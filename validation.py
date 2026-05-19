@@ -1,142 +1,335 @@
+"""
+Validation suite for the Photoproduction Safety Boundary Classifier.
+
+Tests the gradient-ascent projection against four instantaneous constraints:
+  Test 1 — G1: Nitrate path constraint
+  Test 2 — G2: Product/biomass ratio
+  Test 3 — G4: Reactor overflow
+  Test 4 — G5: Reactor underflow
+  Test 5 — Identity mapping (safe states unmodified)
+
+Note: G3 (terminal nitrate) is handled by the GRU temporal context and
+Lagrangian multiplier, not by the APN.
+"""
+
 import torch
 import numpy as np
 import os
-from pretrain import ActionProjectionNetwork 
+from pretrain import ActionProjectionNetwork
 
-def run_synchronized_stress_test(num_test_samples=5000):
+# ── Physical constants (must match env.py and data_gen.py) ────────────────────
+I_MIN, I_MAX     = 120.0, 400.0
+FN_MAX_GROWTH    = 40.0
+FN_MAX_PROD      = 10.0
+FOUT_MAX         = 2.0
+N_LIMIT_PATH     = 800.0
+RATIO_LIMIT      = 0.011
+
+V_MAX            = 50.0
+V_MIN            = 5.0
+C_N_STOCK        = 50000.0
+CONTROL_INTERVAL = 10.0
+TOTAL_TIME       = 500.0
+SAFE_BUFFER      = 0.98
+THRESHOLD        = 0.95
+MAX_PROJ_STEPS   = 5
+LR_PROJ          = 1.0
+
+
+def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS,
+                      lr=LR_PROJ, threshold=THRESHOLD):
+    """
+    Gradient-ascent projection — mirrors safe_agent.SPRL_Agent._project_to_safe.
+
+    Uses constant step size (no severity decay) to ensure the projection
+    reliably reaches the safe manifold within the budget.
+    """
+    a = action_t.clone().detach()
+    state_fixed = state_norm_t.detach()
+
+    with torch.no_grad():
+        p = apn.classify(state_fixed, a)
+        if p.item() >= threshold:
+            return a, 0
+
+    with torch.enable_grad():
+        for step in range(max_steps):
+            a_var  = a.clone().requires_grad_(True)
+            margin = apn(state_fixed, a_var)
+
+            p = torch.sigmoid(margin)
+            if p.item() >= threshold:
+                return a_var.detach(), step
+
+            grad = torch.autograd.grad(margin.sum(), a_var)[0]
+
+            with torch.no_grad():
+                grad = grad.clone()
+                at_lower = (a_var.data <= -0.9999) & (grad < 0)
+                at_upper = (a_var.data >=  0.9999) & (grad > 0)
+                grad[at_lower | at_upper] = 0.0
+
+                # Constant step size with mild decay — avoids premature stall
+                step_size = lr / (1.0 + step * 0.1)
+                a = a + step_size * grad.sign()
+                a = a.clamp(-1.0, 1.0)
+
+    return a, max_steps
+
+
+def _make_state(cx, cN, cq, V, stage_idx, credit_norm, t_norm, supply_norm, device):
+    """Pack physical values into normalised state tensor [1, 11]."""
+    s = torch.zeros(1, 11, dtype=torch.float32, device=device)
+    s[0, 0] = cx / 6.0
+    s[0, 1] = cN / 800.0
+    s[0, 2] = cq / 0.2
+    s[0, 3] = V / V_MAX
+    s[0, 4 + stage_idx] = 1.0
+    s[0, 8] = credit_norm
+    s[0, 9] = t_norm
+    s[0, 10] = supply_norm
+    return s
+
+
+def run_validation(model=None, num_test_samples: int = 5000):
+    """
+    Runs the five constraint validation tests.
+
+    Returns:
+        bool — True if all tests pass (≥ 95% projection success rate).
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # 1. Load Safeguard
-    safeguard = ActionProjectionNetwork(state_dim=4, action_dim=2).to(device)
-    if not os.path.exists("action_projection_network.pth"):
-        print("❌ Error: Missing weights. Run pretrain.py first.")
-        return
 
-    safeguard.load_state_dict(torch.load("action_projection_network.pth", map_location=device))
-    safeguard.eval()
-    
-    # =========================================================================
-    # 1. Physical Constants & Operational Limits
-    # Derived from the specific bioreactor case study parameters.
-    # =========================================================================
-    I_MIN, I_MAX = 120.0, 400.0   # Light intensity bounds
-    FN_MAX = 40.0                 # Max allowable nitrate feed rate
-    N_LIMIT = 800.0               # Constraint g1: Max allowed nitrate concentration
-    RATIO_LIMIT = 0.011           # Constraint g2 target
-    TOTAL_TIME = 240.0            # Total duration of an episode (hours)
-    CONTROL_FREQ = 20.0           # 20-hour control decision window
-    SIGMA = 0.05                  # 5% Gaussian deviation used for exploring edge cases
+    if model is None:
+        apn = ActionProjectionNetwork(state_dim=11, action_dim=4).to(device)
+        for ckpt in [os.path.join("policy", "action_projection_network.pth"),
+                     "action_projection_network.pth"]:
+            if os.path.exists(ckpt):
+                apn.load_state_dict(torch.load(ckpt, map_location=device,
+                                                weights_only=True))
+                print(f"[Validation] Loaded APN from '{ckpt}'.")
+                break
+        else:
+            print("[Validation] ERROR: No checkpoint found. Run pretrain.py first.")
+            return False
+    else:
+        apn = model
 
-    # Helper functions to convert normalized actions [-1, 1] back to physical quantities
-    def denorm_fn(val_norm):
-        return ((val_norm + 1.0) / 2.0) * FN_MAX
+    apn.eval()
+    for p in apn.parameters():
+        p.requires_grad_(False)
 
-    def denorm_i(val_norm):
-        return I_MIN + ((val_norm + 1.0) / 2.0) * (I_MAX - I_MIN)
-
-    def gaussian_sample(mean, std_scale=SIGMA):
-        """Helper to sample states around a specific mean with a given relative deviation."""
-        return torch.normal(mean, mean * std_scale, (num_test_samples,), device=device)
+    PASS_THRESHOLD = 0.95
+    all_passed = True
 
     # =========================================================================
-    # --- TEST 1: Nitrate Accumulation (20h Window) Penalty g1 ---
-    # Purpose: Verify the filter securely restricts feed intent so that accumulation 
-    # over the upcoming control window stays under the absolute safety limit limit.
+    # TEST 1 — G1: Nitrate path constraint
     # =========================================================================
-    print(f"\n--- [TEST 1] g1: 20h Predictive Budget (Target < {N_LIMIT*0.995}) ---")
-    t_norm = torch.rand(num_test_samples, device=device)
-    t_phys = t_norm * TOTAL_TIME
-    delta_t = torch.ceil(t_phys / CONTROL_FREQ) * CONTROL_FREQ - t_phys
-    delta_t = torch.where(delta_t == 0, torch.tensor(CONTROL_FREQ, device=device), delta_t)
-    
-    # Target N levels to test budget (750 to 760)
-    cN_test = 750.0 + torch.rand(num_test_samples, device=device) * 10.0
-    
-    # STOCHASTIC SAFE STATES for cx and cq
-    cx_safe_1 = gaussian_sample(1.0).clamp(0.1, 6.0)
-    cq_safe_1 = gaussian_sample(0.005).clamp(0.0, 0.01)
-    
-    z_intent = torch.ones((num_test_samples, 2), device=device) # Max Feed Intent
-
-    with torch.no_grad():
-        s_phys_1 = torch.stack([cx_safe_1, cN_test, cq_safe_1, t_norm], dim=1)
-        u_safe_1 = safeguard(s_phys_1, z_intent).cpu().numpy()
-
+    print(f"\n--- [TEST 1] G1: Nitrate path (target < {N_LIMIT_PATH*SAFE_BUFFER:.0f} mg/L) ---")
     g1_passes = 0
-    target_limit = N_LIMIT * 0.995 # 796 mg/L
-    for i in range(num_test_samples):
-        fn_phys = denorm_fn(u_safe_1[i, 1])
-        if (cN_test[i].item() + (fn_phys * delta_t[i].item())) < target_limit:
+    g1_iters  = []
+
+    for _ in range(num_test_samples):
+        cN = float(torch.empty(1).uniform_(N_LIMIT_PATH * 0.85, N_LIMIT_PATH * 1.00))
+        cx = float(torch.empty(1).uniform_(0.5, 5.0))
+        cq = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.8))
+        V  = float(torch.empty(1).uniform_(30.0, 45.0))
+        t  = float(torch.empty(1).uniform_(0.0, 0.6))
+
+        s_t = _make_state(cx, cN, cq, V, stage_idx=0, credit_norm=0.5,
+                          t_norm=t, supply_norm=0.5, device=device)
+        a_t = torch.ones(1, 4, device=device)  # max intent
+
+        a_proj, iters = _project_to_safe(apn, s_t, a_t)
+        g1_iters.append(iters)
+
+        # Physics
+        a_scaled = (a_proj[0] + 1.0) / 2.0
+        I_phys = I_MIN + a_scaled[1].item() * (I_MAX - I_MIN)
+        Fn_phys = a_scaled[2].item() * FN_MAX_GROWTH
+        
+        um = 0.0572; KN = 393.1; YNX = 504.5; ks = 178.9; ki = 447.1
+        phi_I = I_phys / (I_phys + ks + (I_phys**2 / ki))
+        phi_N = cN / (cN + KN)
+        growth = um * phi_I * cx * phi_N
+        F_in_vol = Fn_phys * V / C_N_STOCK
+        dCN = -YNX * growth + F_in_vol * (C_N_STOCK - cN) / V
+        cN_next = cN + dCN * CONTROL_INTERVAL
+
+        if cN_next <= N_LIMIT_PATH * SAFE_BUFFER:
             g1_passes += 1
-    print(f"Result: {g1_passes}/{num_test_samples} passed (20h state < {target_limit})")
+
+    g1_rate = g1_passes / num_test_samples
+    print(f"  Pass rate: {g1_passes}/{num_test_samples} ({g1_rate:.1%})  "
+          f"Avg iters: {np.mean(g1_iters):.1f}")
+    if g1_rate < PASS_THRESHOLD:
+        print("  ❌ FAILED")
+        all_passed = False
+    else:
+        print("  ✓ PASSED")
 
     # =========================================================================
-    # --- TEST 2: Terminal Nitrate Constraint (g3) ---
-    # Purpose: Verify the network prevents greedily maximizing feed at the very
-    # end of an episode, guaranteeing the terminal nitrate budget is satisfied.
+    # TEST 2 — G2: Product/biomass ratio
     # =========================================================================
-    N_LIMIT_TERM = 150.0
-    print(f"\n--- [TEST 2] g3: Terminal Nitrate Protection (Target < {N_LIMIT_TERM}) ---")
-    
-    # Generate states very close to the end of the episode (e.g. last 1-2 hours)
-    t_norm_terminal = 0.9 + torch.rand(num_test_samples, device=device) * 0.05
-    t_phys_term = t_norm_terminal * TOTAL_TIME
-    delta_t_term = TOTAL_TIME - t_phys_term # Time remaining until terminal check
-    
-    # Generate Nitrate levels dangerously close to the 142.5 limit, but ensure it's mathematically possible to satisfy
-    # by keeping starting levels strictly <= 142.5 (since we cannot have negative feed)
-    cN_test_3 = (N_LIMIT_TERM * 0.98) - torch.rand(num_test_samples, device=device) * 5.0
-    
-    # STOCHASTIC SAFE STATES for cx and cq
-    cx_safe_3 = gaussian_sample(2.0).clamp(0.1, 6.0)
-    cq_safe_3 = gaussian_sample(0.005).clamp(0.0, 0.01)
-    
-    # Agent intent: Wants to minimize growth (Min Light) and provide MAX Nitrate Feed (1.0)
-    # This greedy behavior would normally accumulate Nitrate above the 150 limit.
-    z_intent_3 = torch.zeros((num_test_samples, 2), device=device)
-    z_intent_3[:, 0] = -1.0 
-    z_intent_3[:, 1] = 1.0 
-    
-    with torch.no_grad():
-        s_phys_3 = torch.stack([cx_safe_3, cN_test_3, cq_safe_3, t_norm_terminal], dim=1)
-        u_safe_3 = safeguard(s_phys_3, z_intent_3).cpu().numpy()
+    print(f"\n--- [TEST 2] G2: Product/biomass ratio (cq/cx ≤ {RATIO_LIMIT*SAFE_BUFFER:.4f}) ---")
+    g2_passes = 0
+    g2_iters  = []
 
-    # Verify that the safeguard forced the Nitrate Feed to be low enough
-    g3_passes = 0
-    target_limit_term = N_LIMIT_TERM * 0.98
-    for i in range(num_test_samples):
-        fn_phys = denorm_fn(u_safe_3[i, 1])
-        # Simple heuristic check: the added feed over the remaining time should keep us below the limit
-        if (cN_test_3[i].item() + (fn_phys * delta_t_term[i].item())) <= target_limit_term:
-            g3_passes += 1
-            
-    print(f"Result: {g3_passes}/{num_test_samples} passed (Terminal state projected < {target_limit_term})")
+    for _ in range(num_test_samples):
+        cx = float(torch.empty(1).uniform_(0.5, 5.0))
+        cq = cx * RATIO_LIMIT * float(torch.empty(1).uniform_(0.90, 1.03))
+        cN = float(torch.empty(1).uniform_(200.0, 600.0))
+        V  = float(torch.empty(1).uniform_(30.0, 45.0))
+        t  = float(torch.empty(1).uniform_(0.0, 0.6))
 
-    # =========================================================================
-    # --- TEST 3: Identity Mapping (Safe Region) ---
-    # Purpose: Prove that the neural network's architecture (skip connections) 
-    # prevents it from interfering with intents when perfectly safe.
-    # =========================================================================
-    print(f"\n--- [TEST 3] Identity Mapping: Stochastic Safe Zone (Diff <= 1%) ---")
-    
-    # Gaussian sampling for ALL states
-    cx_safe_3 = gaussian_sample(2.0).clamp(0.1, 6.0)
-    cN_safe_3 = gaussian_sample(50.0).clamp(0.0, 150.0)
-    cq_safe_3 = gaussian_sample(0.005).clamp(0.0, 0.01)
-    t_safe_3 = gaussian_sample(0.2).clamp(0.0, 1.0)
-    
-    z_safe_intent = -0.5 + torch.rand((num_test_samples, 2), device=device) * 1.0
+        s_t = _make_state(cx, cN, cq, V, stage_idx=1, credit_norm=0.5,
+                          t_norm=t, supply_norm=0.5, device=device)
+        a_t = torch.ones(1, 4, device=device)
 
-    with torch.no_grad():
-        s_safe = torch.stack([cx_safe_3, cN_safe_3, cq_safe_3, t_safe_3], dim=1)
-        u_safe_3 = safeguard(s_safe, z_safe_intent)
-    
-    diff = torch.abs(u_safe_3 - z_safe_intent)
-    identity_passes = torch.all(diff <= 0.02, dim=1).sum().item()
-    max_dev = diff.max().item()
+        a_proj, iters = _project_to_safe(apn, s_t, a_t)
+        g2_iters.append(iters)
 
-    print(f"Max Absolute Deviation: {max_dev:.6e}")
-    print(f"Result: {identity_passes}/{num_test_samples} points within 1% tolerance.")
+        # Physics
+        a_scaled = (a_proj[0] + 1.0) / 2.0
+        I_phys = I_MIN + a_scaled[1].item() * (I_MAX - I_MIN)
+        Fn_phys = a_scaled[2].item() * FN_MAX_PROD
+
+        um = 0.0572; KN = 393.1; km = 0.00016; kd = 0.281
+        ks = 178.9; ki = 447.1; ksq = 23.51; kiq = 800.0; KNp = 16.89
+
+        phi_I = I_phys / (I_phys + ks + (I_phys**2 / ki))
+        phi_N = cN / (cN + KN)
+        phi_Iq = I_phys / (I_phys + ksq + (I_phys**2 / kiq))
+
+        growth = um * phi_I * cx * phi_N
+        F_in_vol = Fn_phys * V / C_N_STOCK
+
+        dCx = growth - (F_in_vol * cx / V)
+        dCq = km * phi_Iq * cx - (kd * cq) / (cN + KNp) - (F_in_vol * cq / V)
+
+        cx_next = cx + dCx * CONTROL_INTERVAL
+        cq_next = cq + dCq * CONTROL_INTERVAL
+        ratio_next = cq_next / (cx_next + 1e-8)
+
+        if ratio_next <= RATIO_LIMIT * SAFE_BUFFER:
+            g2_passes += 1
+
+    g2_rate = g2_passes / num_test_samples
+    print(f"  Pass rate: {g2_passes}/{num_test_samples} ({g2_rate:.1%})  "
+          f"Avg iters: {np.mean(g2_iters):.1f}")
+    if g2_rate < PASS_THRESHOLD:
+        print("  ❌ FAILED")
+        all_passed = False
+    else:
+        print("  ✓ PASSED")
+
+
+
+    print(f"\n--- [TEST 3] G4: Reactor overflow (V ≤ {V_MAX*SAFE_BUFFER:.0f} L) ---")
+    g4_passes = 0
+    g4_iters  = []
+
+    for _ in range(num_test_samples):
+        V  = float(torch.empty(1).uniform_(V_MAX * 0.85, V_MAX * SAFE_BUFFER))
+        cx = float(torch.empty(1).uniform_(0.5, 5.0))
+        cN = float(torch.empty(1).uniform_(0.0, 400.0))
+        cq = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.8))
+        t  = float(torch.empty(1).uniform_(0.0, 0.5))
+
+        s_t = _make_state(cx, cN, cq, V, stage_idx=0, credit_norm=0.5,
+                          t_norm=t, supply_norm=0.5, device=device)
+        a_t = torch.ones(1, 4, device=device)  # max feed → max volume increase
+
+        a_proj, iters = _project_to_safe(apn, s_t, a_t)
+        g4_iters.append(iters)
+
+        # Physics
+        a_scaled = (a_proj[0] + 1.0) / 2.0
+        Fn_phys = a_scaled[2].item() * FN_MAX_GROWTH
+        Fout_phys = 0.0  # masked in growth
+        
+        F_in_vol = Fn_phys * V / C_N_STOCK
+        V_next = V + (F_in_vol - Fout_phys) * CONTROL_INTERVAL
+
+        if V_next <= V_MAX * SAFE_BUFFER:
+            g4_passes += 1
+
+    g4_rate = g4_passes / num_test_samples
+    print(f"  Pass rate: {g4_passes}/{num_test_samples} ({g4_rate:.1%})  "
+          f"Avg iters: {np.mean(g4_iters):.1f}")
+    if g4_rate < PASS_THRESHOLD:
+        print("  ❌ FAILED")
+        all_passed = False
+    else:
+        print("  ✓ PASSED")
+
+    print(f"\n--- [TEST 4] G5: Reactor underflow (V ≥ {V_MIN/SAFE_BUFFER:.1f} L) ---")
+    g5_passes = 0
+    g5_iters  = []
+
+    for _ in range(num_test_samples):
+        V  = float(torch.empty(1).uniform_(V_MIN / SAFE_BUFFER, V_MIN * 3.0))
+        cx = float(torch.empty(1).uniform_(0.5, 5.0))
+        cN = float(torch.empty(1).uniform_(0.0, 200.0))
+        cq = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.8))
+        t  = float(torch.empty(1).uniform_(0.5, 0.9))
+
+        s_t = _make_state(cx, cN, cq, V, stage_idx=2, credit_norm=0.3,
+                          t_norm=t, supply_norm=0.1, device=device)
+        a_t = torch.ones(1, 4, device=device)  # max outflow intent
+
+        a_proj, iters = _project_to_safe(apn, s_t, a_t)
+        g5_iters.append(iters)
+
+        # Physics
+        a_scaled = (a_proj[0] + 1.0) / 2.0
+        Fn_phys = 0.0  # masked in cleanup
+        Fout_phys = a_scaled[3].item() * FOUT_MAX
+        
+        F_in_vol = Fn_phys * V / C_N_STOCK
+        V_next = V + (F_in_vol - Fout_phys) * CONTROL_INTERVAL
+
+        if V_next >= V_MIN / SAFE_BUFFER:
+            g5_passes += 1
+
+    g5_rate = g5_passes / num_test_samples
+    print(f"  Pass rate: {g5_passes}/{num_test_samples} ({g5_rate:.1%})  "
+          f"Avg iters: {np.mean(g5_iters):.1f}")
+    if g5_rate < PASS_THRESHOLD:
+        print("  ❌ FAILED")
+        all_passed = False
+    else:
+        print("  ✓ PASSED")
+
+    print(f"\n--- [TEST 5] Identity mapping: safe states unmodified (diff ≤ 2%) ---")
+    id_passes = 0
+    for _ in range(num_test_samples):
+        cx     = float(torch.empty(1).uniform_(0.5, 5.0))
+        cN     = float(torch.empty(1).uniform_(0.0, N_LIMIT_PATH * 0.50))
+        cq     = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.60))
+        V      = float(torch.empty(1).uniform_(20.0, 40.0))
+        t_norm = float(torch.empty(1).uniform_(0.0, 0.50))
+
+        s_t = _make_state(cx, cN, cq, V, stage_idx=0, credit_norm=0.7,
+                          t_norm=t_norm, supply_norm=0.7, device=device)
+        a_t = -0.5 + torch.rand(1, 4, device=device)  # moderate safe intent
+
+        a_proj, _ = _project_to_safe(apn, s_t, a_t)
+        diff = (a_proj - a_t).abs().max().item()
+        if diff <= 0.02:
+            id_passes += 1
+
+    id_rate = id_passes / num_test_samples
+    print(f"  Pass rate: {id_passes}/{num_test_samples} ({id_rate:.1%})")
+    if id_rate < PASS_THRESHOLD:
+        print("  ❌ FAILED")
+        all_passed = False
+    else:
+        print("  ✓ PASSED")
+
+    print(f"\n{'[ALL TESTS PASSED]' if all_passed else '[SOME TESTS FAILED]'}")
+    return all_passed
+
 
 if __name__ == "__main__":
-    run_synchronized_stress_test()
+    run_validation()

@@ -1,276 +1,542 @@
 import numpy as np
 from numba import njit
-# =============================================================================
-# KINETIC ENGINE (Photoproduction)
-# =============================================================================
-@njit
-def calculate_rates_numba(C, I, Fn):
-    """
-    Computes the instantaneous rates of change for the bioreactor state variables.
-    
-    The kinetics are based on the Photoproduction documentation of pcgym
-    
-    Args:
-        C (array): Current state concentrations [Biomass (Cx), Nitrate (CN), Phycocyanin (Cq)].
-        I (float): Current applied light intensity (umol/m^2/s).
-        Fn (float): Current applied nitrate feed rate (mg/L/h).
-        
-    Returns:
-        R (array): The rates of change [dCx/dt, dCN/dt, dCq/dt].
-    """
-    # State Indices: 0: Biomass (Cx), 1: Nitrate (CN), 2: Phycocyanin (Cq)
-    i_X, i_N, i_q = 0, 1, 2
-    
-    # Static Kinetic Parameters
-    um = 0.0572    # h^-1
-    ud = 0.0       # h^-1 (Death rate)
-    KN = 393.1     # mg/L
-    YNX = 504.5    # mg/g
-    km = 0.00016   # mg/g/h
-    kd = 0.281     # h^-1
-    ks = 178.9     # umol/m^2/s
-    ki = 447.1     # umol/m^2/s
-    ksq = 23.51    # umol/m^2/s
-    kiq = 800.0    # umol/m^2/s
-    KNp = 16.89    # mg/L
 
-    # 1. Growth photolimitation (Aiba model)
-    # Models the inhibition of growth at excessively high light intensities.
-    phi_I = I / (I + ks + (I**2 / ki))
-    
-    # Nutrient availability limitation
-    phi_N = C[i_N] / (C[i_N] + KN)
-    
-    # 2. Product (Phycocyanin) photolimitation 
-    # Phycocyanin synthesis has different optimal light thresholds than biomass growth.
+# =============================================================================
+# KINETIC ENGINE (Photoproduction CSTR with Volume Tracking)
+# =============================================================================
+
+# Feed stock concentration (mg/L) — concentrated nitrate solution
+C_N_STOCK = 50000.0
+
+@njit
+def calculate_rates_numba(state, I, Fn, F_out):
+    """
+    Computes instantaneous rates for the bioreactor state [Cx, CN, Cq, V].
+
+    The CSTR formulation accounts for dilution effects from feed inflow
+    and product removal via outstream.
+
+    Args:
+        state (array): [Biomass Cx (g/L), Nitrate CN (mg/L),
+                        Phycocyanin Cq (mg/L), Volume V (L)].
+        I (float):     Light intensity (umol/m^2/s).
+        Fn (float):    Nitrate feed concentration rate (mg/L/h).
+        F_out (float): Outstream volumetric flow (L/h).
+
+    Returns:
+        R (array): [dCx/dt, dCN/dt, dCq/dt, dV/dt].
+    """
+    Cx = state[0]
+    CN = state[1]
+    Cq = state[2]
+    V  = max(state[3], 0.1)
+
+    # Static Kinetic Parameters
+    um  = 0.0572     # h^-1
+    ud  = 0.0        # h^-1 (Death rate)
+    KN  = 393.1      # mg/L
+    YNX = 504.5      # mg/g
+    km  = 0.00016    # mg/g/h
+    kd  = 0.281      # h^-1
+    ks  = 178.9      # umol/m^2/s
+    ki  = 447.1      # umol/m^2/s
+    ksq = 23.51      # umol/m^2/s
+    kiq = 800.0      # umol/m^2/s
+    KNp = 16.89      # mg/L
+
+    # Volumetric inflow from concentrated nitrate feed
+    F_in_vol = max(0.0, Fn * V / C_N_STOCK)   # L/h
+
+    # Growth photolimitation (Aiba model)
+    phi_I  = I / (I + ks + (I**2 / ki))
+    # Nutrient availability
+    phi_N  = CN / (CN + KN)
+    # Product photolimitation
     phi_Iq = I / (I + ksq + (I**2 / kiq))
-    
-    R = np.zeros(3)
-    # dCx/dt: Biomass growth rate minus natural death rate
-    R[i_X] = um * phi_I * C[i_X] * phi_N - ud * C[i_X]
-    
-    # dCN/dt: Nitrate consumption (proportional to biomass growth) plus active feed
-    R[i_N] = -YNX * (um * phi_I * C[i_X] * phi_N) + Fn
-    
-    # dCq/dt: Phycocyanin synthesis rate minus degradation rate 
-    R[i_q] = km * phi_Iq * C[i_X] - (kd * C[i_q]) / (C[i_N] + KNp)
-    
+
+    growth = um * phi_I * Cx * phi_N
+
+    R = np.zeros(4)
+    # dCx/dt: growth – death – dilution from inflow (no biomass in feed)
+    R[0] = growth - ud * Cx - F_in_vol * Cx / V
+    # dCN/dt: consumption + CSTR feed term
+    R[1] = -YNX * growth + F_in_vol * (C_N_STOCK - CN) / V
+    # dCq/dt: synthesis – degradation – dilution from inflow
+    R[2] = km * phi_Iq * Cx - (kd * Cq) / (CN + KNp) - F_in_vol * Cq / V
+    # dV/dt: inflow – outflow
+    R[3] = F_in_vol - F_out
+
     return R
 
+
 @njit
-def integrate_rk4(c_init, I, Fn, dt, n_steps):
+def integrate_rk4(state_init, I, Fn, F_out, dt, n_steps):
     """
-    Simulates the environment forward in time using the 4th-order Runge-Kutta method.
-    This provides high numerical stability for the non-linear kinetic ODEs.
+    4th-order Runge-Kutta integrator for the CSTR system [Cx, CN, Cq, V].
     """
-    c = c_init.copy()
+    state = state_init.copy()
     for _ in range(n_steps):
-        k1 = calculate_rates_numba(c, I, Fn)
-        k2 = calculate_rates_numba(c + 0.5 * dt * k1, I, Fn)
-        k3 = calculate_rates_numba(c + 0.5 * dt * k2, I, Fn)
-        k4 = calculate_rates_numba(c + dt * k3, I, Fn)
-        
-        c += (dt / 6.0) * (k1 + 2.0*k2 + 2.0*k3 + k4)
-        # Prevent non-physical negative concentrations caused by large ODE steps
-        c = np.maximum(c, 0.0) 
-    return c
+        k1 = calculate_rates_numba(state, I, Fn, F_out)
+        k2 = calculate_rates_numba(state + 0.5 * dt * k1, I, Fn, F_out)
+        k3 = calculate_rates_numba(state + 0.5 * dt * k2, I, Fn, F_out)
+        k4 = calculate_rates_numba(state + dt * k3, I, Fn, F_out)
+        state += (dt / 6.0) * (k1 + 2.0*k2 + 2.0*k3 + k4)
+        # Clamp non-physical values
+        state[0] = max(state[0], 0.0)
+        state[1] = max(state[1], 0.0)
+        state[2] = max(state[2], 0.0)
+        state[3] = max(state[3], 0.1)
+    return state
+
 
 # =============================================================================
 # REINFORCEMENT LEARNING ENVIRONMENT
 # =============================================================================
+
 class PhycocyaninEnv:
     """
-    PCGym Environment wrapper for the bioreactor simulation.
-    Handles action denormalization, state tracking, and the calculation of 
-    rewards and Lagrangian penalty signals.
+    Multi-stage photobioreactor RL environment with volume tracking,
+    Lagrangian constraint enforcement, and adaptive time scheduling.
+
+    Stages:
+        0 — Growth:     Rapid biomass accumulation (I: 120-400, Fn: 0-40)
+        1 — Production: Bioproduct synthesis      (I: 120-400, Fn: 0-10)
+        2 — Cleanup:    Reactor harvest/drain      (Fout active, I/Fn masked)
+        3 — Idle:       Reactor off, system shutdown (all masked)
+
+    Action dimensions (4):
+        0 — Time multiplier  (0.5–2.0, active in Growth/Production)
+        1 — Light intensity  (120–400 μmol/m²/s, active in Growth/Production)
+        2 — Nitrate feed     (0–40 or 0–10 mg/L/h, active in Growth/Production)
+        3 — Outstream flow   (0–Fout_max L/h, active in Cleanup only)
     """
+
     def __init__(self):
-        # --- Batch Config ---
-        self.total_time = 240.0        
-        self.control_freq = 20.0       
-        self.max_steps = int(self.total_time / self.control_freq) # 12 control actions per episode
-        
-        # --- Physical Action Boundaries & Constraints ---
-        self.I_MIN, self.I_MAX = 120.0, 400.0 
-        self.FN_MAX = 40.0                    
-        self.N_LIMIT_PATH = 800.0      # Constraint g1: Absolute max nitrate concentration
-        self.RATIO_LIMIT = 0.011       # Constraint g2: Target Phycocyanin/Biomass ratio
-        self.N_LIMIT_TERM = 150.0      # Constraint g3: Max allowable nitrate at the end of the batch
-        
+        # --- Simulation Config ---
+        self.total_time = 500.0
+        self.control_freq = 10.0
+        self.max_steps = int(self.total_time / self.control_freq)  # 50
+
+        # --- Stage Config ---
+        self.n_stage = 4
+        self.BASE_CREDITS = np.array([120.0, 60.0, 50.0, 0.0])
+        #                              Growth  Prod  Cleanup  Idle
+
+        # --- Physical Action Boundaries ---
+        self.I_MIN, self.I_MAX = 120.0, 400.0
+        self.FN_MAX_GROWTH = 40.0
+        self.FN_MAX_PROD   = 10.0
+        self.FOUT_MAX      = 2.0   # L/h max outstream
+
+        # --- Reactor Volume Specs ---
+        self.V_MAX     = 50.0    # L — reactor capacity
+        self.V_MIN     = 5.0     # L — dry floor
+        self.V_INITIAL = 40.0    # L — initial fill (80%)
+        self.V_DRAIN   = 10.0    # L — cleanup→idle trigger
+
+        # --- Global Nutrient Pool ---
+        self.INITIAL_NITRATE_SUPPLY = 250_000.0  # mg total
+
+        # --- Constraint Limits ---
+        self.N_LIMIT_PATH  = 800.0    # g1: Max path nitrate (mg/L)
+        self.RATIO_LIMIT   = 0.011    # g2: Max cq/cx ratio
+        self.N_LIMIT_TERM  = 150.0    # g3: Terminal nitrate (mg/L)
+
         # --- Integration Config ---
-        # The ODEs are integrated internally in much smaller steps (10 mins) than the RL control frequency
-        self.dt = 10.0 / 60.0          # 10 minutes (0.1667 h)
-        self.n_inner_steps = int(self.control_freq / self.dt) # 120 internal ODE steps for every 20h RL step
+        self.dt = 10.0 / 60.0   # 10 minutes (0.1667 h)
+        self.n_inner_steps = int(self.control_freq / self.dt)  # 60
+
+        # ── Lagrangian Multiplier Constraint Enforcement ──────────────
+        self.lagrange_lr          = 0.5
+        self.lagrange_decay       = 0.5 / 600.0
+        self.lagrange_target_slack = 0.0
+        self.lagrange_max         = 10.0
+
+        # Buffer-zone soft-wall coefficients
+        self.BUFFER_COEF              = 0.02
+        self.OVERFLOW_BUFFER_FRAC     = 0.10   # Activates at 90% V_MAX
+        self.UNDERFLOW_BUFFER_L       = 10.0   # Activates at V < 10 L
+        self.DRY_FLOOR                = self.V_MIN
+
+        # Per-constraint λ multipliers
+        self.g1_lambda = 0.0
+        self.g2_lambda = 0.0
+        self.overflow_lambda  = 0.0
+        self.underflow_lambda = 0.0
+
+        self.BASE_SPIKE       = 0.1
+        self.smoothing_coef   = 0.005
+
+        self.lagrange_updates_enabled = True
+        self.reset_lambdas_per_episode = False
 
         self.reset()
 
     def reset(self, randomize=False):
         """
         Resets the environment for a new training episode.
-        Optionally applies domain randomization to the initial states to improve policy robustness.
         """
         self.time = 0.0
         self.time_step_count = 0
+
+        # Stage scheduling
+        self.current_stage = 0
+        self.stage_credits = float(self.BASE_CREDITS[0])
+
+        # Hysteretic latch for cleanup→idle transition
+        self._cleanup_latch = False
+
+        # Physical state: [Cx (g/L), CN (mg/L), Cq (mg/L), V (L)]
+        self.state = np.array([1.1, 150.0, 0.01, self.V_INITIAL], dtype=np.float64)
+
+        if randomize:
+            noise_factor = 0.10
+            # Only randomize concentrations, not volume
+            conc_noise = np.random.normal(1.0, noise_factor, size=3)
+            self.state[:3] *= np.maximum(0.01, conc_noise)
+            # Slight volume randomization
+            self.state[3] = np.clip(
+                self.state[3] * np.random.normal(1.0, 0.05),
+                self.V_MIN + 5.0, self.V_MAX - 5.0
+            )
+
+        # Global nutrient pool
+        self.nitrate_supply = self.INITIAL_NITRATE_SUPPLY
+
+        # Action smoothing
+        self.prev_action = np.zeros(4)
+
+        # Per-episode λ reset
+        if self.reset_lambdas_per_episode:
+            self.g1_lambda = 0.0
+            self.g2_lambda = 0.0
+            self.overflow_lambda = 0.0
+            self.underflow_lambda = 0.0
+
+        # Violation tracking
         self.violation_count = 0
         self.g1_violation_count = 0
         self.g2_violation_count = 0
         self.g3_violation_count = 0
-        
-        # Initial State Base: [1.1 g/L, 150 mg/L, 0.01 mg/L]
-        self.state = np.array([1.1, 150.0, 0.01], dtype=np.float64)
-        
-        # Add Initial State Randomization for Robustness Evaluation
-        if randomize:
-            # Define how much 'spread' you want as a fraction of each state's value
-            # 0.10 means a standard deviation of 10% of each state variable's base value
-            noise_factor = 0.10
-            
-            # Generate Gaussian noise: Mean = base_state, Std Dev = base_state * noise_factor
-            # This keeps noise proportional across all state variables (Biomass, Nitrate, Phycocyanin)
-            self.state = np.random.normal(loc=self.state, scale=np.abs(self.state) * noise_factor)
-            
-            # Apply noise and ensure values stay non-negative
-            self.state = np.maximum(0.0, self.state)
-            
-        self.prev_action = np.zeros(2)
-        
-        # Metric Tracking
+        self.g4_violation_count = 0
+        self.g5_violation_count = 0
+
+        # Metric tracking
         self.ep_total_reward = 0.0
         self.ep_rewards = []
         self.ep_prod_rewards = []
         self.ep_smooth_penalties = []
-        self.ep_n_usage_penalties = []
-        self.ep_violation_penalties = []
-        self.ep_g1_penalties = []
-        self.ep_g2_penalties = []
-        self.ep_g3_penalties = []
-        
+        self.ep_constraint_penalties = []
+
+        # Phycocyanin harvested during cleanup (mass in mg)
+        self.total_cq_harvested = 0.0
+
         return self.get_state_norm()
 
     def get_state_norm(self):
         """
-        Retrieves the current physical state, normalized to [0, 1] for neural network ingestion.
-        State order: [Biomass, Nitrate, Phycocyanin, Normalized Time]
+        Normalized observation vector (11D):
+          [0] Cx/6.0, [1] CN/800.0, [2] Cq/0.2, [3] V/V_max,
+          [4-7] stage one-hot, [8] credit_remaining/base,
+          [9] t/500, [10] supply_remaining/initial
         """
-        norm_obs = np.zeros(4, dtype=np.float64)
-        norm_obs[0] = self.state[0] / 6.0     
-        norm_obs[1] = self.state[1] / 800.0   
-        norm_obs[2] = self.state[2] / 0.2     
-        norm_obs[3] = self.time / self.total_time 
-        return norm_obs
+        norm = np.zeros(11, dtype=np.float64)
+        norm[0] = self.state[0] / 6.0
+        norm[1] = self.state[1] / 800.0
+        norm[2] = self.state[2] / 0.2
+        norm[3] = self.state[3] / self.V_MAX
+
+        # One-hot stage encoding
+        norm[4 + self.current_stage] = 1.0
+
+        # Credit remaining (normalized to base credit of current stage)
+        base = self.BASE_CREDITS[self.current_stage]
+        norm[8] = (self.stage_credits / base) if base > 0 else 0.0
+
+        norm[9]  = self.time / self.total_time
+        norm[10] = self.nitrate_supply / self.INITIAL_NITRATE_SUPPLY
+
+        return norm
+
+    @staticmethod
+    def get_action_mask(state_tensor):
+        """
+        Computes the stage-aware binary action mask from the state tensor.
+
+        Returns mask of shape [..., 4]:
+          dim 0 — time multiplier:  active in Growth (0) & Production (1)
+          dim 1 — light intensity:  active in Growth (0) & Production (1)
+          dim 2 — nitrate feed:     active in Growth (0) & Production (1)
+          dim 3 — outstream flow:   active in Cleanup (2) only
+        """
+        import torch
+        # Stage one-hot at indices 4:8
+        stage_0 = state_tensor[..., 4]   # Growth
+        stage_1 = state_tensor[..., 5]   # Production
+        stage_2 = state_tensor[..., 6]   # Cleanup
+        # stage_3 = state_tensor[..., 7]  # Idle — all masked
+
+        mask_time = stage_0 + stage_1
+        mask_I    = stage_0 + stage_1
+        mask_Fn   = stage_0 + stage_1
+        mask_Fout = stage_2
+
+        return torch.stack([mask_time, mask_I, mask_Fn, mask_Fout], dim=-1)
+
+    def _sigmoid_switch(self, x, center=0.0, width=2.0):
+        """Smooth transition factor ∈ [0, 1] for hysteretic switching."""
+        return 1.0 / (1.0 + np.exp(-(x - center) / max(width, 0.01)))
 
     def step(self, action):
         """
-        Executes a single control action, steps the kinetic engine forward 20h, 
-        evaluates safety constraints, and calculates the resulting step reward/penalty.
+        Executes one control step (10 hours) with stage-aware action masking,
+        adaptive time scaling, volume-tracked CSTR integration, and
+        Lagrangian constraint enforcement.
         """
-        # Ensure the action provided by the policy is rigorously clamped to [-1, 1] before denormalization
         a_clipped = np.clip(action, -1.0, 1.0)
-        I_phys = self.I_MIN + ((a_clipped[0] + 1.0) / 2.0) * (self.I_MAX - self.I_MIN)
-        Fn_phys = ((a_clipped[1] + 1.0) / 2.0) * self.FN_MAX
-        
-        # Internal integration every 10 minutes for stability
-        self.state = integrate_rk4(self.state, I_phys, Fn_phys, self.dt, self.n_inner_steps)
+        a_scaled  = (a_clipped + 1.0) / 2.0   # [0, 1]
+
+        # ── Action Decoding (stage-dependent) ─────────────────────────
+        if self.current_stage in (0, 1):
+            # Time multiplier: 0.5–2.0
+            multiplier = 0.5 + a_scaled[0] * 1.5
+
+            # Light intensity
+            I_phys = self.I_MIN + a_scaled[1] * (self.I_MAX - self.I_MIN)
+
+            # Nitrate feed (stage-dependent cap)
+            fn_max = self.FN_MAX_GROWTH if self.current_stage == 0 else self.FN_MAX_PROD
+            Fn_phys = a_scaled[2] * fn_max
+
+            # Outstream masked
+            F_out = 0.0
+        elif self.current_stage == 2:
+            # Cleanup: only outstream active
+            multiplier = 1.0
+            I_phys  = self.I_MIN  # baseline
+            Fn_phys = 0.0
+            F_out   = a_scaled[3] * self.FOUT_MAX
+        else:
+            # Idle: everything at baseline
+            multiplier = 1.0
+            I_phys  = self.I_MIN
+            Fn_phys = 0.0
+            F_out   = 0.0
+
+        # ── Mass Balance: Cap Fn by available supply ──────────────────
+        if Fn_phys > 0 and self.nitrate_supply > 0:
+            # Approximate demand over control period
+            nitrate_demand = Fn_phys * self.state[3] * self.control_freq  # mg
+            actual_consumed = min(nitrate_demand, self.nitrate_supply)
+            if actual_consumed < nitrate_demand and nitrate_demand > 0:
+                Fn_phys *= (actual_consumed / nitrate_demand)
+            self.nitrate_supply -= actual_consumed
+        elif self.nitrate_supply <= 0:
+            Fn_phys = 0.0
+
+        # ── Hysteretic Sigmoid Blending (Cleanup → Idle) ─────────────
+        blend = 0.0
+        if self.current_stage == 2:
+            if not self._cleanup_latch and self.state[3] < self.V_DRAIN:
+                self._cleanup_latch = True
+
+            if self._cleanup_latch:
+                # Sigmoid soft-switch: blend towards idle as V drops
+                blend = self._sigmoid_switch(
+                    self.V_DRAIN - self.state[3], center=0.0, width=2.0)
+                # Blend actions toward idle defaults
+                I_phys  = I_phys * (1.0 - blend) + self.I_MIN * blend
+                Fn_phys = Fn_phys * (1.0 - blend)
+                F_out   = F_out * (1.0 - blend)
+
+        # ── Time Credit Update ────────────────────────────────────────
+        dt_hours = self.control_freq   # effective step duration
+        if self.current_stage in (0, 1):
+            self.stage_credits -= multiplier * dt_hours
+        elif self.current_stage == 2:
+            self.stage_credits -= dt_hours  # fixed rate in cleanup
+
+        # ── Stage Transition Logic ────────────────────────────────────
+        if self.current_stage in (0, 1) and self.stage_credits <= 0:
+            self.current_stage += 1
+            self.stage_credits = float(self.BASE_CREDITS[self.current_stage])
+            self._cleanup_latch = False
+
+        elif self.current_stage == 2:
+            # Volume-triggered transition with hysteretic latch
+            if self._cleanup_latch and blend >= 0.95:
+                self.current_stage = 3
+                self.stage_credits = 0.0
+
+        # ── CSTR Integration ─────────────────────────────────────────
+        self.state = integrate_rk4(
+            self.state, I_phys, Fn_phys, F_out,
+            self.dt, self.n_inner_steps)
+
+        # Track harvested phycocyanin mass during cleanup outflow
+        if F_out > 0:
+            self.total_cq_harvested += self.state[2] * F_out * self.control_freq
+
         self.time += self.control_freq
         self.time_step_count += 1
-        
-        # During deployment (is_training=False), minor violations are not penalized 
-        # as harshly to encourage smooth trajectory execution, relying instead on the 
-        # safety filter's absolute bounds.
-        minor_coef = 2 if getattr(self, 'is_training', False) else 0
+
+        # ── Reward Construction ───────────────────────────────────────
+        is_training = getattr(self, 'is_training', False)
+        minor_coef  = 2 if is_training else 0
         severe_coef = 200
-        
-        # =====================================================================
-        # Lagrangian Environmental Penalty Signals
-        # Hand-crafted to teach the unconstrained lag_agent.py where the boundaries are.
-        # =====================================================================
-        
-        # g1: Path Nitrate Violation Penalty
-        n_vio_p = 0.0
+
+        # Primary objective: Phycocyanin production (dense per-step)
+        prod_r = self.state[2] * 10.0
+
+        # ── Lagrangian Constraint Penalties ────────────────────────────
+        constraint_penalty = 0.0
+
+        # g1: Path Nitrate Violation
+        g1_penalty = 0.0
         n_ratio = self.state[1] / self.N_LIMIT_PATH
-        # Reverse log barrier approaching infinity as n_ratio -> 1, centered near 0.95
         if n_ratio > 0.995 and n_ratio < 1.0:
-            # Shift ratio such that evaluating at 0.95 gives roughly log(1.0) = 0
-            n_vio_p -= minor_coef * np.log(1.005 - n_ratio) 
+            g1_penalty -= minor_coef * np.log(1.005 - n_ratio)
         if n_ratio > 1.0:
-            n_vio_p += severe_coef * (n_ratio - 1.0) 
+            viol = n_ratio - 1.0
+            g1_penalty += self.g1_lambda * viol + self.BASE_SPIKE * (1.0 + viol)
             self.violation_count += 1
             self.g1_violation_count += 1
-            
-        # g2: Product Ratio Violation Penalty 
-        q_vio_p = 0.0
+            if self.lagrange_updates_enabled:
+                self.g1_lambda = min(self.lagrange_max,
+                    self.g1_lambda + self.lagrange_lr * viol)
+        elif self.lagrange_updates_enabled:
+            self.g1_lambda *= (1.0 - self.lagrange_decay)
+        constraint_penalty += g1_penalty
+
+        # g2: Product Ratio Violation
+        g2_penalty = 0.0
         ratio = self.state[2] / (self.state[0] + 1e-8)
         q_ratio = ratio / self.RATIO_LIMIT
         if q_ratio > 0.995 and q_ratio < 1.0:
-            q_vio_p -= minor_coef * np.log(1.005 - q_ratio)
+            g2_penalty -= minor_coef * np.log(1.005 - q_ratio)
         if ratio > self.RATIO_LIMIT:
-            q_vio_p += severe_coef * (q_ratio - 1.0)
+            viol = q_ratio - 1.0
+            g2_penalty += self.g2_lambda * viol + self.BASE_SPIKE * (1.0 + viol)
             self.violation_count += 1
             self.g2_violation_count += 1
-            
-        # Smoothing Penalty: Encourages the agent not to swing the actuators wildly between steps
-        smooth_p = 0.05 * np.mean(np.square(a_clipped - self.prev_action))
+            if self.lagrange_updates_enabled:
+                self.g2_lambda = min(self.lagrange_max,
+                    self.g2_lambda + self.lagrange_lr * viol)
+        elif self.lagrange_updates_enabled:
+            self.g2_lambda *= (1.0 - self.lagrange_decay)
+        constraint_penalty += g2_penalty
+
+        # g4: Reactor Overflow
+        g4_penalty = 0.0
+        v_frac = self.state[3] / self.V_MAX
+        # Buffer zone (quadratic ramp near 90% capacity)
+        overflow_edge = 1.0 - self.OVERFLOW_BUFFER_FRAC
+        if v_frac > overflow_edge:
+            depth = min(1.0, (v_frac - overflow_edge) / self.OVERFLOW_BUFFER_FRAC)
+            g4_penalty += self.BUFFER_COEF * depth * depth
+        # Hard constraint
+        overflow_viol = max(0.0, v_frac - 1.0)
+        if overflow_viol > 0:
+            g4_penalty += self.overflow_lambda * overflow_viol
+            g4_penalty += self.BASE_SPIKE * (1.0 + overflow_viol)
+            self.violation_count += 1
+            self.g4_violation_count += 1
+            if self.lagrange_updates_enabled:
+                self.overflow_lambda = min(self.lagrange_max,
+                    self.overflow_lambda + self.lagrange_lr * overflow_viol)
+        elif self.lagrange_updates_enabled:
+            self.overflow_lambda *= (1.0 - self.lagrange_decay)
+        constraint_penalty += g4_penalty
+
+        # g5: Reactor Underflow
+        g5_penalty = 0.0
+        # Buffer zone
+        if self.state[3] < self.UNDERFLOW_BUFFER_L:
+            zone_width = max(self.UNDERFLOW_BUFFER_L - self.DRY_FLOOR, 1.0)
+            depth = min(1.0, (self.UNDERFLOW_BUFFER_L - self.state[3]) / zone_width)
+            g5_penalty += self.BUFFER_COEF * depth * depth
+        # Hard constraint
+        underflow_viol = max(0.0, (self.DRY_FLOOR - self.state[3]) / self.DRY_FLOOR)
+        if underflow_viol > 0:
+            g5_penalty += self.underflow_lambda * underflow_viol
+            g5_penalty += self.BASE_SPIKE * (1.0 + underflow_viol)
+            self.violation_count += 1
+            self.g5_violation_count += 1
+            if self.lagrange_updates_enabled:
+                self.underflow_lambda = min(self.lagrange_max,
+                    self.underflow_lambda + self.lagrange_lr * underflow_viol)
+        elif self.lagrange_updates_enabled:
+            self.underflow_lambda *= (1.0 - self.lagrange_decay)
+        constraint_penalty += g5_penalty
+
+        # Feedstock barrier (nitrate supply depletion warning)
+        supply_ratio = self.nitrate_supply / self.INITIAL_NITRATE_SUPPLY
+        feedstock_barrier = 0.0
+        if 0.0 < supply_ratio < 0.02:
+            feedstock_barrier += 0.005 * (-np.log(supply_ratio + 0.001))
+        constraint_penalty += feedstock_barrier
+
+        # Smoothing penalty
+        smooth_p = self.smoothing_coef * np.mean(np.square(a_clipped - self.prev_action))
         self.prev_action = a_clipped.copy()
-        
-        # Nitrate Usage Penalty: Gently encourages metabolism efficiency and avoiding overfeeding
+
+        # Nitrate usage penalty (encourage efficiency)
         n_use_p = 0.007 * Fn_phys
-        
-        # Primary Objective: Maximize Phycocyanin Production
-        prod_r = self.state[2] * 10
-        
-        # Aggregate the final step reward signal
-        total_v_p = n_vio_p + q_vio_p
-        step_reward = prod_r - (total_v_p + smooth_p + n_use_p)
-        
-        # Update metrics
-        self.ep_total_reward += step_reward
-        self.ep_rewards.append(step_reward)
-        self.ep_prod_rewards.append(prod_r)
-        self.ep_smooth_penalties.append(smooth_p)
-        self.ep_n_usage_penalties.append(n_use_p)
-        self.ep_violation_penalties.append(total_v_p)
-        self.ep_g1_penalties.append(n_vio_p)
-        self.ep_g2_penalties.append(q_vio_p)
-        self.ep_g3_penalties.append(0.0)
-        
-        # --- Termination & Terminal Penalty ---
+
+        # Trickle penalty during Cleanup (encourage efficient draining)
+        eff_penalty = 0.0005 if self.current_stage == 2 else 0.0
+
+        # Aggregate step reward
+        step_reward = prod_r - (constraint_penalty + smooth_p + n_use_p + eff_penalty)
+
+        # ── Terminal Checks ───────────────────────────────────────────
         done = self.time_step_count >= self.max_steps
+
         if done:
-            # g3: Terminal Nitrate check [cite: 691]
+            # g3: Terminal Nitrate
             t_ratio = self.state[1] / self.N_LIMIT_TERM
             t_penalty = 0.0
-            
             if t_ratio > 0.995 and t_ratio < 1.0:
                 t_penalty -= minor_coef * np.log(1.005 - t_ratio) * 100
-                
             if t_ratio > 1.0:
                 t_penalty += severe_coef * (t_ratio - 1.0) * 100
                 self.violation_count += 1
                 self.g3_violation_count += 1
             else:
-                self.ep_total_reward += 50.0 # Success bonus
-                
-            if t_penalty > 0:
-                step_reward -= t_penalty
-                self.ep_total_reward -= t_penalty
-                self.ep_violation_penalties[-1] += t_penalty
-                self.ep_g3_penalties[-1] += t_penalty
-                self.ep_rewards[-1] -= t_penalty
+                self.ep_total_reward += 50.0  # Success bonus
+
+            # Terminal Idle Penalty: must be in Idle (stage 3) at t=500h
+            idle_penalty = 0.0
+            if self.current_stage != 3:
+                idle_penalty = 500.0
+
+            terminal_penalty = t_penalty + idle_penalty
+            if terminal_penalty > 0:
+                step_reward -= terminal_penalty
+
+        # Update metrics
+        self.ep_total_reward += step_reward
+        self.ep_rewards.append(step_reward)
+        self.ep_prod_rewards.append(prod_r)
+        self.ep_smooth_penalties.append(smooth_p)
+        self.ep_constraint_penalties.append(constraint_penalty)
 
         info = {
-            "avg_reward": float(np.mean(self.ep_rewards)),
-            "total_reward": self.ep_total_reward,
-            "avg_prod_reward": float(np.mean(self.ep_prod_rewards)),
-            "avg_smooth_penalty": float(np.mean(self.ep_smooth_penalties)),
-            "avg_nitrate_usage_penalty": float(np.mean(self.ep_n_usage_penalties)),
-            "avg_violation_penalty": float(np.mean(self.ep_violation_penalties)),
-            "avg_g1_penalty": float(np.mean(self.ep_g1_penalties)),
-            "avg_g2_penalty": float(np.mean(self.ep_g2_penalties)),
-            "avg_g3_penalty": float(np.mean(self.ep_g3_penalties)),
-            "violation_count": self.violation_count,
-            "g1_violation_count": self.g1_violation_count,
-            "g2_violation_count": self.g2_violation_count,
-            "g3_violation_count": self.g3_violation_count
+            "avg_reward":             float(np.mean(self.ep_rewards)),
+            "total_reward":           self.ep_total_reward,
+            "avg_prod_reward":        float(np.mean(self.ep_prod_rewards)),
+            "avg_smooth_penalty":     float(np.mean(self.ep_smooth_penalties)),
+            "avg_constraint_penalty": float(np.mean(self.ep_constraint_penalties)),
+            "violation_count":        self.violation_count,
+            "g1_violation_count":     self.g1_violation_count,
+            "g2_violation_count":     self.g2_violation_count,
+            "g3_violation_count":     self.g3_violation_count,
+            "g4_violation_count":     self.g4_violation_count,
+            "g5_violation_count":     self.g5_violation_count,
+            "current_stage":          self.current_stage,
+            "volume":                 float(self.state[3]),
+            "nitrate_supply":         float(self.nitrate_supply),
+            "total_cq_harvested":     float(self.total_cq_harvested),
         }
-        
+
         return self.get_state_norm(), step_reward, done, info
