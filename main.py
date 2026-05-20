@@ -1,9 +1,15 @@
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning,
+                        message=r".*Detected call of `lr_scheduler\.step\(\)` before `optimizer\.step\(\)`.*")
+
 import torch
 import torch.nn as nn
 import numpy as np
 import os
+from collections import deque
 from tqdm import tqdm
-from env import PhycocyaninEnv
+from env_bench import PhycocyaninEnvBench
+from env_safe import PhycocyaninEnvSafe
 from lag_agent import StandardRL_Agent
 from safe_agent import SPRL_Agent
 from utils import DataLogger, Plotter
@@ -16,14 +22,15 @@ STATE_DIM = 11     # [Cx, CN, Cq, V, stage_0..3, credit, t_norm, supply]
 ACTION_DIM = 4     # [time_mult, I, Fn, Fout]
 MAX_EPISODES = 50000
 UPDATE_TIMESTEP = 1000
-K_EPOCHS = 40
-EPS_CLIP = 0.3
-GAMMA = 0.99
-LR_ACTOR = 3e-4
-LR_CRITIC = 1e-3
+K_EPOCHS = 3
+EPS_CLIP = 0.2
+GAMMA = 0.95
+LR_ACTOR = 5e-5
+LR_CRITIC = 1e-4
 MIN_LR = 1e-5
-ENTROPY_COEFF = 0.05
-EVALUATE_ONLY = True
+INITIAL_ENTROPY = 0.05
+MIN_ENTROPY = 1e-5
+EVALUATE_ONLY = False
 NOISE_STD = 0.1
 
 class Memory:
@@ -37,17 +44,18 @@ class Memory:
 def train_agent(agent_name, agent, logger):
     """Primary training loop for a specified RL agent."""
     print(f"\n--- Starting Training: {agent_name} ---")
-    env = PhycocyaninEnv()
-    env.is_training = True
+    env = PhycocyaninEnvSafe() if agent_name == "SPRL" else PhycocyaninEnvBench()
     memory = Memory()
-    scheduler = LinearLR(agent.optimizer, start_factor=1.0, end_factor=0.01, total_iters=MAX_EPISODES)
+    scheduler = LinearLR(agent.optimizer, start_factor=1.0, end_factor=MIN_LR / LR_ACTOR, total_iters=MAX_EPISODES)
 
     time_step = 0
-    rewards_history = []
-    best_moving_avg = -float('inf')
-    plateau_counter = 0
-
-    WINDOW_SIZE, PATIENCE, EARLY_EXIT_START = 150, 1500, 15000
+    WINDOW_SIZE = 200
+    EARLY_STOP_WARMUP = 5000
+    EARLY_STOP_PATIENCE = 3000
+    min_improvement = 1e-4
+    rewards_window = deque(maxlen=WINDOW_SIZE)
+    best_avg_reward = -float('inf')
+    no_improve_count = 0
 
     pbar = tqdm(range(1, MAX_EPISODES + 1), desc=f"Training {agent_name}")
     for i_episode in pbar:
@@ -56,6 +64,8 @@ def train_agent(agent_name, agent, logger):
 
         if hasattr(agent, 'reset_hidden'):
             agent.reset_hidden()
+        elif hasattr(agent, 'reset'):
+            agent.reset()
 
         while True:
             time_step += 1
@@ -80,20 +90,29 @@ def train_agent(agent_name, agent, logger):
 
             if done: break
 
+        # Anneal entropy coefficient proportionally to remaining LR headroom.
+        curr_lr = agent.optimizer.param_groups[0]['lr']
+        cos_frac = (curr_lr - MIN_LR) / (LR_ACTOR - MIN_LR + 1e-12)
+        agent.entropy_coeff = MIN_ENTROPY + (INITIAL_ENTROPY - MIN_ENTROPY) * cos_frac
+
         scheduler.step()
         logger.log_training_episode(agent_name, current_ep_reward, info["violation_count"])
-        rewards_history.append(current_ep_reward)
+        rewards_window.append(current_ep_reward)
 
-        if i_episode >= EARLY_EXIT_START:
-            recent_avg = np.mean(rewards_history[-WINDOW_SIZE:])
-            if recent_avg > best_moving_avg:
-                best_moving_avg = recent_avg
-                plateau_counter = 0
+        if i_episode > EARLY_STOP_WARMUP and len(rewards_window) == WINDOW_SIZE:
+            avg_reward = np.mean(rewards_window)
+            if avg_reward > best_avg_reward * (1 + min_improvement):
+                best_avg_reward = avg_reward
+                no_improve_count = 0
+                os.makedirs("policy", exist_ok=True)
+                torch.save(agent.policy.state_dict(),
+                           os.path.join("policy", f"{agent_name}_best_weights.pth"))
             else:
-                plateau_counter += 1
+                no_improve_count += 1
 
-            if plateau_counter >= PATIENCE:
-                print(f"Early stopping triggered at episode {i_episode}.")
+            if no_improve_count >= EARLY_STOP_PATIENCE:
+                print(f"[Early Stopping] No improvement for {EARLY_STOP_PATIENCE} episodes. "
+                      f"Best avg reward: {best_avg_reward:.3f}")
                 break
 
         if i_episode % 10 == 0:
@@ -102,7 +121,9 @@ def train_agent(agent_name, agent, logger):
                 "Stage": f"{info['current_stage']}",
                 "Vol": f"{info['volume']:.1f}",
                 "Vio": f"{info['violation_count']}",
-                "LR": f"{agent.optimizer.param_groups[0]['lr']:.1e}"
+                "LR": f"{agent.optimizer.param_groups[0]['lr']:.1e}",
+                "Ent": f"{agent.entropy_coeff:.2e}",
+                "NoImp": no_improve_count
             })
 
     os.makedirs("policy", exist_ok=True)
@@ -120,8 +141,8 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
         agent.policy.load_state_dict(torch.load(load_path))
         agent.policy.eval()
 
-    env = PhycocyaninEnv()
-    total_g1, total_g2, total_g3, total_g4, total_g5 = 0, 0, 0, 0, 0
+    env = PhycocyaninEnvSafe() if agent_name == "SPRL" else PhycocyaninEnvBench()
+    total_g1, total_g2, total_g3, total_g4 = 0, 0, 0, 0
 
     all_episodes = []
     all_nitrate_trajectories    = []
@@ -155,7 +176,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
                 if agent_name == "SPRL":
                     noisy_t = torch.FloatTensor(noisy_intent).to(state_t.device).unsqueeze(0)
                     # For SPRL, apply the projection filter
-                    from env import PhycocyaninEnv as _Env
+                    from env_core import PhycocyaninEnvCore as _Env
                     mask = _Env.get_action_mask(state_t)
                     default_sq = torch.tensor([-0.333, -1.0, -1.0, -1.0], device=state_t.device)
                     noisy_t = noisy_t * mask + default_sq * (1 - mask)
@@ -192,17 +213,15 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
                 last_info.get("g1_violation_count", 0),
                 last_info.get("g2_violation_count", 0),
                 last_info.get("g3_violation_count", 0),
-                last_info.get("g4_violation_count", 0),
-                last_info.get("g5_violation_count", 0)
+                last_info.get("g4_violation_count", 0)
             )
             total_g1 += last_info.get("g1_violation_count", 0)
             total_g2 += last_info.get("g2_violation_count", 0)
             total_g3 += last_info.get("g3_violation_count", 0)
             total_g4 += last_info.get("g4_violation_count", 0)
-            total_g5 += last_info.get("g5_violation_count", 0)
 
     print(f"{agent_name} Violations — G1: {total_g1}, G2: {total_g2}, "
-          f"G3: {total_g3}, G4: {total_g4}, G5: {total_g5}")
+          f"G3: {total_g3}, G4: {total_g4}")
 
     all_episodes.sort(key=lambda x: x[0])
     mid_idx = len(all_episodes) // 2
@@ -240,9 +259,9 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
 if __name__ == "__main__":
     logger = DataLogger()
     lag_agent  = StandardRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC,
-                                  GAMMA, K_EPOCHS, EPS_CLIP, ENTROPY_COEFF)
+                                  GAMMA, K_EPOCHS, EPS_CLIP, INITIAL_ENTROPY)
     sprl_agent = SPRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC,
-                             GAMMA, K_EPOCHS, EPS_CLIP, ENTROPY_COEFF)
+                             GAMMA, K_EPOCHS, EPS_CLIP, INITIAL_ENTROPY)
 
     if not EVALUATE_ONLY:
         train_agent("Standard RL", lag_agent, logger)

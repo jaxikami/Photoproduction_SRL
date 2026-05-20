@@ -93,10 +93,9 @@ def integrate_rk4(state_init, I, Fn, F_out, dt, n_steps):
 # REINFORCEMENT LEARNING ENVIRONMENT
 # =============================================================================
 
-class PhycocyaninEnv:
+class PhycocyaninEnvCore:
     """
-    Multi-stage photobioreactor RL environment with volume tracking,
-    Lagrangian constraint enforcement, and adaptive time scheduling.
+    Multi-stage photobioreactor RL environment core.
 
     Stages:
         0 — Growth:     Rapid biomass accumulation (I: 120-400, Fn: 0-40)
@@ -146,30 +145,6 @@ class PhycocyaninEnv:
         self.dt = 10.0 / 60.0   # 10 minutes (0.1667 h)
         self.n_inner_steps = int(self.control_freq / self.dt)  # 60
 
-        # ── Lagrangian Multiplier Constraint Enforcement ──────────────
-        self.lagrange_lr          = 0.5
-        self.lagrange_decay       = 0.5 / 600.0
-        self.lagrange_target_slack = 0.0
-        self.lagrange_max         = 10.0
-
-        # Buffer-zone soft-wall coefficients
-        self.BUFFER_COEF              = 0.02
-        self.OVERFLOW_BUFFER_FRAC     = 0.10   # Activates at 90% V_MAX
-        self.UNDERFLOW_BUFFER_L       = 10.0   # Activates at V < 10 L
-        self.DRY_FLOOR                = self.V_MIN
-
-        # Per-constraint λ multipliers
-        self.g1_lambda = 0.0
-        self.g2_lambda = 0.0
-        self.overflow_lambda  = 0.0
-        self.underflow_lambda = 0.0
-
-        self.BASE_SPIKE       = 0.1
-        self.smoothing_coef   = 0.005
-
-        self.lagrange_updates_enabled = True
-        self.reset_lambdas_per_episode = False
-
         self.reset()
 
     def reset(self, randomize=False):
@@ -205,13 +180,6 @@ class PhycocyaninEnv:
 
         # Action smoothing
         self.prev_action = np.zeros(4)
-
-        # Per-episode λ reset
-        if self.reset_lambdas_per_episode:
-            self.g1_lambda = 0.0
-            self.g2_lambda = 0.0
-            self.overflow_lambda = 0.0
-            self.underflow_lambda = 0.0
 
         # Violation tracking
         self.violation_count = 0
@@ -287,11 +255,13 @@ class PhycocyaninEnv:
         """Smooth transition factor ∈ [0, 1] for hysteretic switching."""
         return 1.0 / (1.0 + np.exp(-(x - center) / max(width, 0.01)))
 
-    def step(self, action):
+    def _physics_step(self, action):
         """
-        Executes one control step (10 hours) with stage-aware action masking,
-        adaptive time scaling, volume-tracked CSTR integration, and
-        Lagrangian constraint enforcement.
+        Executes one control step (10 hours) physics simulation.
+        Returns:
+            a_clipped (ndarray): The clipped action.
+            Fn_phys (float): The actual nitrate feed applied.
+            done (bool): Whether the max time steps has been reached.
         """
         a_clipped = np.clip(action, -1.0, 1.0)
         a_scaled  = (a_clipped + 1.0) / 2.0   # [0, 1]
@@ -380,163 +350,6 @@ class PhycocyaninEnv:
         self.time += self.control_freq
         self.time_step_count += 1
 
-        # ── Reward Construction ───────────────────────────────────────
-        is_training = getattr(self, 'is_training', False)
-        minor_coef  = 2 if is_training else 0
-        severe_coef = 200
-
-        # Primary objective: Phycocyanin production (dense per-step)
-        prod_r = self.state[2] * 10.0
-
-        # ── Lagrangian Constraint Penalties ────────────────────────────
-        constraint_penalty = 0.0
-
-        # g1: Path Nitrate Violation
-        g1_penalty = 0.0
-        n_ratio = self.state[1] / self.N_LIMIT_PATH
-        if n_ratio > 0.995 and n_ratio < 1.0:
-            g1_penalty -= minor_coef * np.log(1.005 - n_ratio)
-        if n_ratio > 1.0:
-            viol = n_ratio - 1.0
-            g1_penalty += self.g1_lambda * viol + self.BASE_SPIKE * (1.0 + viol)
-            self.violation_count += 1
-            self.g1_violation_count += 1
-            if self.lagrange_updates_enabled:
-                self.g1_lambda = min(self.lagrange_max,
-                    self.g1_lambda + self.lagrange_lr * viol)
-        elif self.lagrange_updates_enabled:
-            self.g1_lambda *= (1.0 - self.lagrange_decay)
-        constraint_penalty += g1_penalty
-
-        # g2: Product Ratio Violation
-        g2_penalty = 0.0
-        ratio = self.state[2] / (self.state[0] + 1e-8)
-        q_ratio = ratio / self.RATIO_LIMIT
-        if q_ratio > 0.995 and q_ratio < 1.0:
-            g2_penalty -= minor_coef * np.log(1.005 - q_ratio)
-        if ratio > self.RATIO_LIMIT:
-            viol = q_ratio - 1.0
-            g2_penalty += self.g2_lambda * viol + self.BASE_SPIKE * (1.0 + viol)
-            self.violation_count += 1
-            self.g2_violation_count += 1
-            if self.lagrange_updates_enabled:
-                self.g2_lambda = min(self.lagrange_max,
-                    self.g2_lambda + self.lagrange_lr * viol)
-        elif self.lagrange_updates_enabled:
-            self.g2_lambda *= (1.0 - self.lagrange_decay)
-        constraint_penalty += g2_penalty
-
-        # g4: Reactor Overflow
-        g4_penalty = 0.0
-        v_frac = self.state[3] / self.V_MAX
-        # Buffer zone (quadratic ramp near 90% capacity)
-        overflow_edge = 1.0 - self.OVERFLOW_BUFFER_FRAC
-        if v_frac > overflow_edge:
-            depth = min(1.0, (v_frac - overflow_edge) / self.OVERFLOW_BUFFER_FRAC)
-            g4_penalty += self.BUFFER_COEF * depth * depth
-        # Hard constraint
-        overflow_viol = max(0.0, v_frac - 1.0)
-        if overflow_viol > 0:
-            g4_penalty += self.overflow_lambda * overflow_viol
-            g4_penalty += self.BASE_SPIKE * (1.0 + overflow_viol)
-            self.violation_count += 1
-            self.g4_violation_count += 1
-            if self.lagrange_updates_enabled:
-                self.overflow_lambda = min(self.lagrange_max,
-                    self.overflow_lambda + self.lagrange_lr * overflow_viol)
-        elif self.lagrange_updates_enabled:
-            self.overflow_lambda *= (1.0 - self.lagrange_decay)
-        constraint_penalty += g4_penalty
-
-        # g5: Reactor Underflow
-        g5_penalty = 0.0
-        # Buffer zone
-        if self.state[3] < self.UNDERFLOW_BUFFER_L:
-            zone_width = max(self.UNDERFLOW_BUFFER_L - self.DRY_FLOOR, 1.0)
-            depth = min(1.0, (self.UNDERFLOW_BUFFER_L - self.state[3]) / zone_width)
-            g5_penalty += self.BUFFER_COEF * depth * depth
-        # Hard constraint
-        underflow_viol = max(0.0, (self.DRY_FLOOR - self.state[3]) / self.DRY_FLOOR)
-        if underflow_viol > 0:
-            g5_penalty += self.underflow_lambda * underflow_viol
-            g5_penalty += self.BASE_SPIKE * (1.0 + underflow_viol)
-            self.violation_count += 1
-            self.g5_violation_count += 1
-            if self.lagrange_updates_enabled:
-                self.underflow_lambda = min(self.lagrange_max,
-                    self.underflow_lambda + self.lagrange_lr * underflow_viol)
-        elif self.lagrange_updates_enabled:
-            self.underflow_lambda *= (1.0 - self.lagrange_decay)
-        constraint_penalty += g5_penalty
-
-        # Feedstock barrier (nitrate supply depletion warning)
-        supply_ratio = self.nitrate_supply / self.INITIAL_NITRATE_SUPPLY
-        feedstock_barrier = 0.0
-        if 0.0 < supply_ratio < 0.02:
-            feedstock_barrier += 0.005 * (-np.log(supply_ratio + 0.001))
-        constraint_penalty += feedstock_barrier
-
-        # Smoothing penalty
-        smooth_p = self.smoothing_coef * np.mean(np.square(a_clipped - self.prev_action))
-        self.prev_action = a_clipped.copy()
-
-        # Nitrate usage penalty (encourage efficiency)
-        n_use_p = 0.007 * Fn_phys
-
-        # Trickle penalty during Cleanup (encourage efficient draining)
-        eff_penalty = 0.0005 if self.current_stage == 2 else 0.0
-
-        # Aggregate step reward
-        step_reward = prod_r - (constraint_penalty + smooth_p + n_use_p + eff_penalty)
-
-        # ── Terminal Checks ───────────────────────────────────────────
         done = self.time_step_count >= self.max_steps
 
-        if done:
-            # g3: Terminal Nitrate
-            t_ratio = self.state[1] / self.N_LIMIT_TERM
-            t_penalty = 0.0
-            if t_ratio > 0.995 and t_ratio < 1.0:
-                t_penalty -= minor_coef * np.log(1.005 - t_ratio) * 100
-            if t_ratio > 1.0:
-                t_penalty += severe_coef * (t_ratio - 1.0) * 100
-                self.violation_count += 1
-                self.g3_violation_count += 1
-            else:
-                self.ep_total_reward += 50.0  # Success bonus
-
-            # Terminal Idle Penalty: must be in Idle (stage 3) at t=500h
-            idle_penalty = 0.0
-            if self.current_stage != 3:
-                idle_penalty = 500.0
-
-            terminal_penalty = t_penalty + idle_penalty
-            if terminal_penalty > 0:
-                step_reward -= terminal_penalty
-
-        # Update metrics
-        self.ep_total_reward += step_reward
-        self.ep_rewards.append(step_reward)
-        self.ep_prod_rewards.append(prod_r)
-        self.ep_smooth_penalties.append(smooth_p)
-        self.ep_constraint_penalties.append(constraint_penalty)
-
-        info = {
-            "avg_reward":             float(np.mean(self.ep_rewards)),
-            "total_reward":           self.ep_total_reward,
-            "avg_prod_reward":        float(np.mean(self.ep_prod_rewards)),
-            "avg_smooth_penalty":     float(np.mean(self.ep_smooth_penalties)),
-            "avg_constraint_penalty": float(np.mean(self.ep_constraint_penalties)),
-            "violation_count":        self.violation_count,
-            "g1_violation_count":     self.g1_violation_count,
-            "g2_violation_count":     self.g2_violation_count,
-            "g3_violation_count":     self.g3_violation_count,
-            "g4_violation_count":     self.g4_violation_count,
-            "g5_violation_count":     self.g5_violation_count,
-            "current_stage":          self.current_stage,
-            "volume":                 float(self.state[3]),
-            "nitrate_supply":         float(self.nitrate_supply),
-            "total_cq_harvested":     float(self.total_cq_harvested),
-        }
-
-        return self.get_state_norm(), step_reward, done, info
+        return a_clipped, Fn_phys, done
