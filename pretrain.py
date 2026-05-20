@@ -5,15 +5,15 @@ Trains the ActionProjectionNetwork as a margin regressor covering:
   G1 — Nitrate path constraint  (cN + Fn*10h ≤ 800 mg/L)
   G2 — Product/biomass ratio    (cq/cx ≤ 0.011)
   G4 — Reactor overflow         (V ≤ 50 L)
-  G5 — Reactor underflow        (V ≥ 5 L)
 
 Note: G3 (terminal nitrate ≤ 150 mg/L) is handled by the GRU's temporal
 context and the Lagrangian multiplier, not by the APN.
 
 Architecture (11D state + 4D action = 15 input):
-  Linear(15→64) → LayerNorm → Mish
-  → 1× Residual block (64→64)
-  → Linear(64→1) [raw margin]
+  Linear(15→128) → LayerNorm → Mish
+  → 3× Residual blocks (128→128)
+  → Linear(128→1) [raw margin]
+  + 4× per-constraint auxiliary heads (train-only)
 """
 
 import os
@@ -40,12 +40,11 @@ class ActionProjectionNetwork(nn.Module):
       margin < 0  →  unsafe
       margin = 0  →  on the safety boundary
 
-    Architecture: wider (128-dim) with 2 residual blocks for better
-    boundary discrimination across all 4 constraints.
+    auxiliary heads for improved boundary discrimination.
     """
 
     def __init__(self, state_dim: int = 11, action_dim: int = 4,
-                 latent_dim: int = 128):
+                 latent_dim: int = 160):
         super(ActionProjectionNetwork, self).__init__()
 
         self.encoder = nn.Sequential(
@@ -54,7 +53,7 @@ class ActionProjectionNetwork(nn.Module):
             nn.Mish()
         )
 
-        # Two residual blocks for depth
+        # Three residual blocks for depth
         self.res_block1 = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim),
@@ -69,9 +68,21 @@ class ActionProjectionNetwork(nn.Module):
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim)
         )
+        self.res_block3 = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.LayerNorm(latent_dim),
+            nn.Mish(),
+            nn.Linear(latent_dim, latent_dim),
+            nn.LayerNorm(latent_dim)
+        )
         self.res_act = nn.Mish()
 
         self.margin_head = nn.Linear(latent_dim, 1)
+
+        # Per-constraint auxiliary heads (train-only, direct gradient signal)
+        self.g1_head = nn.Linear(latent_dim, 1)
+        self.g2_head = nn.Linear(latent_dim, 1)
+        self.g4_head = nn.Linear(latent_dim, 1)
 
         nn.init.zeros_(self.margin_head.weight)
         nn.init.zeros_(self.margin_head.bias)
@@ -81,8 +92,22 @@ class ActionProjectionNetwork(nn.Module):
         x_enc = self.encoder(x_in)
         x_enc = self.res_act(x_enc + self.res_block1(x_enc))
         x_enc = self.res_act(x_enc + self.res_block2(x_enc))
+        x_enc = self.res_act(x_enc + self.res_block3(x_enc))
         margin = self.margin_head(x_enc).squeeze(-1)
         return margin
+
+    def forward_aux(self, state_norm, action_norm):
+        """Forward pass returning main margin + per-constraint auxiliary margins."""
+        x_in = torch.cat([state_norm, action_norm], dim=-1)
+        x_enc = self.encoder(x_in)
+        x_enc = self.res_act(x_enc + self.res_block1(x_enc))
+        x_enc = self.res_act(x_enc + self.res_block2(x_enc))
+        x_enc = self.res_act(x_enc + self.res_block3(x_enc))
+        margin = self.margin_head(x_enc).squeeze(-1)
+        g1 = self.g1_head(x_enc).squeeze(-1)
+        g2 = self.g2_head(x_enc).squeeze(-1)
+        g4 = self.g4_head(x_enc).squeeze(-1)
+        return margin, g1, g2, g4
 
     def classify(self, state_norm, action_norm):
         return torch.sigmoid(self.forward(state_norm, action_norm))
@@ -172,7 +197,7 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
     patience = 3000
     window_size = 200
     improvement_threshold = 1e-4
-    min_training = 10000
+    min_training = 15000
 
     pbar = tqdm(range(epochs), desc="Training Safety Classifier")
 
@@ -185,14 +210,18 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
     # Asynchronous data generation background worker
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     future_dataset = None
+    latest_pass_rates = None
 
     # Initial explicit dataset spawn
-    b_s_raw, b_a_raw, b_labels, b_margins = get_fresh_batch_dataset(
-        buffer_size, bias=0.7)
+    b_s_raw, b_a_raw, b_labels, b_margins, b_mg1, b_mg2, b_mg4 = \
+        get_fresh_batch_dataset(buffer_size, bias=0.7, pass_rates=latest_pass_rates)
     b_s_raw = b_s_raw.to(device)
     b_a_raw = b_a_raw.to(device)
     b_labels = b_labels.to(device)
     b_margins = b_margins.to(device)
+    b_mg1 = b_mg1.to(device)
+    b_mg2 = b_mg2.to(device)
+    b_mg4 = b_mg4.to(device)
 
     # Print class balance diagnostics for the initial dataset
     safe_ratio = b_labels.mean().item()
@@ -207,18 +236,22 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
             # accuracy continuously across completely distinct batches of randomized sample points.
 
             if epoch > 0 and future_dataset is not None:
-                b_s_raw, b_a_raw, b_labels, b_margins = future_dataset.result()
+                b_s_raw, b_a_raw, b_labels, b_margins, b_mg1, b_mg2, b_mg4 = \
+                    future_dataset.result()
                 b_s_raw = b_s_raw.to(device)
                 b_a_raw = b_a_raw.to(device)
                 b_labels = b_labels.to(device)
                 b_margins = b_margins.to(device)
+                b_mg1 = b_mg1.to(device)
+                b_mg2 = b_mg2.to(device)
+                b_mg4 = b_mg4.to(device)
                 safe_ratio = b_labels.mean().item()
                 print(
                     f"\n[Data] Refreshed class balance at epoch {epoch}: {safe_ratio:.2%} safe, {1-safe_ratio:.2%} unsafe")
 
             # Spawn the next required dataset batch asynchronously
             future_dataset = executor.submit(
-                get_fresh_batch_dataset, buffer_size, 0.7)
+                get_fresh_batch_dataset, buffer_size, 0.7, latest_pass_rates)
 
         model.train()
         epoch_loss = 0.0
@@ -234,44 +267,65 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
             b_y = b_labels[batch_idx]      # [batch] — 1.0 safe, 0.0 unsafe
             # [batch] — continuous physical margin
             b_m = b_margins[batch_idx]
+            b_m_g1 = b_mg1[batch_idx]
+            b_m_g2 = b_mg2[batch_idx]
+            b_m_g4 = b_mg4[batch_idx]
 
             optimizer.zero_grad()
 
             def calculate_loss():
                 """
-                Composite boundary-learning loss with two components:
+                Composite boundary-learning loss with three components:
 
-                1. BCE (boundary signal, primary, 60% weight):
+                1. BCE with focal modulation (boundary signal, primary):
                    Uses margin_pred as a logit against the hard safe/unsafe class.
-                   Gradient is always O(1) — no stalling from tiny margin values.
-                   Boundary-emphasis weights concentrate learning at margin=0.
+                   Focal weighting concentrates on hard-to-classify boundary samples.
 
-                2. Scaled regression (magnitude calibration, secondary, 40% weight):
+                2. Scaled regression (magnitude calibration):
                    SmoothL1(margin_pred, b_m * MARGIN_SCALE).
-                   Calibrates the output range so sigmoid(margin_pred) maps to
-                   the 0.95 inference threshold correctly for comfortable safe actions.
 
-                Sign-accuracy: fraction where predicted sign matches ground truth.
+                3. Per-constraint auxiliary BCE (G2/G5 upweighted 1.5×):
+                   Each aux head gets direct gradient from its own constraint.
                 """
-                margin_pred = model(b_s, b_a)
+                margin_pred, aux_g1, aux_g2, aux_g4 = model.forward_aux(b_s, b_a)
 
                 # Hard class target from physical margin sign
                 sign_target = (b_m >= 0.0).float()
 
-                # Boundary-emphasis: upweight samples near margin=0 (most uncertain).
-                # Normalise so the mean weight is 1, preserving effective batch size.
+                # Boundary-emphasis weights
                 boundary_weight = 1.0 / (b_m.abs() * MARGIN_SCALE + 0.5)
                 boundary_weight = boundary_weight / \
                     (boundary_weight.mean() + 1e-8)
 
-                # 1. BCE component: trains the safe/unsafe boundary
-                l_bce = F.binary_cross_entropy_with_logits(
-                    margin_pred, sign_target, weight=boundary_weight)
+                # Focal-loss modulation: (1 - p_t)^gamma downweights easy samples
+                with torch.no_grad():
+                    p_pred = torch.sigmoid(margin_pred)
+                    p_t = sign_target * p_pred + (1.0 - sign_target) * (1.0 - p_pred)
+                    focal_weight = (1.0 - p_t) ** 2.0  # gamma=2
+                    focal_weight = focal_weight / (focal_weight.mean() + 1e-8)
 
-                # 2. Scaled regression: calibrates margin magnitude
+                combined_weight = boundary_weight * focal_weight
+
+                # 1. Focal BCE component
+                l_bce = F.binary_cross_entropy_with_logits(
+                    margin_pred, sign_target, weight=combined_weight)
+
+                # 2. Scaled regression
                 l_reg = F.smooth_l1_loss(margin_pred, b_m * MARGIN_SCALE)
 
-                loss = 0.6 * l_bce + 0.4 * l_reg
+                # 3. Per-constraint auxiliary BCE losses
+                target_g1 = (b_m_g1 >= 0.0).float()
+                target_g2 = (b_m_g2 >= 0.0).float()
+                target_g4 = (b_m_g4 >= 0.0).float()
+
+                l_aux_g1 = F.binary_cross_entropy_with_logits(aux_g1, target_g1)
+                l_aux_g2 = F.binary_cross_entropy_with_logits(aux_g2, target_g2)
+                l_aux_g4 = F.binary_cross_entropy_with_logits(aux_g4, target_g4)
+
+                l_aux = (1.5 * l_aux_g1 + 2.0 * l_aux_g2 + 1.5 * l_aux_g4) / 5.0
+
+                loss = 0.4 * l_bce + 0.25 * l_reg + 0.35 * l_aux
+
                 pred_safe = (margin_pred.detach() >= 0.0)
                 truth_safe = (b_m >= 0.0)
                 correct = (pred_safe == truth_safe).sum().item()
@@ -329,7 +383,7 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
                 f"\n[Success] Safety Classifier reached accuracy threshold. Running full validation suite...")
             model.eval()
             from validation import run_validation
-            all_passed = run_validation(model)
+            all_passed, latest_pass_rates = run_validation(model)
 
             # Unfreeze for potential further training
             for p in model.parameters():
@@ -349,7 +403,7 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
                 f"\n[Validation] Periodic validation check at epoch {epoch}...")
             model.eval()
             from validation import run_validation
-            all_passed = run_validation(model)
+            all_passed, latest_pass_rates = run_validation(model, num_test_samples=500)
 
             for p in model.parameters():
                 p.requires_grad_(True)

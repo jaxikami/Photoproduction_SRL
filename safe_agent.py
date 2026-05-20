@@ -18,14 +18,15 @@ class ActionProjectionNetwork(nn.Module):
       margin < 0  →  action is unsafe
       margin = 0  →  action is on the safety boundary
 
-    Constraints covered: G1, G2, G4 (overflow), G5 (underflow).
+    Constraints covered: G1, G2, G4 (overflow).
     G3 (terminal nitrate) is handled by the GRU temporal context and
     Lagrangian multiplier.
 
     Architecture:
       Linear(15→128) → LayerNorm → Mish
-      → 2× Residual blocks (128→128)
+      → 3× Residual blocks (128→128)
       → Linear(128→1)  [raw margin]
+      + 3 per-constraint auxiliary heads (train-only)
     """
     def __init__(self, state_dim: int = 11, action_dim: int = 4,
                  latent_dim: int = 128):
@@ -37,7 +38,7 @@ class ActionProjectionNetwork(nn.Module):
             nn.Mish()
         )
 
-        # Two residual blocks for depth
+        # Three residual blocks for depth
         self.res_block1 = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim),
@@ -52,9 +53,21 @@ class ActionProjectionNetwork(nn.Module):
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim)
         )
+        self.res_block3 = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.LayerNorm(latent_dim),
+            nn.Mish(),
+            nn.Linear(latent_dim, latent_dim),
+            nn.LayerNorm(latent_dim)
+        )
         self.res_act = nn.Mish()
 
         self.margin_head = nn.Linear(latent_dim, 1)
+
+        # Per-constraint auxiliary heads (train-only, direct gradient signal)
+        self.g1_head = nn.Linear(latent_dim, 1)
+        self.g2_head = nn.Linear(latent_dim, 1)
+        self.g4_head = nn.Linear(latent_dim, 1)
 
         nn.init.zeros_(self.margin_head.weight)
         nn.init.zeros_(self.margin_head.bias)
@@ -64,6 +77,7 @@ class ActionProjectionNetwork(nn.Module):
         x_enc  = self.encoder(x_in)
         x_enc  = self.res_act(x_enc + self.res_block1(x_enc))
         x_enc  = self.res_act(x_enc + self.res_block2(x_enc))
+        x_enc  = self.res_act(x_enc + self.res_block3(x_enc))
         margin = self.margin_head(x_enc).squeeze(-1)
         return margin
 
@@ -168,14 +182,14 @@ class ActorCritic(nn.Module):
             z_raw    : unbounded Gaussian sample
             hidden   : updated GRU hidden state
         """
-        from env import PhycocyaninEnv
+        from env_core import PhycocyaninEnvCore
 
         fused, hidden = self._encode(state, hidden)
         mean = self.actor(fused)
         std  = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
 
         # Stage mask from observation
-        mask = PhycocyaninEnv.get_action_mask(state[..., :self.env_state_dim])
+        mask = PhycocyaninEnvCore.get_action_mask(state[..., :self.env_state_dim])
 
         # Default intents for masked dims (pre-Tanh values):
         # time_mult → tanh(-0.35) ≈ -0.34 → maps to ~0.5 multiplier
@@ -201,13 +215,13 @@ class ActorCritic(nn.Module):
         Re-evaluates stored intents during the PPO update.
         Hidden state is not threaded (standard PPO practice).
         """
-        from env import PhycocyaninEnv
+        from env_core import PhycocyaninEnvCore
 
         fused, _ = self._encode(state, hidden=None)
         mean     = self.actor(fused)
         std      = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
 
-        mask = PhycocyaninEnv.get_action_mask(state[..., :self.env_state_dim])
+        mask = PhycocyaninEnvCore.get_action_mask(state[..., :self.env_state_dim])
 
         default_intent = torch.full_like(mean, -10.0)
         default_intent[..., 0] = -0.34657359
@@ -297,20 +311,23 @@ class SPRL_Agent:
 
         Uses constant step size with mild decay to avoid premature stalling.
         """
-        from env import PhycocyaninEnv
+        from env_core import PhycocyaninEnvCore
 
         a = action.clone().detach()
         state_fixed = state_norm.detach()
         self._proj_calls += 1
 
         # Stage mask for gradient zeroing
-        stage_mask = PhycocyaninEnv.get_action_mask(state_fixed)
+        stage_mask = PhycocyaninEnvCore.get_action_mask(state_fixed)
 
         with torch.no_grad():
             p = self.safeguard.classify(state_fixed, a)
             if p.item() >= threshold:
                 self._proj_noop += 1
                 return a
+
+        best_a      = a.clone()
+        best_margin = self.safeguard(state_fixed, a).item()
 
         with torch.enable_grad():
             for step in range(max_steps):
@@ -321,6 +338,12 @@ class SPRL_Agent:
                 p = torch.sigmoid(margin)
                 if p.item() >= threshold:
                     return a_var.detach()
+
+                # Track best iterate seen
+                m_val = margin.item()
+                if m_val > best_margin:
+                    best_margin = m_val
+                    best_a      = a_var.detach().clone()
 
                 grad = torch.autograd.grad(margin.sum(), a_var)[0]
 
@@ -338,13 +361,13 @@ class SPRL_Agent:
                     a = a + step_size * grad.sign()
                     a = a.clamp(-1.0, 1.0)
 
-        return a
+        return best_a
 
     def select_action(self, state_norm):
         """
         Full safe action selection: Actor → mask → APN projection → final mask.
         """
-        from env import PhycocyaninEnv
+        from env_core import PhycocyaninEnvCore
 
         with torch.no_grad():
             state_t = torch.FloatTensor(state_norm).to(device).unsqueeze(0)
@@ -353,7 +376,7 @@ class SPRL_Agent:
             z, log_prob, z_raw, self._hidden = self.policy_old.act(state_t, self._hidden)
 
             # Apply SERL mask checkpoint 2 (pre-APN)
-            mask = PhycocyaninEnv.get_action_mask(state_t)
+            mask = PhycocyaninEnvCore.get_action_mask(state_t)
             default_squashed = torch.tensor([-0.333, -1.0, -1.0, -1.0], device=device)
             z_masked = z * mask + default_squashed * (1 - mask)
 
