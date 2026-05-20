@@ -31,11 +31,10 @@ Implemented constraints in `env.py`:
 - `g2` (quality ratio): `Cq/Cx <= 0.011`
 - `g3` (terminal nitrate): `CN <= 150 mg/L` at episode end
 - `g4` (overflow): `V <= 50 L`
-- `g5` (underflow): `V >= 5 L`
 
 Notes:
 
-- APN pretraining covers `g1`, `g2`, `g4`, `g5` (instantaneous constraints).
+- APN pretraining covers `g1`, `g2`, `g4` (instantaneous constraints).
 - `g3` is handled in environment terminal logic and temporal policy behavior.
 
 ## Architecture

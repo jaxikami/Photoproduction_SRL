@@ -28,7 +28,7 @@ plt.rcParams.update({
 class DataLogger:
     """
     Centralized logging architecture for recording agent metrics.
-    Tracks g1–g5 constraint violations plus idle-stage compliance.
+    Tracks g1–g4 constraint violations plus idle-stage compliance.
     """
 
     def __init__(self):
@@ -38,8 +38,8 @@ class DataLogger:
         self.eval_data = {"Standard RL": None, "SPRL": None}
         self.eval_violations = {"Standard RL": [], "SPRL": []}
         self.eval_violations_details = {
-            "Standard RL": {"g1": [], "g2": [], "g3": [], "g4": [], "g5": []},
-            "SPRL":        {"g1": [], "g2": [], "g3": [], "g4": [], "g5": []}
+            "Standard RL": {"g1": [], "g2": [], "g3": [], "g4": []},
+            "SPRL":        {"g1": [], "g2": [], "g3": [], "g4": []}
         }
 
     def log_training_episode(self, agent_name, total_reward, violation_count=0):
@@ -58,13 +58,12 @@ class DataLogger:
 
     def log_evaluation_episode_violations(self, agent_name, violation_count,
                                            g1_count=0, g2_count=0, g3_count=0,
-                                           g4_count=0, g5_count=0):
+                                           g4_count=0):
         self.eval_violations[agent_name].append(violation_count)
         self.eval_violations_details[agent_name]["g1"].append(g1_count)
         self.eval_violations_details[agent_name]["g2"].append(g2_count)
         self.eval_violations_details[agent_name]["g3"].append(g3_count)
         self.eval_violations_details[agent_name]["g4"].append(g4_count)
-        self.eval_violations_details[agent_name]["g5"].append(g5_count)
 
 
 class Plotter:
