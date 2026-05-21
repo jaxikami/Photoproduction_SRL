@@ -11,7 +11,7 @@ from tqdm import tqdm
 from env_bench import PhycocyaninEnvBench
 from env_safe import PhycocyaninEnvSafe
 from lag_agent import StandardRL_Agent
-from safe_agent import SPRL_Agent
+from safe_agent import SPRL_Agent as SafeRL_Agent
 from utils import DataLogger, Plotter
 from torch.optim.lr_scheduler import LinearLR
 
@@ -31,6 +31,7 @@ MIN_LR = 1e-5
 INITIAL_ENTROPY = 0.05
 MIN_ENTROPY = 1e-5
 EVALUATE_ONLY = False
+RUN_BENCHMARK = True   # True → run Standard RL (bench) only; False → run Safe RL only
 NOISE_STD = 0.1
 
 class Memory:
@@ -44,7 +45,7 @@ class Memory:
 def train_agent(agent_name, agent, logger):
     """Primary training loop for a specified RL agent."""
     print(f"\n--- Starting Training: {agent_name} ---")
-    env = PhycocyaninEnvSafe() if agent_name == "SPRL" else PhycocyaninEnvBench()
+    env = PhycocyaninEnvSafe() if agent_name == "Safe RL" else PhycocyaninEnvBench()
     memory = Memory()
     scheduler = LinearLR(agent.optimizer, start_factor=1.0, end_factor=MIN_LR / LR_ACTOR, total_iters=MAX_EPISODES)
 
@@ -116,14 +117,29 @@ def train_agent(agent_name, agent, logger):
                 break
 
         if i_episode % 10 == 0:
+            vio_id_str = "".join(
+                str(k) for k, c in [
+                    (1, info.get("g1_violation_count", 0)),
+                    (2, info.get("g2_violation_count", 0)),
+                    (3, info.get("g3_violation_count", 0)),
+                    (4, info.get("g4_violation_count", 0)),
+                    (5, info.get("g5_violation_count", 0)),
+                ] if c > 0
+            ) or "-"
             pbar.set_postfix({
+                "TotR": f"{info['total_reward']:.1f}",
                 "AvgR": f"{info['avg_reward']:.3f}",
-                "Stage": f"{info['current_stage']}",
-                "Vol": f"{info['volume']:.1f}",
-                "Vio": f"{info['violation_count']}",
-                "LR": f"{agent.optimizer.param_groups[0]['lr']:.1e}",
-                "Ent": f"{agent.entropy_coeff:.2e}",
-                "NoImp": no_improve_count
+                "VioID": vio_id_str,
+                "g1P": f"{info['avg_g1_penalty']:.2f}",
+                "g2P": f"{info['avg_g2_penalty']:.2f}",
+                "g3P": f"{info['avg_g3_penalty']:.2f}",
+                "g4P": f"{info['avg_g4_penalty']:.2f}",
+                "g5P": f"{info['avg_g5_penalty']:.2f}",
+                "g6P": f"{info['avg_g6_penalty']:.2f}",
+                "SmthP": f"{info['avg_smooth_penalty']:.3f}",
+                "RawMP": f"{info['avg_raw_mat_penalty']:.3f}",
+                "TotVio": f"{info['violation_count']}",
+                "Stage": f"{info['current_stage']}"
             })
 
     os.makedirs("policy", exist_ok=True)
@@ -141,7 +157,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
         agent.policy.load_state_dict(torch.load(load_path))
         agent.policy.eval()
 
-    env = PhycocyaninEnvSafe() if agent_name == "SPRL" else PhycocyaninEnvBench()
+    env = PhycocyaninEnvSafe() if agent_name == "Safe RL" else PhycocyaninEnvBench()
     total_g1, total_g2, total_g3, total_g4 = 0, 0, 0, 0
 
     all_episodes = []
@@ -150,7 +166,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
     all_ratio_trajectories      = []
     all_volume_trajectories     = []
 
-    for _ in range(eval_episodes):
+    for _ in tqdm(range(eval_episodes), desc=f"Evaluating {agent_name}"):
         state = env.reset(randomize=True)
 
         ep_states, ep_actions, ep_rewards, ep_infos = [], [], [], []
@@ -160,7 +176,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
             with torch.no_grad():
                 state_t = torch.FloatTensor(state).to(
                     torch.device("cuda" if torch.cuda.is_available() else "cpu")).unsqueeze(0)
-                if agent_name == "SPRL":
+                if agent_name == "Safe RL":
                     z, _, _, eval_hidden = agent.policy.act(state_t, eval_hidden)
                 else:
                     z, _, _ = agent.policy.act(state_t)
@@ -173,9 +189,9 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
                 noisy_intent = intent
 
             with torch.no_grad():
-                if agent_name == "SPRL":
+                if agent_name == "Safe RL":
                     noisy_t = torch.FloatTensor(noisy_intent).to(state_t.device).unsqueeze(0)
-                    # For SPRL, apply the projection filter
+                    # For Safe RL, apply the projection filter
                     from env_core import PhycocyaninEnvCore as _Env
                     mask = _Env.get_action_mask(state_t)
                     default_sq = torch.tensor([-0.333, -1.0, -1.0, -1.0], device=state_t.device)
@@ -258,19 +274,20 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
 # =============================================================================
 if __name__ == "__main__":
     logger = DataLogger()
-    lag_agent  = StandardRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC,
-                                  GAMMA, K_EPOCHS, EPS_CLIP, INITIAL_ENTROPY)
-    sprl_agent = SPRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC,
-                             GAMMA, K_EPOCHS, EPS_CLIP, INITIAL_ENTROPY)
+
+    if RUN_BENCHMARK:
+        agent      = StandardRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC,
+                                      GAMMA, K_EPOCHS, EPS_CLIP, INITIAL_ENTROPY)
+        agent_name = "Standard RL"
+    else:
+        agent      = SafeRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC,
+                                   GAMMA, K_EPOCHS, EPS_CLIP, INITIAL_ENTROPY)
+        agent_name = "Safe RL"
 
     if not EVALUATE_ONLY:
-        train_agent("Standard RL", lag_agent, logger)
-        train_agent("SPRL", sprl_agent, logger)
+        train_agent(agent_name, agent, logger)
+        if not EVALUATE_ONLY:
+            Plotter.plot_training_violations(logger)
 
-    evaluate_agent("Standard RL", lag_agent, logger, noise_std=NOISE_STD)
-    evaluate_agent("SPRL", sprl_agent, logger, noise_std=NOISE_STD)
-
-    if not EVALUATE_ONLY:
-        Plotter.plot_training_violations(logger)
-
+    evaluate_agent(agent_name, agent, logger, noise_std=NOISE_STD)
     Plotter.plot_comprehensive_evaluation(logger.eval_data, logger.eval_violations)

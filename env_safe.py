@@ -44,14 +44,17 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
     """
 
     def __init__(self):
-        super().__init__()
+        # ── Initialise attributes used by reset() BEFORE super().__init__() ──
+        # super().__init__() calls self.reset(), so these must exist first.
+        self.reset_lambdas_per_episode = False
+        self.lam_g1 = 0.0
+        self.lam_g2 = 0.0
+        self.lam_g3 = 0.0
+        self.lam_g4 = 0.0
+        self.lam_g5 = 0.0
+        self.lam_g6 = 0.0
 
-        # ── Per-constraint Lagrangian multipliers ──────────────────
-        self.lam_g1 = 0.0   # Path nitrate
-        self.lam_g2 = 0.0   # Product ratio
-        self.lam_g3 = 0.0   # Terminal nitrate
-        self.lam_g4 = 0.0   # Volume overflow
-        self.lam_g6 = 0.0   # Idle terminal constraint
+        super().__init__()
 
         # ── Lagrangian update hyperparameters ──────────────────────
         self.lag_lr     = 0.5
@@ -70,12 +73,9 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         self.G2_BUFFER_START = 0.9
 
         # ── Reward shaping coefficients ────────────────────────────
-        self.prod_coef    = 10.0   # Dense per-step Cq concentration scale
+        self.prod_coef    = 4.0    # Dense per-step Cq scale  (4 * (Cq/0.2) ≈ 2 at Cq=0.1)
         self.smooth_coef  = 0.005  # Action-smoothing penalty coefficient
-        self.raw_mat_coef = 0.007  # Nitrate feed usage penalty coefficient
-
-        # Whether to persist λ values across episodes (True = training default)
-        self.reset_lambdas_per_episode = False
+        self.raw_mat_coef = 0.3    # Nitrate feed penalty  (0.3 * Fn/FN_MAX ≈ 0.15 at half-max)
 
         # Disable inherited monolithic Lagrangian attributes to avoid confusion
         self.lagrange_updates_enabled = False
@@ -98,6 +98,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             self.lam_g2 = 0.0
             self.lam_g3 = 0.0
             self.lam_g4 = 0.0
+            self.lam_g5 = 0.0
             self.lam_g6 = 0.0
         return state
 
@@ -110,20 +111,20 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         a_clipped, Fn_phys, done = self._physics_step(action)
 
         # ── Production reward (dense) ──────────────────────────────
-        prod_r = self.prod_coef * self.state[2]
+        prod_r = self.prod_coef * (self.state[2] / 0.2)
 
         # ── Per-constraint Lagrangian penalties ────────────────────
-        constraint_penalty = 0.0
+        p_g1 = p_g2 = p_g3 = p_g4 = p_g5 = p_g6 = 0.0
 
         # g1: Path nitrate (CN ≤ 800 mg/L)
         n_ratio = self.state[1] / self.N_LIMIT_PATH
         if n_ratio > self.G1_BUFFER_START:
             buf_depth = min(1.0, (n_ratio - self.G1_BUFFER_START) /
                            (1.0 - self.G1_BUFFER_START))
-            constraint_penalty += self.BUFFER_COEF * buf_depth ** 2
+            p_g1 += self.BUFFER_COEF * buf_depth ** 2
         if n_ratio > 1.0:
             viol = n_ratio - 1.0
-            constraint_penalty += self.lam_g1 * viol + self.BASE_SPIKE * (1.0 + viol)
+            p_g1 += self.lam_g1 * viol + self.BASE_SPIKE * (1.0 + viol)
             self.lam_g1 = min(self.lag_max, self.lam_g1 + self.lag_lr * viol)
             self.violation_count    += 1
             self.g1_violation_count += 1
@@ -136,10 +137,10 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         if q_ratio > self.G2_BUFFER_START:
             buf_depth = min(1.0, (q_ratio - self.G2_BUFFER_START) /
                            (1.0 - self.G2_BUFFER_START))
-            constraint_penalty += self.BUFFER_COEF * buf_depth ** 2
+            p_g2 += self.BUFFER_COEF * buf_depth ** 2
         if q_ratio > 1.0:
             viol = q_ratio - 1.0
-            constraint_penalty += self.lam_g2 * viol + self.BASE_SPIKE * (1.0 + viol)
+            p_g2 += self.lam_g2 * viol + self.BASE_SPIKE * (1.0 + viol)
             self.lam_g2 = min(self.lag_max, self.lam_g2 + self.lag_lr * viol)
             self.violation_count    += 1
             self.g2_violation_count += 1
@@ -151,15 +152,33 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         overflow_edge = 1.0 - self.OVERFLOW_BUFFER_FRAC
         if v_frac > overflow_edge:
             buf_depth = min(1.0, (v_frac - overflow_edge) / self.OVERFLOW_BUFFER_FRAC)
-            constraint_penalty += self.BUFFER_COEF * buf_depth ** 2
+            p_g4 += self.BUFFER_COEF * buf_depth ** 2
         overflow_viol = max(0.0, v_frac - 1.0)
         if overflow_viol > 0:
-            constraint_penalty += self.lam_g4 * overflow_viol + self.BASE_SPIKE * (1.0 + overflow_viol)
+            p_g4 += self.lam_g4 * overflow_viol + self.BASE_SPIKE * (1.0 + overflow_viol)
             self.lam_g4 = min(self.lag_max, self.lam_g4 + self.lag_lr * overflow_viol)
             self.violation_count    += 1
             self.g4_violation_count += 1
         else:
             self.lam_g4 *= (1.0 - self.lag_decay)
+
+        # g5: Volume underflow (V ≥ V_MIN) — only active in Growth/Production
+        # Cleanup intentionally drains to ~4 L; penalising that would be wrong.
+        if self.current_stage in (0, 1):
+            if self.state[3] < self.UNDERFLOW_BUFFER_L:
+                zone_width = max(self.UNDERFLOW_BUFFER_L - self.DRY_FLOOR, 1.0)
+                buf_depth  = min(1.0, (self.UNDERFLOW_BUFFER_L - self.state[3]) / zone_width)
+                p_g5 += self.BUFFER_COEF * buf_depth ** 2
+            underflow_viol = max(0.0, (self.DRY_FLOOR - self.state[3]) / self.DRY_FLOOR)
+            if underflow_viol > 0:
+                p_g5 += self.lam_g5 * underflow_viol + self.BASE_SPIKE * (1.0 + underflow_viol)
+                self.lam_g5 = min(self.lag_max, self.lam_g5 + self.lag_lr * underflow_viol)
+                self.violation_count    += 1
+                self.g5_violation_count += 1
+            else:
+                self.lam_g5 *= (1.0 - self.lag_decay)
+
+        constraint_penalty = p_g1 + p_g2 + p_g4 + p_g5
 
         # ── Smoothing penalty ──────────────────────────────────────
         smooth_p = self.smooth_coef * float(
@@ -167,7 +186,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         self.prev_action = a_clipped.copy()
 
         # ── Raw material usage penalty ─────────────────────────────
-        raw_mat_p = self.raw_mat_coef * Fn_phys
+        raw_mat_p = self.raw_mat_coef * (Fn_phys / self.FN_MAX_GROWTH)
 
         # ── Aggregate step reward ──────────────────────────────────
         step_reward = prod_r - constraint_penalty - smooth_p - raw_mat_p
@@ -180,7 +199,8 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             if t_ratio > 1.0:
                 viol = t_ratio - 1.0
                 # Scale terminal penalty by 100× vs path constraints
-                step_reward -= self.lam_g3 * viol * 100.0 + self.BASE_SPIKE * (1.0 + viol) * 100.0
+                p_g3 += self.lam_g3 * viol * 100.0 + self.BASE_SPIKE * (1.0 + viol) * 100.0
+                step_reward -= p_g3
                 self.lam_g3 = min(self.lag_max, self.lam_g3 + self.lag_lr * viol * 10.0)
                 self.violation_count    += 1
                 self.g3_violation_count += 1
@@ -190,7 +210,8 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             # g6: Must end in Idle stage — HARD constraint
             # Enforced via large fixed base spike + adaptive λ_g6
             if self.current_stage != 3:
-                step_reward -= self.lam_g6 + self.IDLE_BASE_SPIKE
+                p_g6 += self.lam_g6 + self.IDLE_BASE_SPIKE
+                step_reward -= p_g6
                 self.lam_g6 = min(self.lag_max_g6, self.lam_g6 + self.lag_lr * 20.0)
             else:
                 self.lam_g6 *= (1.0 - self.lag_decay)
@@ -202,6 +223,21 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         self.ep_prod_rewards.append(prod_r)
         self.ep_smooth_penalties.append(smooth_p)
         self.ep_constraint_penalties.append(constraint_penalty)
+        if not hasattr(self, 'ep_raw_mat_penalties'):
+            self.ep_raw_mat_penalties = []
+            self.ep_g1_penalties = []
+            self.ep_g2_penalties = []
+            self.ep_g3_penalties = []
+            self.ep_g4_penalties = []
+            self.ep_g5_penalties = []
+            self.ep_g6_penalties = []
+        self.ep_raw_mat_penalties.append(raw_mat_p)
+        self.ep_g1_penalties.append(p_g1)
+        self.ep_g2_penalties.append(p_g2)
+        self.ep_g3_penalties.append(p_g3)
+        self.ep_g4_penalties.append(p_g4)
+        self.ep_g5_penalties.append(p_g5)
+        self.ep_g6_penalties.append(p_g6)
 
         info = {
             "avg_reward":             float(np.mean(self.ep_rewards)),
@@ -209,11 +245,19 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             "avg_prod_reward":        float(np.mean(self.ep_prod_rewards)),
             "avg_smooth_penalty":     float(np.mean(self.ep_smooth_penalties)),
             "avg_constraint_penalty": float(np.mean(self.ep_constraint_penalties)),
+            "avg_raw_mat_penalty":    float(np.mean(self.ep_raw_mat_penalties)),
+            "avg_g1_penalty":         float(np.mean(self.ep_g1_penalties)),
+            "avg_g2_penalty":         float(np.mean(self.ep_g2_penalties)),
+            "avg_g3_penalty":         float(np.mean(self.ep_g3_penalties)),
+            "avg_g4_penalty":         float(np.mean(self.ep_g4_penalties)),
+            "avg_g5_penalty":         float(np.mean(self.ep_g5_penalties)),
+            "avg_g6_penalty":         float(np.mean(self.ep_g6_penalties)),
             "violation_count":        self.violation_count,
             "g1_violation_count":     self.g1_violation_count,
             "g2_violation_count":     self.g2_violation_count,
             "g3_violation_count":     self.g3_violation_count,
             "g4_violation_count":     self.g4_violation_count,
+            "g5_violation_count":     self.g5_violation_count,
             "current_stage":          self.current_stage,
             "volume":                 float(self.state[3]),
             "nitrate_supply":         float(self.nitrate_supply),
@@ -223,6 +267,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             "lam_g2": float(self.lam_g2),
             "lam_g3": float(self.lam_g3),
             "lam_g4": float(self.lam_g4),
+            "lam_g5": float(self.lam_g5),
             "lam_g6": float(self.lam_g6),
         }
 

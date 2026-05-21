@@ -141,6 +141,11 @@ class PhycocyaninEnvCore:
         self.RATIO_LIMIT   = 0.011    # g2: Max cq/cx ratio
         self.N_LIMIT_TERM  = 150.0    # g3: Terminal nitrate (mg/L)
 
+        # --- Buffer / Barrier Zone Config ---
+        self.OVERFLOW_BUFFER_FRAC = 0.10   # g4 buffer activates at 90% V_MAX
+        self.UNDERFLOW_BUFFER_L   = 10.0   # g5 buffer activates at V < 10 L
+        self.DRY_FLOOR            = self.V_MIN  # hard underflow floor (5 L)
+
         # --- Integration Config ---
         self.dt = 10.0 / 60.0   # 10 minutes (0.1667 h)
         self.n_inner_steps = int(self.control_freq / self.dt)  # 60
