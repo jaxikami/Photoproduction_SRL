@@ -264,7 +264,7 @@ class SPRL_Agent:
 
         # Safeguard (APN)
         self.safeguard = ActionProjectionNetwork(
-            state_dim=state_dim, action_dim=action_dim).to(device)
+            state_dim=state_dim, action_dim=action_dim, latent_dim=160).to(device)
         _ckpt_paths = [
             os.path.join("policy", "action_projection_network.pth"),
             "action_projection_network.pth",
