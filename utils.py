@@ -32,14 +32,14 @@ class DataLogger:
     """
 
     def __init__(self):
-        self.training_log = {"Standard RL": [], "SPRL": []}
-        self.training_violations = {"Standard RL": [], "SPRL": []}
+        self.training_log = {"Standard RL": [], "safe_RL agent": []}
+        self.training_violations = {"Standard RL": [], "safe_RL agent": []}
 
-        self.eval_data = {"Standard RL": None, "SPRL": None}
-        self.eval_violations = {"Standard RL": [], "SPRL": []}
+        self.eval_data = {"Standard RL": None, "safe_RL agent": None}
+        self.eval_violations = {"Standard RL": [], "safe_RL agent": []}
         self.eval_violations_details = {
             "Standard RL": {"g1": [], "g2": [], "g3": [], "g4": []},
-            "SPRL":        {"g1": [], "g2": [], "g3": [], "g4": []}
+            "safe_RL agent":        {"g1": [], "g2": [], "g3": [], "g4": []}
         }
 
     def log_training_episode(self, agent_name, total_reward, violation_count=0):
@@ -98,7 +98,7 @@ class Plotter:
 
     @staticmethod
     def plot_training_violations(logger):
-        agents = ["Standard RL", "SPRL"]
+        agents = ["Standard RL", "safe_RL agent"]
         train_viols = [sum(logger.training_violations.get(a, [])) for a in agents]
 
         fig, ax1 = plt.subplots(figsize=(6, 5))
@@ -115,19 +115,19 @@ class Plotter:
     @staticmethod
     def plot_comprehensive_evaluation(eval_data, eval_violations):
         """
-        Generates a 10-panel subplot comparing Standard RL and SPRL agents:
-        Row 1: Nitrate levels (Standard RL / SPRL)
+        Generates a 10-panel subplot comparing Standard RL and safe_RL agent agents:
+        Row 1: Nitrate levels (Standard RL / safe_RL agent)
         Row 2: Violations bar / Average Production
         Row 3: Light Intensity / Nitrate Feed
-        Row 4: Volume trajectories (Standard RL / SPRL)
-        Row 5: cq/cx Ratio (Standard RL / SPRL)
+        Row 4: Volume trajectories (Standard RL / safe_RL agent)
+        Row 5: cq/cx Ratio (Standard RL / safe_RL agent)
         """
-        if "Standard RL" not in eval_data or "SPRL" not in eval_data:
+        if "Standard RL" not in eval_data or "safe_RL agent" not in eval_data:
             print("Evaluation data missing. Cannot plot.")
             return
 
         nr_data   = eval_data["Standard RL"]
-        sprl_data = eval_data["SPRL"]
+        sprl_data = eval_data["safe_RL agent"]
 
         # Constants
         I_MIN, I_MAX = 120.0, 400.0
@@ -151,7 +151,7 @@ class Plotter:
         # ----- Row 1: Nitrate Levels -----
         for col, (name, data, color) in enumerate([
             ("Standard RL", nr_data, 'tab:blue'),
-            ("SPRL", sprl_data, 'tab:orange')
+            ("safe_RL agent", sprl_data, 'tab:orange')
         ]):
             ax = axes[0, col]
             if data is not None:
@@ -172,7 +172,7 @@ class Plotter:
 
         # ----- Row 2: Violations / Production -----
         ax = axes[1, 0]
-        agents = ["Standard RL", "SPRL"]
+        agents = ["Standard RL", "safe_RL agent"]
         viols = [int(np.sum(eval_violations.get(a, []))) for a in agents]
         bars = ax.bar(agents, viols, color=['tab:blue', 'tab:orange'])
         ax.set_title("Total Evaluation Violations")
@@ -189,7 +189,7 @@ class Plotter:
                     label="Standard RL", color='tab:blue')
         if sprl_data is not None and sprl_data.get("agg_data"):
             ax.plot(time, sprl_data["agg_data"]["production_avg"] * 0.2,
-                    label="SPRL", color='tab:orange')
+                    label="safe_RL agent", color='tab:orange')
         ax.set_title("Average Phycocyanin ($c_q$)")
         ax.set_ylabel("g/L")
         ax.set_xlabel("Step")
@@ -207,7 +207,7 @@ class Plotter:
             s_I = I_MIN + ((sprl_data["actions"][:, 1] + 1.0) / 2.0) * (I_MAX - I_MIN)
             t_act = np.arange(len(s_I) + 1)
             ax.step(t_act, np.append(s_I, s_I[-1]), where='post',
-                    label="SPRL", color='tab:orange')
+                    label="safe_RL agent", color='tab:orange')
         ax.set_title("Light Intensity ($I$)")
         ax.set_ylabel(r"$\mu mol/m^2/s$")
         ax.set_xlabel("Step")
@@ -224,7 +224,7 @@ class Plotter:
             s_Fn = ((sprl_data["actions"][:, 2] + 1.0) / 2.0) * FN_MAX_GROWTH
             t_act = np.arange(len(s_Fn) + 1)
             ax.step(t_act, np.append(s_Fn, s_Fn[-1]), where='post',
-                    label="SPRL", color='tab:orange')
+                    label="safe_RL agent", color='tab:orange')
         ax.set_title("Nitrate Feed ($F_N$)")
         ax.set_ylabel("mg/L/h")
         ax.set_xlabel("Step")
@@ -234,7 +234,7 @@ class Plotter:
         # ----- Row 4: Volume Trajectories -----
         for col, (name, data, color) in enumerate([
             ("Standard RL", nr_data, 'tab:blue'),
-            ("SPRL", sprl_data, 'tab:orange')
+            ("safe_RL agent", sprl_data, 'tab:orange')
         ]):
             ax = axes[3, col]
             if data is not None:
@@ -256,7 +256,7 @@ class Plotter:
         # ----- Row 5: Ratio -----
         for col, (name, data, color) in enumerate([
             ("Standard RL", nr_data, 'tab:blue'),
-            ("SPRL", sprl_data, 'tab:orange')
+            ("safe_RL agent", sprl_data, 'tab:orange')
         ]):
             ax = axes[4, col]
             if data is not None and data.get("agg_data"):

@@ -200,6 +200,13 @@ class PhycocyaninEnvCore:
         self.ep_prod_rewards = []
         self.ep_smooth_penalties = []
         self.ep_constraint_penalties = []
+        self.ep_raw_mat_penalties = []
+        self.ep_g1_penalties = []
+        self.ep_g2_penalties = []
+        self.ep_g3_penalties = []
+        self.ep_g4_penalties = []
+        self.ep_g5_penalties = []
+        self.ep_g6_penalties = []
 
         # Phycocyanin harvested during cleanup (mass in mg)
         self.total_cq_harvested = 0.0

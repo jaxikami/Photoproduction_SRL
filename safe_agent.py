@@ -7,6 +7,11 @@ import os
 # Hardware acceleration setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Disable CuDNN and MIOpen backends to avoid ROCm GRU bugs (miopenStatusUnknownError)
+torch.backends.cudnn.enabled = False
+if hasattr(torch.backends, 'miopen'):
+    torch.backends.miopen.enabled = False
+
 
 class ActionProjectionNetwork(nn.Module):
     """
@@ -301,8 +306,7 @@ class SPRL_Agent:
         self._proj_calls = self._proj_noop = self._proj_iters = 0
         return {'calls': calls, 'noop': noop, 'iters': iters, 'avg_it': avg_it}
 
-    def _project_to_safe(self, state_norm, action, max_steps=5, lr=1.0,
-                          threshold=0.95):
+    def _project_to_safe(self, state_norm, action, lr=0.05, max_steps=10, threshold=0.95):
         """
         Gradient-ascend the APN margin surface until classify() >= threshold.
 

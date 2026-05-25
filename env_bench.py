@@ -38,17 +38,17 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         self.lagrange_updates_enabled = False
 
         # ── Fixed constraint penalty weights ───────────────────────
-        self.W_BARRIER   = 1.0     # Quadratic buffer-zone scaling coefficient  (~1 at full depth)
-        self.W_g1_SPIKE  = 10.0   # Path nitrate hard spike                    (~10 per unit violation)
-        self.W_g2_SPIKE  = 10.0   # Product ratio hard spike                   (~10 per unit violation)
-        self.W_g3_SPIKE  = 400.0  # Terminal nitrate hard spike
-        self.W_g4_SPIKE  = 10.0   # Volume overflow hard spike                 (~10 per unit violation)
-        self.W_IDLE_HARD = 1000.0 # Must end in Idle — hard terminal penalty
+        self.W_BARRIER   = 20.0    # Quadratic buffer-zone scaling coefficient  (~1 at full depth)
+        self.W_g1_SPIKE  = 200.0  # Path nitrate hard spike                    (~10 per unit violation)
+        self.W_g2_SPIKE  = 200.0  # Product ratio hard spike                   (~10 per unit violation)
+        self.W_g3_SPIKE  = 8000.0 # Terminal nitrate hard spike
+        self.W_g4_SPIKE  = 200.0  # Volume overflow hard spike                 (~10 per unit violation)
+        self.W_IDLE_HARD = 20000.0# Must end in Idle — hard terminal penalty
 
         # ── Reward shaping coefficients ────────────────────────────
         self.prod_coef    = 4.0    # Dense per-step Cq scale  (4 * (Cq/0.2) ≈ 2 at Cq=0.1)
-        self.smooth_coef  = 0.05   # Action-smoothing penalty coefficient
-        self.raw_mat_coef = 0.3    # Nitrate feed penalty  (0.3 * Fn/FN_MAX ≈ 0.15 at half-max)
+        self.smooth_coef  = 0.5   # Action-smoothing penalty coefficient
+        self.raw_mat_coef = 3.0    # Nitrate feed penalty  (0.3 * Fn/FN_MAX ≈ 0.15 at half-max)
 
         # ── Buffer zone activation thresholds ─────────────────────
         # g1/g2: buffer activates at 90% of limit
@@ -154,14 +154,6 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         self.ep_prod_rewards.append(prod_r)
         self.ep_smooth_penalties.append(smooth_p)
         self.ep_constraint_penalties.append(constraint_penalty)
-        if not hasattr(self, 'ep_raw_mat_penalties'):
-            self.ep_raw_mat_penalties = []
-            self.ep_g1_penalties = []
-            self.ep_g2_penalties = []
-            self.ep_g3_penalties = []
-            self.ep_g4_penalties = []
-            self.ep_g5_penalties = []
-            self.ep_g6_penalties = []
         self.ep_raw_mat_penalties.append(raw_mat_p)
         self.ep_g1_penalties.append(p_g1)
         self.ep_g2_penalties.append(p_g2)

@@ -31,7 +31,7 @@ MIN_LR = 1e-5
 INITIAL_ENTROPY = 0.05
 MIN_ENTROPY = 1e-5
 EVALUATE_ONLY = False
-RUN_BENCHMARK = True   # True → run Standard RL (bench) only; False → run Safe RL only
+RUN_BENCHMARK = False   # True → run Standard RL (bench) only; False → run Safe RL only
 NOISE_STD = 0.1
 
 class Memory:
@@ -45,7 +45,7 @@ class Memory:
 def train_agent(agent_name, agent, logger):
     """Primary training loop for a specified RL agent."""
     print(f"\n--- Starting Training: {agent_name} ---")
-    env = PhycocyaninEnvSafe() if agent_name == "Safe RL" else PhycocyaninEnvBench()
+    env = PhycocyaninEnvSafe() if agent_name == "safe_RL agent" else PhycocyaninEnvBench()
     memory = Memory()
     scheduler = LinearLR(agent.optimizer, start_factor=1.0, end_factor=MIN_LR / LR_ACTOR, total_iters=MAX_EPISODES)
 
@@ -157,7 +157,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
         agent.policy.load_state_dict(torch.load(load_path))
         agent.policy.eval()
 
-    env = PhycocyaninEnvSafe() if agent_name == "Safe RL" else PhycocyaninEnvBench()
+    env = PhycocyaninEnvSafe() if agent_name == "safe_RL agent" else PhycocyaninEnvBench()
     total_g1, total_g2, total_g3, total_g4 = 0, 0, 0, 0
 
     all_episodes = []
@@ -176,7 +176,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
             with torch.no_grad():
                 state_t = torch.FloatTensor(state).to(
                     torch.device("cuda" if torch.cuda.is_available() else "cpu")).unsqueeze(0)
-                if agent_name == "Safe RL":
+                if agent_name == "safe_RL agent":
                     z, _, _, eval_hidden = agent.policy.act(state_t, eval_hidden)
                 else:
                     z, _, _ = agent.policy.act(state_t)
@@ -189,7 +189,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
                 noisy_intent = intent
 
             with torch.no_grad():
-                if agent_name == "Safe RL":
+                if agent_name == "safe_RL agent":
                     noisy_t = torch.FloatTensor(noisy_intent).to(state_t.device).unsqueeze(0)
                     # For Safe RL, apply the projection filter
                     from env_core import PhycocyaninEnvCore as _Env
@@ -282,7 +282,7 @@ if __name__ == "__main__":
     else:
         agent      = SafeRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC,
                                    GAMMA, K_EPOCHS, EPS_CLIP, INITIAL_ENTROPY)
-        agent_name = "Safe RL"
+        agent_name = "safe_RL agent"
 
     if not EVALUATE_ONLY:
         train_agent(agent_name, agent, logger)

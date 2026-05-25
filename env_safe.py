@@ -63,10 +63,10 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         self.lag_max_g6 = 50.0   # Higher cap for the hard idle constraint
 
         # ── Barrier + base spike params ────────────────────────────
-        self.BASE_SPIKE           = 0.1
-        self.BUFFER_COEF          = 0.02
+        self.BASE_SPIKE           = 2.0
+        self.BUFFER_COEF          = 0.4
         self.OVERFLOW_BUFFER_FRAC = 0.10   # buffer activates at 90% V_MAX
-        self.IDLE_BASE_SPIKE      = 300.0  # large fixed spike for idle violation
+        self.IDLE_BASE_SPIKE      = 6000.0 # large fixed spike for idle violation
 
         # ── Buffer zone activation thresholds ─────────────────────
         self.G1_BUFFER_START = 0.9
@@ -74,8 +74,8 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
 
         # ── Reward shaping coefficients ────────────────────────────
         self.prod_coef    = 4.0    # Dense per-step Cq scale  (4 * (Cq/0.2) ≈ 2 at Cq=0.1)
-        self.smooth_coef  = 0.005  # Action-smoothing penalty coefficient
-        self.raw_mat_coef = 0.3    # Nitrate feed penalty  (0.3 * Fn/FN_MAX ≈ 0.15 at half-max)
+        self.smooth_coef  = 0.05  # Action-smoothing penalty coefficient
+        self.raw_mat_coef = 3.0    # Nitrate feed penalty  (0.3 * Fn/FN_MAX ≈ 0.15 at half-max)
 
         # Disable inherited monolithic Lagrangian attributes to avoid confusion
         self.lagrange_updates_enabled = False
@@ -223,14 +223,6 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         self.ep_prod_rewards.append(prod_r)
         self.ep_smooth_penalties.append(smooth_p)
         self.ep_constraint_penalties.append(constraint_penalty)
-        if not hasattr(self, 'ep_raw_mat_penalties'):
-            self.ep_raw_mat_penalties = []
-            self.ep_g1_penalties = []
-            self.ep_g2_penalties = []
-            self.ep_g3_penalties = []
-            self.ep_g4_penalties = []
-            self.ep_g5_penalties = []
-            self.ep_g6_penalties = []
         self.ep_raw_mat_penalties.append(raw_mat_p)
         self.ep_g1_penalties.append(p_g1)
         self.ep_g2_penalties.append(p_g2)
