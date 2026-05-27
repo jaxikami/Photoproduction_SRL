@@ -47,6 +47,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         # ── Initialise attributes used by reset() BEFORE super().__init__() ──
         # super().__init__() calls self.reset(), so these must exist first.
         self.reset_lambdas_per_episode = False
+        self.episode_count = 0
         self.lam_g1 = 0.0
         self.lam_g2 = 0.0
         self.lam_g3 = 0.0
@@ -59,11 +60,11 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         # ── Lagrangian update hyperparameters ──────────────────────
         self.lag_lr     = 0.5
         self.lag_decay  = 0.5 / 600.0
-        self.lag_max    = 10.0
+        self.lag_max    = 25.0
         self.lag_max_g6 = 50.0   # Higher cap for the hard idle constraint
 
         # ── Barrier + base spike params ────────────────────────────
-        self.BASE_SPIKE           = 2.0
+        self.BASE_SPIKE           = 5.0
         self.BUFFER_COEF          = 0.4
         self.OVERFLOW_BUFFER_FRAC = 0.10   # buffer activates at 90% V_MAX
         self.IDLE_BASE_SPIKE      = 6000.0 # large fixed spike for idle violation
@@ -83,6 +84,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
     # ------------------------------------------------------------------
 
     def reset(self, randomize=False):
+        self.episode_count += 1
         state = super().reset(randomize=randomize)
         # Ensure reset state does not violate g1, g2, g4 constraints
         self.state[1] = min(self.state[1], self.N_LIMIT_PATH * 0.9)
@@ -111,7 +113,8 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         a_clipped, Fn_phys, done = self._physics_step(action)
 
         # ── Production reward (dense) ──────────────────────────────
-        prod_r = self.prod_coef * (self.state[2] / 0.2)
+        # Reward based on total mass (Cq * Volume) relative to max possible mass
+        prod_r = self.prod_coef * ((self.state[2] * self.state[3]) / (0.2 * self.V_MAX))
 
         # ── Per-constraint Lagrangian penalties ────────────────────
         p_g1 = p_g2 = p_g3 = p_g4 = p_g5 = p_g6 = 0.0
@@ -188,8 +191,34 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         # ── Raw material usage penalty ─────────────────────────────
         raw_mat_p = self.raw_mat_coef * (Fn_phys / self.FN_MAX_GROWTH)
 
+        # ── G6 Directional Guiding ─────────────────────────────────────
+        time_remaining = self.total_time - self.time
+        if self.current_stage != 3:
+            min_time_to_idle = 0.0
+            if self.current_stage == 0:
+                min_time_to_idle = (self.stage_credits / 2.0) + (self.BASE_CREDITS[1] / 2.0) + max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
+            elif self.current_stage == 1:
+                min_time_to_idle = (self.stage_credits / 2.0) + max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
+            elif self.current_stage == 2:
+                min_time_to_idle = max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
+        
+            g6_buffer = 30.0  # Danger zone width (hours)
+            margin = time_remaining - min_time_to_idle
+            if margin < g6_buffer:
+                severity = max(0.0, (g6_buffer - margin) / g6_buffer)
+                
+                a_scaled = (np.clip(action, -1.0, 1.0) + 1.0) / 2.0
+                action_subopt = 0.0
+                if self.current_stage in (0, 1):
+                    action_subopt = 1.0 - a_scaled[0]
+                elif self.current_stage == 2:
+                    action_subopt = 1.0 - a_scaled[3]
+        
+                guiding_p = (1.0 + severity * 2.0) * action_subopt * 10.0
+                p_g6 += guiding_p
+
         # ── Aggregate step reward ──────────────────────────────────
-        step_reward = prod_r - constraint_penalty - smooth_p - raw_mat_p
+        step_reward = prod_r - constraint_penalty - smooth_p - raw_mat_p - p_g6
 
         # ── Terminal checks ────────────────────────────────────────
 
@@ -210,12 +239,17 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             # g6: Must end in Idle stage — HARD constraint
             # Enforced via large fixed base spike + adaptive λ_g6
             if self.current_stage != 3:
-                p_g6 += self.lam_g6 + self.IDLE_BASE_SPIKE
+                # Anneal the idle penalty from 0 to 6000 over 25000 episodes
+                current_idle_spike = min(self.IDLE_BASE_SPIKE, self.IDLE_BASE_SPIKE * (self.episode_count / 25000.0))
+                p_g6 += self.lam_g6 + current_idle_spike
                 step_reward -= p_g6
                 self.lam_g6 = min(self.lag_max_g6, self.lam_g6 + self.lag_lr * 20.0)
             else:
                 self.lam_g6 *= (1.0 - self.lag_decay)
                 step_reward += 50.0  # Idle completion bonus
+
+            # Terminal harvest bonus: reward sum of phycocyanin produced across cycles
+            step_reward += self.total_cq_harvested * 50.0  # Scale total harvest bonus
 
         # ── Metrics bookkeeping ────────────────────────────────────
         self.ep_total_reward += step_reward

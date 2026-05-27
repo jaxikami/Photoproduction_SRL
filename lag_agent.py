@@ -17,7 +17,7 @@ class ActorCriticStandardRL(nn.Module):
 
     Observation is 11D (see env.py get_state_norm for layout).
     """
-    def __init__(self, state_dim=11, action_dim=4):
+    def __init__(self, state_dim=12, action_dim=4):
         super(ActorCriticStandardRL, self).__init__()
         self.LOG_STD_MIN = -1.0
         self.LOG_STD_MAX = 0.5
@@ -110,7 +110,7 @@ class StandardRL_Agent:
 
     def learn(self, memory):
         """
-        PPO update with clipped surrogate objective.
+        PPO update with mini-batch training and normalized advantages.
         """
         rewards = []
         discounted_reward = 0
@@ -126,23 +126,42 @@ class StandardRL_Agent:
         old_z_raw = torch.squeeze(torch.stack(memory.raw_actions, dim=0)).detach().to(device)
         old_logprobs = torch.squeeze(torch.stack(memory.logprobs, dim=0)).detach().to(device)
 
+        # Precalculate and normalize advantages over the entire batch
+        with torch.no_grad():
+            _, old_state_values, _ = self.policy.evaluate(old_states, old_z_raw)
+            old_state_values = old_state_values.squeeze(-1)
+            advantages = rewards - old_state_values
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        batch_size = old_states.size(0)
+        mini_batch_size = 256
+
         for _ in range(self.K_epochs):
-            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_z_raw)
+            permutation = torch.randperm(batch_size)
+            for start_idx in range(0, batch_size, mini_batch_size):
+                batch_indices = permutation[start_idx : start_idx + mini_batch_size]
 
-            ratios = torch.exp(logprobs - old_logprobs)
-            advantages = rewards - state_values.detach().squeeze()
+                b_states = old_states[batch_indices]
+                b_z_raw = old_z_raw[batch_indices]
+                b_logprobs = old_logprobs[batch_indices]
+                b_rewards = rewards[batch_indices]
+                b_advantages = advantages[batch_indices]
 
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-            ppo_loss = -torch.min(surr1, surr2).mean()
+                logprobs, state_values, dist_entropy = self.policy.evaluate(b_states, b_z_raw)
 
-            loss = ppo_loss + \
-                   0.5 * self.MseLoss(state_values.squeeze(), rewards) - \
-                   self.entropy_coeff * dist_entropy.mean()
+                ratios = torch.exp(logprobs - b_logprobs)
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
-            self.optimizer.step()
+                surr1 = ratios * b_advantages
+                surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * b_advantages
+                ppo_loss = -torch.min(surr1, surr2).mean()
+
+                loss = ppo_loss + \
+                       0.5 * self.MseLoss(state_values.squeeze(-1), b_rewards) - \
+                       self.entropy_coeff * dist_entropy.mean()
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+                self.optimizer.step()
 
         self.policy_old.load_state_dict(self.policy.state_dict())

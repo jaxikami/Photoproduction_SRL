@@ -70,17 +70,30 @@ class Plotter:
     """Static utility class for generating matplotlib visualizations."""
 
     @staticmethod
-    def plot_training_results(training_log, agent_name, window=50):
+    def plot_training_results(training_log, agent_name, window=500):
         rewards = training_log.get(agent_name, [])
-        if len(rewards) < window:
+        if len(rewards) < 50:
             return
 
         plt.figure(figsize=(10, 6))
-        mv_avg = pd.Series(rewards).rolling(window=window).mean()
-        plt.plot(mv_avg, label=f"{agent_name} (MA {window})", color='tab:blue')
-        plt.plot(rewards, alpha=0.15, color='tab:blue')
+        
+        # Plot raw rewards with light transparency
+        plt.plot(rewards, alpha=0.12, color='tab:blue')
 
-        valid_mv_avg = mv_avg.dropna()
+        # Plot 50-episode MA (short-term trend) as a dotted line
+        if len(rewards) >= 50:
+            mv_avg_50 = pd.Series(rewards).rolling(window=50).mean()
+            plt.plot(mv_avg_50, label=f"{agent_name} (MA 50)", color='tab:blue', linestyle=':', alpha=0.6)
+
+        # Plot larger-window MA (long-term trend) as a solid line
+        if len(rewards) >= window:
+            mv_avg_large = pd.Series(rewards).rolling(window=window).mean()
+            plt.plot(mv_avg_large, label=f"{agent_name} (MA {window})", color='tab:blue', linestyle='-', alpha=1.0)
+            valid_mv_avg = mv_avg_large.dropna()
+        else:
+            mv_avg_large = pd.Series(rewards).rolling(window=len(rewards)).mean()
+            valid_mv_avg = mv_avg_large.dropna()
+
         if len(valid_mv_avg) > 0:
             y_max = valid_mv_avg.max()
             y_min = -2.0

@@ -9,7 +9,7 @@ Trains the ActionProjectionNetwork as a margin regressor covering:
 Note: G3 (terminal nitrate ≤ 150 mg/L) is handled by the GRU's temporal
 context and the Lagrangian multiplier, not by the APN.
 
-Architecture (11D state + 4D action = 15 input):
+Architecture (12D state + 4D action = 16 input):
   Linear(15→128) → LayerNorm → Mish
   → 3× Residual blocks (128→128)
   → Linear(128→1) [raw margin]
@@ -43,7 +43,7 @@ class ActionProjectionNetwork(nn.Module):
     auxiliary heads for improved boundary discrimination.
     """
 
-    def __init__(self, state_dim: int = 11, action_dim: int = 4,
+    def __init__(self, state_dim: int = 12, action_dim: int = 4,
                  latent_dim: int = 160):
         super(ActionProjectionNetwork, self).__init__()
 
@@ -126,7 +126,7 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    model = ActionProjectionNetwork(state_dim=11, action_dim=4).to(device)
+    model = ActionProjectionNetwork(state_dim=12, action_dim=4).to(device)
 
     policy_path = os.path.join("policy", "action_projection_network.pth")
     if load and os.path.exists(policy_path):
@@ -463,4 +463,4 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
 
 
 if __name__ == "__main__":
-    run_pretraining(load=False)
+    run_pretraining(load=True)

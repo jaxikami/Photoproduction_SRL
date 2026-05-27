@@ -14,6 +14,7 @@ import torch
 import numpy as np
 import os
 from pretrain import ActionProjectionNetwork
+from env_core import PhycocyaninEnvCore
 
 # ── Physical constants (must match env.py and data_gen.py) ────────────────────
 I_MIN, I_MAX     = 120.0, 400.0
@@ -38,12 +39,16 @@ def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS,
                       lr=LR_PROJ, threshold=THRESHOLD):
     """
     Gradient-ascent projection — mirrors safe_agent.SPRL_Agent._project_to_safe.
-
-    Uses constant step size (no severity decay) to ensure the projection
-    reliably reaches the safe manifold within the budget.
+    
+    Includes full SERL masking logic to prevent the APN from cheating
+    using structurally inactive flow dimensions.
     """
-    a = action_t.clone().detach()
     state_fixed = state_norm_t.detach()
+    stage_mask = PhycocyaninEnvCore.get_action_mask(state_fixed)
+    default_squashed = torch.tensor([-0.333, -1.0, -1.0, -1.0], device=state_fixed.device)
+
+    # SERL checkpoint 2: clamp initial action
+    a = action_t.clone().detach() * stage_mask + default_squashed * (1 - stage_mask)
 
     with torch.no_grad():
         p = apn.classify(state_fixed, a)
@@ -60,7 +65,8 @@ def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS,
 
             p = torch.sigmoid(margin)
             if p.item() >= threshold:
-                return a_var.detach(), step
+                a_final = a_var.detach()
+                return a_final * stage_mask + default_squashed * (1 - stage_mask), step
 
             # Track best iterate seen
             m_val = margin.item()
@@ -72,21 +78,26 @@ def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS,
 
             with torch.no_grad():
                 grad = grad.clone()
+                # Zero gradient for masked dimensions
+                grad = grad * stage_mask
+                
                 at_lower = (a_var.data <= -0.9999) & (grad < 0)
                 at_upper = (a_var.data >=  0.9999) & (grad > 0)
                 grad[at_lower | at_upper] = 0.0
 
                 # Constant step size with mild decay — avoids premature stall
-                step_size = lr / (1.0 + step * 0.1)
+                step_size = lr / (1.0 + step * 0.03)
                 a = a + step_size * grad.sign()
                 a = a.clamp(-1.0, 1.0)
 
+    # SERL checkpoint 3
+    best_a = best_a * stage_mask + default_squashed * (1 - stage_mask)
     return best_a, max_steps
 
 
 def _make_state(cx, cN, cq, V, stage_idx, credit_norm, t_norm, supply_norm, device):
-    """Pack physical values into normalised state tensor [1, 11]."""
-    s = torch.zeros(1, 11, dtype=torch.float32, device=device)
+    """Pack physical values into normalised state tensor [1, 12]."""
+    s = torch.zeros(1, 12, dtype=torch.float32, device=device)
     s[0, 0] = cx / 6.0
     s[0, 1] = cN / 800.0
     s[0, 2] = cq / 0.2
@@ -95,6 +106,7 @@ def _make_state(cx, cN, cq, V, stage_idx, credit_norm, t_norm, supply_norm, devi
     s[0, 8] = credit_norm
     s[0, 9] = t_norm
     s[0, 10] = supply_norm
+    s[0, 11] = 1.0 - t_norm  # operation time left
     return s
 
 
@@ -108,7 +120,7 @@ def run_validation(model=None, num_test_samples: int = 2000):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if model is None:
-        apn = ActionProjectionNetwork(state_dim=11, action_dim=4).to(device)
+        apn = ActionProjectionNetwork(state_dim=12, action_dim=4).to(device)
         for ckpt in [os.path.join("policy", "action_projection_network.pth"),
                      "action_projection_network.pth"]:
             if os.path.exists(ckpt):
@@ -282,9 +294,14 @@ def run_validation(model=None, num_test_samples: int = 2000):
         s_t = _make_state(cx, cN, cq, V, stage_idx=0, credit_norm=0.7,
                           t_norm=t_norm, supply_norm=0.7, device=device)
         a_t = -0.5 + torch.rand(1, 4, device=device)  # moderate safe intent
+        
+        # Pre-mask a_t so we don't unfairly penalize the default clamp
+        stage_mask = PhycocyaninEnvCore.get_action_mask(s_t)
+        default_squashed = torch.tensor([-0.333, -1.0, -1.0, -1.0], device=device)
+        a_t_masked = a_t * stage_mask + default_squashed * (1 - stage_mask)
 
-        a_proj, _ = _project_to_safe(apn, s_t, a_t)
-        diff = (a_proj - a_t).abs().max().item()
+        a_proj, _ = _project_to_safe(apn, s_t, a_t_masked)
+        diff = (a_proj - a_t_masked).abs().max().item()
         if diff <= 0.02:
             id_passes += 1
 

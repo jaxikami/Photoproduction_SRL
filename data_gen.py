@@ -33,8 +33,8 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     """
     Generate a raw batch of (state, action, is_safe, margin) samples.
 
-    State layout (11D, normalised):
-      [cx/6, cN/800, cq/0.2, V/V_MAX, stage_0..3, credit/base, t/500, supply/initial]
+    State layout (12D, normalised):
+      [cx/6, cN/800, cq/0.2, V/V_MAX, stage_0..3, credit/base, t/500, supply/initial, op_time_left]
 
     Action layout (4D, [-1,1]):
       [time_mult, I_norm, Fn_norm, Fout_norm]
@@ -46,8 +46,9 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    n_postcycle = int(num_samples * 0.12)
     n_interior = int(num_samples * (1.0 - bias))
-    n_boundary = num_samples - n_interior
+    n_boundary = num_samples - n_interior - n_postcycle
 
     if pass_rates is not None:
         err_g1 = max(0.0, 1.0 - pass_rates.get("G1", 1.0))
@@ -125,14 +126,56 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
 
 
     # ══════════════════════════════════════════════════════════════════════════
+    # CYCLE-INITIAL samples — pre-cycle AND post-cycle partial-reset states
+    # Physical profile mirrors _partial_reset_reactor(): Cx≈1.1, CN≈150,
+    # Cq≈0.01, V≈40.  Split into pre-cycle (t≈0, full supply) and post-cycle
+    # (t>0.25, depleted supply) temporal contexts so the APN generalises
+    # across the full episode timeline.  65% G1-boundary focus (high Fn sweep
+    # → CN accumulation risk) and 35% safe interior.
+    # ══════════════════════════════════════════════════════════════════════════
+    n_post_bnd = int(n_postcycle * 0.65)
+    n_post_int = n_postcycle - n_post_bnd
+
+    # --- G1-boundary sub-group: moderate CN with full Fn sweep ---------------
+    cx_pb = 0.8 + torch.rand(n_post_bnd, device=device) * 1.7     # 0.8–2.5
+    cN_pb = 100.0 + torch.rand(n_post_bnd, device=device) * 580.0 # 100–680
+    cq_pb = torch.rand(n_post_bnd, device=device) * 0.04          # ≈0
+    V_pb  = 35.0 + torch.rand(n_post_bnd, device=device) * 12.0   # 35–47
+    a_pb  = torch.rand(n_post_bnd, 4, device=device) * 2.0 - 1.0
+    a_pb[:, 2] = torch.rand(n_post_bnd, device=device) * 2.0 - 1.0  # full Fn
+    # Temporal split: 40% pre-cycle (t≈0), 60% post-cycle (t>0.25)
+    n_pre_bnd  = int(n_post_bnd * 0.4)
+    t_pb = torch.empty(n_post_bnd, device=device)
+    t_pb[:n_pre_bnd]  = torch.rand(n_pre_bnd, device=device) * 0.15    # 0.0–0.15
+    t_pb[n_pre_bnd:]  = 0.25 + torch.rand(n_post_bnd - n_pre_bnd, device=device) * 0.55  # 0.25–0.80
+
+    # --- Safe interior sub-group: comfortably below all limits ---------------
+    cx_pi = 0.8 + torch.rand(n_post_int, device=device) * 1.2     # 0.8–2.0
+    cN_pi = 80.0 + torch.rand(n_post_int, device=device) * 200.0  # 80–280
+    cq_pi = torch.rand(n_post_int, device=device) * 0.02          # ≈0
+    V_pi  = 35.0 + torch.rand(n_post_int, device=device) * 8.0    # 35–43
+    a_pi  = torch.rand(n_post_int, 4, device=device) * 1.4 - 0.7  # moderate
+    n_pre_int  = int(n_post_int * 0.4)
+    t_pi = torch.empty(n_post_int, device=device)
+    t_pi[:n_pre_int]  = torch.rand(n_pre_int, device=device) * 0.15
+    t_pi[n_pre_int:]  = 0.25 + torch.rand(n_post_int - n_pre_int, device=device) * 0.55
+
+    cx_post = torch.cat([cx_pb, cx_pi])
+    cN_post = torch.cat([cN_pb, cN_pi])
+    cq_post = torch.cat([cq_pb, cq_pi])
+    V_post  = torch.cat([V_pb, V_pi])
+    t_post  = torch.cat([t_pb, t_pi])
+    a_post  = torch.cat([a_pb, a_pi])
+
+    # ══════════════════════════════════════════════════════════════════════════
     # Concatenate all samples
     # ══════════════════════════════════════════════════════════════════════════
-    cx = torch.cat([cx_int, cx_g1, cx_g2, cx_g4])
-    cN = torch.cat([cN_int, cN_g1, cN_g2, cN_g4])
-    cq = torch.cat([cq_int, cq_g1, cq_g2, cq_g4])
-    V  = torch.cat([V_int,  V_g1,  V_g2,  V_g4]).clamp(V_MIN * 0.3, V_MAX * 1.3)
-    t_norm = torch.cat([t_int, t_g1, t_g2, t_g4])
-    actions = torch.cat([a_int, a_g1, a_g2, a_g4])
+    cx = torch.cat([cx_int, cx_g1, cx_g2, cx_g4, cx_post])
+    cN = torch.cat([cN_int, cN_g1, cN_g2, cN_g4, cN_post])
+    cq = torch.cat([cq_int, cq_g1, cq_g2, cq_g4, cq_post])
+    V  = torch.cat([V_int,  V_g1,  V_g2,  V_g4,  V_post]).clamp(V_MIN * 0.3, V_MAX * 1.3)
+    t_norm = torch.cat([t_int, t_g1, t_g2, t_g4, t_post])
+    actions = torch.cat([a_int, a_g1, a_g2, a_g4, a_post])
 
     # ── Stage assignment ──────────────────────────────────────────────────────
     stage_idx = torch.randint(0, 4, (num_samples,), device=device)
@@ -150,6 +193,9 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
         torch.tensor(1, device=device),
         stage_idx[g2_start:g2_start + n_g2]
     )
+    # Cycle-initial samples: always Growth stage (just started / backtracked)
+    post_start = n_interior + n_g1 + n_g2 + n_g4
+    stage_idx[post_start:post_start + n_postcycle] = 0
 
     stage_onehot = torch.zeros(num_samples, 4, device=device)
     stage_onehot.scatter_(1, stage_idx.unsqueeze(1), 1.0)
@@ -160,6 +206,26 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # Supply remaining
     supply_norm = torch.rand(num_samples, device=device)
 
+    # Cycle-initial overrides: fresh Growth credits, supply split pre/post
+    n_pre_total = int(n_postcycle * 0.4)
+    credit_norm[post_start:post_start + n_postcycle] = (
+        0.7 + torch.rand(n_postcycle, device=device) * 0.3)   # near-full credits
+    # Pre-cycle: full supply; post-cycle: partially depleted
+    supply_norm[post_start:post_start + n_pre_total] = (
+        0.85 + torch.rand(n_pre_total, device=device) * 0.15)  # 0.85–1.0
+    supply_norm[post_start + n_pre_total:post_start + n_postcycle] = (
+        0.15 + torch.rand(n_postcycle - n_pre_total, device=device) * 0.55)  # 0.15–0.70
+
+    # Target extreme overflow boundary with a continuous sweep [-1.0, 1.0]
+    # analogous to Fermentation-PPO handling of the level constraint
+    extreme_overflow_slots = ((V / V_MAX) > 0.85) & (stage_onehot[:, 0].bool() | stage_onehot[:, 1].bool())
+    if extreme_overflow_slots.any():
+        apply_survival_overflow = extreme_overflow_slots & (
+            torch.rand(num_samples, device=device) < 0.50)
+        # Use full [-1.0, 1.0] sweep to map the boundary smoothly
+        safe_sweep_fn = -1.0 + torch.rand(num_samples, device=device) * 2.0
+        actions[:, 2] = torch.where(apply_survival_overflow, safe_sweep_fn, actions[:, 2])
+
     # ── Decode physical actions ───────────────────────────────────────────────
     a_scaled = (actions + 1.0) / 2.0
 
@@ -168,7 +234,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     is_prod   = stage_onehot[:, 1].bool()
     is_cleanup = stage_onehot[:, 2].bool()
     fn_max    = torch.where(is_growth, torch.tensor(FN_MAX_GROWTH, device=device),
-                torch.where(is_prod | is_cleanup, torch.tensor(FN_MAX_PROD, device=device),
+                torch.where(is_prod, torch.tensor(FN_MAX_PROD, device=device),
                              torch.tensor(0.0, device=device)))
     Fn_phys = a_scaled[:, 2] * fn_max
 
@@ -243,7 +309,8 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     near_g4 = (V / V_MAX) > 0.75
     near_boundary = near_g1 | near_g2 | near_g4
 
-    # ── Assemble normalised states (11D) ──────────────────────────────────────
+    # ── Assemble normalised states (12D) ──────────────────────────────────────
+    op_time_left = 1.0 - t_norm
     states = torch.cat([
         (cx / 6.0).unsqueeze(1),
         (cN / 800.0).unsqueeze(1),
@@ -253,7 +320,8 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
         credit_norm.unsqueeze(1),
         t_norm.unsqueeze(1),
         supply_norm.unsqueeze(1),
-    ], dim=1)  # [N, 11]
+        op_time_left.unsqueeze(1),
+    ], dim=1)  # [N, 12]
 
     return (states.float(), actions.float(), is_safe,
             min_margin.float(), margin_g1, margin_g2, margin_g4,

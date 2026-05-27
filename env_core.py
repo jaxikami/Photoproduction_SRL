@@ -101,6 +101,7 @@ class PhycocyaninEnvCore:
         0 — Growth:     Rapid biomass accumulation (I: 120-400, Fn: 0-40)
         1 — Production: Bioproduct synthesis      (I: 120-400, Fn: 0-10)
         2 — Cleanup:    Reactor harvest/drain      (Fout active, I/Fn masked)
+                        → stage 3 (volume latch) OR stage 0 (credit expiry, partial reset)
         3 — Idle:       Reactor off, system shutdown (all masked)
 
     Action dimensions (4):
@@ -215,12 +216,13 @@ class PhycocyaninEnvCore:
 
     def get_state_norm(self):
         """
-        Normalized observation vector (11D):
+        Normalized observation vector (12D):
           [0] Cx/6.0, [1] CN/800.0, [2] Cq/0.2, [3] V/V_max,
           [4-7] stage one-hot, [8] credit_remaining/base,
-          [9] t/500, [10] supply_remaining/initial
+          [9] t/500, [10] supply_remaining/initial,
+          [11] operation_time_left (1 - t/500)
         """
-        norm = np.zeros(11, dtype=np.float64)
+        norm = np.zeros(12, dtype=np.float64)
         norm[0] = self.state[0] / 6.0
         norm[1] = self.state[1] / 800.0
         norm[2] = self.state[2] / 0.2
@@ -235,6 +237,7 @@ class PhycocyaninEnvCore:
 
         norm[9]  = self.time / self.total_time
         norm[10] = self.nitrate_supply / self.INITIAL_NITRATE_SUPPLY
+        norm[11] = 1.0 - self.time / self.total_time  # operation time left
 
         return norm
 
@@ -266,6 +269,17 @@ class PhycocyaninEnvCore:
     def _sigmoid_switch(self, x, center=0.0, width=2.0):
         """Smooth transition factor ∈ [0, 1] for hysteretic switching."""
         return 1.0 / (1.0 + np.exp(-(x - center) / max(width, 0.01)))
+
+    def _partial_reset_reactor(self):
+        """
+        Reset the physical reactor state for a new Growth batch.
+        Preserves episode tracking (time, step count, violations, rewards).
+        Called when Cleanup credits expire → stage 0 backtrack.
+        """
+        self.state = np.array([1.1, 150.0, 0.01, self.V_INITIAL], dtype=np.float64)
+        self.nitrate_supply = self.INITIAL_NITRATE_SUPPLY
+        self.prev_action = np.zeros(4)
+
 
     def _physics_step(self, action):
         """
@@ -345,10 +359,31 @@ class PhycocyaninEnvCore:
             self._cleanup_latch = False
 
         elif self.current_stage == 2:
-            # Volume-triggered transition with hysteretic latch
+            # Immediate transition bypass if harvest is complete
             if self._cleanup_latch and blend >= 0.95:
-                self.current_stage = 3
                 self.stage_credits = 0.0
+
+            # End of stage 2 is reached when stage_credits <= 0 AND harvest is complete (blend >= 0.95)
+            # If credits expire but harvest is not complete, hold stage 2 (like fermentation env)
+            if self.stage_credits <= 0:
+                if not (self._cleanup_latch and blend >= 0.95):
+                    self.stage_credits = 0.0
+                else:
+                    # End of stage 2 reached!
+                    min_time_for_cycle = 110.0
+                    time_remaining = self.total_time - self.time
+                    
+                    if time_remaining >= min_time_for_cycle:
+                        # Backtrack to Growth (stage 0) to start a new batch
+                        self._partial_reset_reactor()
+                        self.current_stage = 0
+                        self.stage_credits = float(self.BASE_CREDITS[0])
+                        self._cleanup_latch = False
+                    else:
+                        # Transition to Idle (stage 3)
+                        self.current_stage = 3
+                        self.stage_credits = 0.0
+
 
         # ── CSTR Integration ─────────────────────────────────────────
         self.state = integrate_rk4(

@@ -18,7 +18,7 @@ from torch.optim.lr_scheduler import LinearLR
 # =============================================================================
 # HYPERPARAMETERS
 # =============================================================================
-STATE_DIM = 11     # [Cx, CN, Cq, V, stage_0..3, credit, t_norm, supply]
+STATE_DIM = 12     # [Cx, CN, Cq, V, stage_0..3, credit, t_norm, supply, op_time_left]
 ACTION_DIM = 4     # [time_mult, I, Fn, Fout]
 MAX_EPISODES = 50000
 UPDATE_TIMESTEP = 1000
@@ -108,7 +108,7 @@ def train_agent(agent_name, agent, logger):
                 os.makedirs("policy", exist_ok=True)
                 torch.save(agent.policy.state_dict(),
                            os.path.join("policy", f"{agent_name}_best_weights.pth"))
-            else:
+            elif i_episode > 25000:
                 no_improve_count += 1
 
             if no_improve_count >= EARLY_STOP_PATIENCE:
@@ -127,7 +127,7 @@ def train_agent(agent_name, agent, logger):
                 ] if c > 0
             ) or "-"
             pbar.set_postfix({
-                "TotR": f"{info['total_reward']:.1f}",
+                "TotR": f"{info['total_reward'] / 300.0:.3f}",
                 "AvgR": f"{info['avg_reward']:.3f}",
                 "VioID": vio_id_str,
                 "g1P": f"{info['avg_g1_penalty']:.2f}",

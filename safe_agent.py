@@ -33,7 +33,7 @@ class ActionProjectionNetwork(nn.Module):
       → Linear(128→1)  [raw margin]
       + 3 per-constraint auxiliary heads (train-only)
     """
-    def __init__(self, state_dim: int = 11, action_dim: int = 4,
+    def __init__(self, state_dim: int = 12, action_dim: int = 4,
                  latent_dim: int = 128):
         super(ActionProjectionNetwork, self).__init__()
 
@@ -96,7 +96,7 @@ class ActionProjectionNetwork(nn.Module):
 
 class StateEncoderGRU(nn.Module):
     """Temporal context encoder with GRU."""
-    def __init__(self, state_dim=11, embed_dim=32, gru_hidden=64, gru_layers=1):
+    def __init__(self, state_dim=12, embed_dim=32, gru_hidden=64, gru_layers=1):
         super(StateEncoderGRU, self).__init__()
         self.gru_hidden = gru_hidden
         self.gru_layers = gru_layers
@@ -122,7 +122,7 @@ class StateEncoderGRU(nn.Module):
 
 class StateEncoderSkip(nn.Module):
     """Instantaneous state encoder (skip connection)."""
-    def __init__(self, state_dim=11, skip_dim=32):
+    def __init__(self, state_dim=12, skip_dim=32):
         super(StateEncoderSkip, self).__init__()
         self.encode = nn.Sequential(
             nn.Linear(state_dim, skip_dim),
@@ -143,7 +143,7 @@ class ActorCritic(nn.Module):
       - Masked dims get near-zero std to suppress exploration
       - Log-probs exclude masked dims
     """
-    def __init__(self, state_dim=11, action_dim=4,
+    def __init__(self, state_dim=12, action_dim=4,
                  embed_dim=32, gru_hidden=64, skip_dim=32):
         super(ActorCritic, self).__init__()
         self.LOG_STD_MIN = -1.0
@@ -306,7 +306,7 @@ class SPRL_Agent:
         self._proj_calls = self._proj_noop = self._proj_iters = 0
         return {'calls': calls, 'noop': noop, 'iters': iters, 'avg_it': avg_it}
 
-    def _project_to_safe(self, state_norm, action, lr=0.05, max_steps=10, threshold=0.95):
+    def _project_to_safe(self, state_norm, action, lr=0.15, max_steps=5, threshold=0.95):
         """
         Gradient-ascend the APN margin surface until classify() >= threshold.
 
@@ -361,7 +361,7 @@ class SPRL_Agent:
                     grad[at_lower | at_upper] = 0.0
 
                     # Constant step size with mild decay
-                    step_size = lr / (1.0 + step * 0.1)
+                    step_size = lr / (1.0 + step * 0.03)
                     a = a + step_size * grad.sign()
                     a = a.clamp(-1.0, 1.0)
 
