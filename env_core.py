@@ -144,8 +144,6 @@ class PhycocyaninEnvCore:
 
         # --- Buffer / Barrier Zone Config ---
         self.OVERFLOW_BUFFER_FRAC = 0.10   # g4 buffer activates at 90% V_MAX
-        self.UNDERFLOW_BUFFER_L   = 10.0   # g5 buffer activates at V < 10 L
-        self.DRY_FLOOR            = self.V_MIN  # hard underflow floor (5 L)
 
         # --- Integration Config ---
         self.dt = 10.0 / 60.0   # 10 minutes (0.1667 h)
@@ -207,7 +205,6 @@ class PhycocyaninEnvCore:
         self.ep_g3_penalties = []
         self.ep_g4_penalties = []
         self.ep_g5_penalties = []
-        self.ep_g6_penalties = []
 
         # Phycocyanin harvested during cleanup (mass in mg)
         self.total_cq_harvested = 0.0

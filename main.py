@@ -135,7 +135,6 @@ def train_agent(agent_name, agent, logger):
                 "g3P": f"{info['avg_g3_penalty']:.2f}",
                 "g4P": f"{info['avg_g4_penalty']:.2f}",
                 "g5P": f"{info['avg_g5_penalty']:.2f}",
-                "g6P": f"{info['avg_g6_penalty']:.2f}",
                 "SmthP": f"{info['avg_smooth_penalty']:.3f}",
                 "RawMP": f"{info['avg_raw_mat_penalty']:.3f}",
                 "TotVio": f"{info['violation_count']}",
