@@ -94,48 +94,9 @@ class ActionProjectionNetwork(nn.Module):
 # GRU + Skip-Connection Actor-Critic Architecture
 # =============================================================================
 
-class StateEncoderGRU(nn.Module):
-    """Temporal context encoder with GRU."""
-    def __init__(self, state_dim=12, embed_dim=32, gru_hidden=64, gru_layers=1):
-        super(StateEncoderGRU, self).__init__()
-        self.gru_hidden = gru_hidden
-        self.gru_layers = gru_layers
-
-        self.embed = nn.Sequential(
-            nn.Linear(state_dim, embed_dim),
-            nn.ELU(),
-        )
-        self.gru = nn.GRU(
-            input_size=embed_dim,
-            hidden_size=gru_hidden,
-            num_layers=gru_layers,
-            batch_first=True,
-        )
-
-    def forward(self, state, hidden=None):
-        emb = self.embed(state)
-        emb_seq = emb.unsqueeze(1)
-        gru_out, hidden = self.gru(emb_seq, hidden)
-        gru_out = gru_out.squeeze(1)
-        return gru_out, hidden
-
-
-class StateEncoderSkip(nn.Module):
-    """Instantaneous state encoder (skip connection)."""
-    def __init__(self, state_dim=12, skip_dim=32):
-        super(StateEncoderSkip, self).__init__()
-        self.encode = nn.Sequential(
-            nn.Linear(state_dim, skip_dim),
-            nn.ELU(),
-        )
-
-    def forward(self, state):
-        return self.encode(state)
-
-
 class ActorCritic(nn.Module):
     """
-    Safe-agent Actor-Critic with dual-encoder (GRU + skip) and
+    Safe-agent Actor-Critic with feedforward MLP (no GRU) and
     stage-aware action masking for the 4D action space.
 
     Action masking follows the Fermentation-PPO pattern:
@@ -143,39 +104,26 @@ class ActorCritic(nn.Module):
       - Masked dims get near-zero std to suppress exploration
       - Log-probs exclude masked dims
     """
-    def __init__(self, state_dim=12, action_dim=4,
-                 embed_dim=32, gru_hidden=64, skip_dim=32):
+    def __init__(self, state_dim=12, action_dim=4):
         super(ActorCritic, self).__init__()
         self.LOG_STD_MIN = -1.0
         self.LOG_STD_MAX = 0.5
         self.env_state_dim = state_dim
 
-        # Dual Encoders
-        self.gru_encoder  = StateEncoderGRU(state_dim, embed_dim, gru_hidden)
-        self.skip_encoder = StateEncoderSkip(state_dim, skip_dim)
-
-        fused_dim = gru_hidden + skip_dim
-
-        # Actor head
+        # Actor head (3-layer MLP with 256 units and ELU activations)
         self.actor = nn.Sequential(
-            nn.Linear(fused_dim, 128), nn.ELU(),
-            nn.Linear(128, 64),         nn.ELU(),
-            nn.Linear(64, action_dim)
+            nn.Linear(state_dim, 256), nn.ELU(),
+            nn.Linear(256, 256),       nn.ELU(),
+            nn.Linear(256, action_dim)
         )
         self.log_std = nn.Parameter(torch.ones(action_dim) * -0.5)
 
-        # Critic head
+        # Critic head (3-layer MLP with 256 units and ELU activations)
         self.critic = nn.Sequential(
-            nn.Linear(fused_dim, 128), nn.ELU(),
-            nn.Linear(128, 64),         nn.ELU(),
-            nn.Linear(64, 1)
+            nn.Linear(state_dim, 256), nn.ELU(),
+            nn.Linear(256, 256),       nn.ELU(),
+            nn.Linear(256, 1)
         )
-
-    def _encode(self, state, hidden=None):
-        gru_out, hidden = self.gru_encoder(state, hidden)
-        skip            = self.skip_encoder(state)
-        fused           = torch.cat([gru_out, skip], dim=-1)
-        return fused, hidden
 
     def act(self, state, hidden=None):
         """
@@ -185,12 +133,11 @@ class ActorCritic(nn.Module):
             z        : squashed action [-1, 1]
             log_prob : log π(z | s)
             z_raw    : unbounded Gaussian sample
-            hidden   : updated GRU hidden state
+            hidden   : None (for API compatibility)
         """
         from env_core import PhycocyaninEnvCore
 
-        fused, hidden = self._encode(state, hidden)
-        mean = self.actor(fused)
+        mean = self.actor(state)
         std  = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
 
         # Stage mask from observation
@@ -213,18 +160,16 @@ class ActorCritic(nn.Module):
 
         log_prob = (dist.log_prob(z_raw) * mask).sum(dim=-1)
 
-        return z.detach(), log_prob.detach(), z_raw.detach(), hidden
+        return z.detach(), log_prob.detach(), z_raw.detach(), None
 
     def evaluate(self, state, z_raw):
         """
         Re-evaluates stored intents during the PPO update.
-        Hidden state is not threaded (standard PPO practice).
         """
         from env_core import PhycocyaninEnvCore
 
-        fused, _ = self._encode(state, hidden=None)
-        mean     = self.actor(fused)
-        std      = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
+        mean = self.actor(state)
+        std  = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
 
         mask = PhycocyaninEnvCore.get_action_mask(state[..., :self.env_state_dim])
 
@@ -237,13 +182,13 @@ class ActorCritic(nn.Module):
 
         log_probs    = (dist.log_prob(z_raw) * mask).sum(dim=-1)
         dist_entropy = (dist.entropy() * mask).sum(dim=-1)
-        state_values = self.critic(fused)
+        state_values = self.critic(state)
         return log_probs, state_values, dist_entropy
 
 
 class SPRL_Agent:
     """
-    Safe PPO agent with dual-encoder ActorCritic, stage-aware action masking,
+    Safe PPO agent with MLP ActorCritic, stage-aware action masking,
     and APN gradient projection safety filter.
     """
     def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, entropy_coeff):
@@ -257,11 +202,9 @@ class SPRL_Agent:
         # Actor-Critic
         self.policy = ActorCritic(state_dim=state_dim, action_dim=action_dim).to(device)
         self.optimizer = torch.optim.Adam([
-            {'params': self.policy.gru_encoder.parameters(),  'lr': lr_actor},
-            {'params': self.policy.skip_encoder.parameters(), 'lr': lr_actor},
             {'params': self.policy.actor.parameters(),        'lr': lr_actor},
             {'params': [self.policy.log_std],                 'lr': lr_actor},
-            {'params': self.policy.critic.parameters(),       'lr': lr_critic}
+            {'params': self.policy.critic.parameters(),       'lr': lr_critic, 'weight_decay': 1e-5}
         ])
 
         self.policy_old = ActorCritic(state_dim=state_dim, action_dim=action_dim).to(device)
@@ -306,13 +249,11 @@ class SPRL_Agent:
         self._proj_calls = self._proj_noop = self._proj_iters = 0
         return {'calls': calls, 'noop': noop, 'iters': iters, 'avg_it': avg_it}
 
-    def _project_to_safe(self, state_norm, action, lr=0.15, max_steps=5, threshold=0.95):
+    def _project_to_safe(self, state_norm, action, lr=0.25, max_steps=15, threshold=0.95):
         """
         Gradient-ascend the APN margin surface until classify() >= threshold.
-
         Stage-masked dimensions are zeroed in the gradient to prevent the
         projection from modifying locked action channels.
-
         Uses constant step size with mild decay to avoid premature stalling.
         """
         from env_core import PhycocyaninEnvCore
@@ -323,6 +264,13 @@ class SPRL_Agent:
 
         # Stage mask for gradient zeroing
         stage_mask = PhycocyaninEnvCore.get_action_mask(state_fixed)
+
+        # Bypass projection in Stage 2 (Cleanup) and Stage 3 (Idle) to avoid phantom gradients
+        # lock-in during draining and shutdown.
+        is_stage_2_or_3 = (state_fixed[..., 6] > 0.5) | (state_fixed[..., 7] > 0.5)
+        if is_stage_2_or_3.any():
+            self._proj_noop += 1
+            return a
 
         with torch.no_grad():
             p = self.safeguard.classify(state_fixed, a)
@@ -370,6 +318,8 @@ class SPRL_Agent:
     def select_action(self, state_norm):
         """
         Full safe action selection: Actor → mask → APN projection → final mask.
+        Returns u_safe as both the action AND the stored raw_action so that
+        PPO gradients are computed against the actually-executed safe action.
         """
         from env_core import PhycocyaninEnvCore
 
@@ -391,7 +341,11 @@ class SPRL_Agent:
         with torch.no_grad():
             u_safe = u_safe * mask + default_squashed * (1 - mask)
 
-        return (u_safe.cpu().numpy().flatten(),
+        # CRITICAL: store u_safe (the actually-executed action) as raw_action
+        # so PPO update gradients align with what was truly executed in the env.
+        # Using z_raw (pre-APN) would teach the policy to reproduce unsafe actions.
+        u_safe_np = u_safe.cpu().numpy().flatten()
+        return (u_safe_np,
                 log_prob.cpu().numpy(),
                 z_raw.cpu().numpy().flatten())
 
@@ -410,9 +364,10 @@ class SPRL_Agent:
         rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
-        old_states   = torch.squeeze(torch.stack(memory.states, dim=0)).detach().to(device)
-        old_z_raw    = torch.squeeze(torch.stack(memory.raw_actions, dim=0)).detach().to(device)
-        old_logprobs = torch.squeeze(torch.stack(memory.logprobs, dim=0)).detach().to(device)
+        old_states    = torch.squeeze(torch.stack(memory.states, dim=0)).detach().to(device)
+        old_z_raw     = torch.squeeze(torch.stack(memory.raw_actions, dim=0)).detach().to(device)
+        old_logprobs  = torch.squeeze(torch.stack(memory.logprobs, dim=0)).detach().to(device)
+        old_safe_acts = torch.squeeze(torch.stack(memory.actions, dim=0)).detach().to(device)
 
         for _ in range(self.K_epochs):
             logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_z_raw)
@@ -423,20 +378,24 @@ class SPRL_Agent:
             surr2      = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
             ppo_loss   = -torch.min(surr1, surr2).mean()
 
-            # Margin-based mapping penalty
+            # Manifold-mapping regression penalty matching Fermentation PPO
+            z_sq = torch.tanh(old_z_raw)
             with torch.no_grad():
-                z_intent = torch.tanh(old_z_raw)
-                margin   = self.safeguard(old_states, z_intent)
-            mapping_penalty = torch.clamp(-margin, min=0.0).mean()
+                margin = self.safeguard(old_states, z_sq)
+                # Apply higher weight to more severe violations
+                unsafe_weight = torch.clamp(-margin, min=0.0) + 0.1
+            
+            per_sample_loss = (z_sq - old_safe_acts.detach()).pow(2).mean(dim=-1)
+            mapping_penalty = (per_sample_loss * unsafe_weight).mean()
 
             loss = (ppo_loss
                     + 0.5  * self.MseLoss(state_values.squeeze(), rewards)
                     - self.entropy_coeff * dist_entropy.mean()
-                    + 0.001 * mapping_penalty)
+                    + 0.01 * mapping_penalty)  # matched to 0.01 from fermentation PPO
 
             self.optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+            nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
             self.optimizer.step()
 
         self.policy_old.load_state_dict(self.policy.state_dict())

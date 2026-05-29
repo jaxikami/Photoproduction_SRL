@@ -39,17 +39,21 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         self.lagrange_updates_enabled = False
 
         # ── Fixed constraint penalty weights ───────────────────────
-        self.W_BARRIER   = 20.0    # Quadratic buffer-zone scaling coefficient  (~1 at full depth)
-        self.W_g1_SPIKE  = 200.0  # Path nitrate hard spike                    (~10 per unit violation)
-        self.W_g2_SPIKE  = 200.0  # Product ratio hard spike                   (~10 per unit violation)
-        self.W_g3_SPIKE  = 1000.0 # Terminal nitrate hard spike
-        self.W_g4_SPIKE  = 200.0  # Volume overflow hard spike                 (~10 per unit violation)
-        self.W_IDLE_HARD = 1000.0 # Must end in Idle — hard terminal penalty
+        # Scale: harvest_r peaks ~13/step. Spikes should dominate reward
+        # at hard violations, but not be so large they prevent learning.
+        self.W_BARRIER   = 5.0     # Quadratic buffer-zone scaling coefficient
+        self.W_g1_SPIKE  = 30.0   # G1: 3× base; painful but not catastrophic
+        self.W_g2_SPIKE  = 20.0   # G2: 2× base
+        self.W_g3_SPIKE  = 200.0  # G3: terminal, so higher
+        self.W_g4_SPIKE  = 15.0   # G4: volume overflow
+        self.W_IDLE_HARD = 500.0  # G5: ~40× one harvest step — hard terminal
 
         # ── Reward shaping coefficients ────────────────────────────
-        self.prod_coef    = 4.0    # Dense per-step Cq scale  (4 * (Cq/0.2) ≈ 2 at Cq=0.1)
-        self.smooth_coef  = 0.5   # Action-smoothing penalty coefficient
-        self.raw_mat_coef = 3.0    # Nitrate feed penalty  (0.3 * Fn/FN_MAX ≈ 0.15 at half-max)
+        self.prod_coef    = 0.2    # Gentle stockpile nudge
+        self.harvest_coef = 200.0  # Massive payout for physical harvesting
+        self.time_penalty = 0.05   # Small operational cost
+        self.smooth_coef  = 0.5    # Action-smoothing penalty coefficient
+        self.raw_mat_coef = 0.5    # Nitrate feed penalty (reduced)
 
         # ── Buffer zone activation thresholds ─────────────────────
         # g1/g2: buffer activates at 90% of limit
@@ -76,11 +80,15 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         """
         One control step (10 h) with fixed-weight barrier + spike penalties.
         """
+        prev_harvested = self.total_cq_harvested
         a_clipped, Fn_phys, done = self._physics_step(action)
+        harvested_step = self.total_cq_harvested - prev_harvested
 
-        # ── Production reward (dense) ──────────────────────────────
-        # Reward based on total mass (Cq * Volume) relative to max possible mass
+        # ── Production & Harvest rewards (dense) ───────────────────
+        # Small reward for holding product
         prod_r = self.prod_coef * ((self.state[2] * self.state[3]) / (0.2 * self.V_MAX))
+        # Large reward for draining product out of the tank
+        harvest_r = harvested_step * self.harvest_coef
 
         # ── Fixed-weight barrier + spike constraint penalties ──────
         p_g1 = p_g2 = p_g3 = p_g4 = p_g5 = 0.0
@@ -157,7 +165,7 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
                 p_g5 += guiding_p
 
         # ── Aggregate step reward ──────────────────────────────────
-        step_reward = prod_r - constraint_penalty - smooth_p - raw_mat_p - p_g5
+        step_reward = prod_r + harvest_r - constraint_penalty - smooth_p - raw_mat_p - p_g5 - self.time_penalty
 
         # ── Terminal checks ────────────────────────────────────────
 
@@ -180,13 +188,11 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
             else:
                 step_reward += 50.0  # Idle completion bonus
 
-            # Terminal harvest bonus: reward sum of phycocyanin produced across cycles
-            step_reward += self.total_cq_harvested * 50.0  # Scale total harvest bonus
-
         # ── Metrics bookkeeping ────────────────────────────────────
         self.ep_total_reward += step_reward
         self.ep_rewards.append(step_reward)
         self.ep_prod_rewards.append(prod_r)
+        self.ep_harvest_rewards.append(harvest_r)
         self.ep_smooth_penalties.append(smooth_p)
         self.ep_constraint_penalties.append(constraint_penalty)
         self.ep_raw_mat_penalties.append(raw_mat_p)
@@ -200,6 +206,7 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
             "avg_reward":             float(np.mean(self.ep_rewards)),
             "total_reward":           self.ep_total_reward,
             "avg_prod_reward":        float(np.mean(self.ep_prod_rewards)),
+            "avg_harvest_reward":     float(np.mean(self.ep_harvest_rewards)),
             "avg_smooth_penalty":     float(np.mean(self.ep_smooth_penalties)),
             "avg_constraint_penalty": float(np.mean(self.ep_constraint_penalties)),
             "avg_raw_mat_penalty":    float(np.mean(self.ep_raw_mat_penalties)),

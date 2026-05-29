@@ -197,6 +197,7 @@ class PhycocyaninEnvCore:
         self.ep_total_reward = 0.0
         self.ep_rewards = []
         self.ep_prod_rewards = []
+        self.ep_harvest_rewards = []
         self.ep_smooth_penalties = []
         self.ep_constraint_penalties = []
         self.ep_raw_mat_penalties = []
@@ -367,7 +368,7 @@ class PhycocyaninEnvCore:
                     self.stage_credits = 0.0
                 else:
                     # End of stage 2 reached!
-                    min_time_for_cycle = 110.0
+                    min_time_for_cycle = 165.0
                     time_remaining = self.total_time - self.time
                     
                     if time_remaining >= min_time_for_cycle:

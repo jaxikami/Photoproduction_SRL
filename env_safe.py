@@ -57,25 +57,35 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         super().__init__()
 
         # ── Lagrangian update hyperparameters ──────────────────────
-        self.lag_lr     = 0.5
-        self.lag_decay  = 0.5 / 600.0
-        self.lag_max    = 25.0
-        self.lag_max_g5 = 50.0   # Higher cap for the hard idle constraint
+        # Scale: harvest_r peaks ~13/step. Penalties should dominate only
+        # at severe/persistent violations, not on first contact.
+        self.lag_lr     = 0.5          # Slow growth so λ ramps gradually
+        self.lag_lr_g1  = 2000.0       # Scaled up for G1 (path nitrate)
+        self.lag_lr_g2  = 2000.0       # Scaled up to handle tiny violation magnitude (~0.02)
+        self.lag_decay  = 0.5 / 600.0  # Slow decay so λ persists across episodes
+        self.lag_max    = 15.0         # Default matches env_bench W_g4_SPIKE
+        self.lag_max_g1 = 15000.0      # Dedicated high cap for G1 (retains G1 > G2 priority)
+        self.lag_max_g2 = 10000.0      # Dedicated high cap for G2 to allow meaningful penalty density
+        self.lag_max_g3 = 200.0        # Matches env_bench W_g3_SPIKE perfectly
+        self.lag_max_g5 = 100.0        # G5 cap (hard constraint)
 
         # ── Barrier + base spike params ────────────────────────────
-        self.BASE_SPIKE           = 5.0
-        self.BUFFER_COEF          = 0.4
-        self.OVERFLOW_BUFFER_FRAC = 0.10   # buffer activates at 90% V_MAX
-        self.IDLE_BASE_SPIKE      = 6000.0 # large fixed spike for idle violation
+        # BASE_SPIKE fires even at λ=0; must be painful but not catastrophic.
+        self.BASE_SPIKE           = 0.5   # Reduced from 2.0 to match Fermentation dynamics closer
+        self.BUFFER_COEF          = 5.0   # Matches env_bench W_BARRIER (was 0.5)
+        self.OVERFLOW_BUFFER_FRAC = 0.10  # buffer activates at 90% V_MAX
+        self.IDLE_BASE_SPIKE      = 500.0 # Hard idle spike: ~40× one harvest step
 
         # ── Buffer zone activation thresholds ─────────────────────
         self.G1_BUFFER_START = 0.9
         self.G2_BUFFER_START = 0.9
 
         # ── Reward shaping coefficients ────────────────────────────
-        self.prod_coef    = 4.0    # Dense per-step Cq scale  (4 * (Cq/0.2) ≈ 2 at Cq=0.1)
-        self.smooth_coef  = 0.05  # Action-smoothing penalty coefficient
-        self.raw_mat_coef = 3.0    # Nitrate feed penalty  (0.3 * Fn/FN_MAX ≈ 0.15 at half-max)
+        self.prod_coef    = 0.2    # Gentle stockpile nudge
+        self.harvest_coef = 200.0  # Massive payout for physical harvesting
+        self.time_penalty = 0.05   # Small operational cost (was 0.2, too aggressive)
+        self.smooth_coef  = 0.05   # Action-smoothing penalty coefficient
+        self.raw_mat_coef = 0.5    # Nitrate feed penalty (reduced: was 3.0)
 
         # Disable inherited monolithic Lagrangian attributes to avoid confusion
         self.lagrange_updates_enabled = False
@@ -108,11 +118,15 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         """
         One control step (10 h) with per-constraint Lagrangian multiplier penalties.
         """
+        prev_harvested = self.total_cq_harvested
         a_clipped, Fn_phys, done = self._physics_step(action)
+        harvested_step = self.total_cq_harvested - prev_harvested
 
-        # ── Production reward (dense) ──────────────────────────────
-        # Reward based on total mass (Cq * Volume) relative to max possible mass
+        # ── Production & Harvest rewards (dense) ───────────────────
+        # Small reward for holding product
         prod_r = self.prod_coef * ((self.state[2] * self.state[3]) / (0.2 * self.V_MAX))
+        # Large reward for draining product out of the tank
+        harvest_r = harvested_step * self.harvest_coef
 
         # ── Per-constraint Lagrangian penalties ────────────────────
         p_g1 = p_g2 = p_g3 = p_g4 = p_g5 = 0.0
@@ -126,7 +140,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         if n_ratio > 1.0:
             viol = n_ratio - 1.0
             p_g1 += self.lam_g1 * viol + self.BASE_SPIKE * (1.0 + viol)
-            self.lam_g1 = min(self.lag_max, self.lam_g1 + self.lag_lr * viol)
+            self.lam_g1 = min(self.lag_max_g1, self.lam_g1 + self.lag_lr_g1 * viol)
             self.violation_count    += 1
             self.g1_violation_count += 1
         else:
@@ -142,7 +156,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         if q_ratio > 1.0:
             viol = q_ratio - 1.0
             p_g2 += self.lam_g2 * viol + self.BASE_SPIKE * (1.0 + viol)
-            self.lam_g2 = min(self.lag_max, self.lam_g2 + self.lag_lr * viol)
+            self.lam_g2 = min(self.lag_max_g2, self.lam_g2 + self.lag_lr_g2 * viol)
             self.violation_count    += 1
             self.g2_violation_count += 1
         else:
@@ -200,7 +214,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
                 p_g5 += guiding_p
 
         # ── Aggregate step reward ──────────────────────────────────
-        step_reward = prod_r - constraint_penalty - smooth_p - raw_mat_p - p_g5
+        step_reward = prod_r + harvest_r - constraint_penalty - smooth_p - raw_mat_p - p_g5 - self.time_penalty
 
         # ── Terminal checks ────────────────────────────────────────
 
@@ -209,14 +223,14 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             t_ratio = self.state[1] / self.N_LIMIT_TERM
             if t_ratio > 1.0:
                 viol = t_ratio - 1.0
-                # Scale terminal penalty by 100× vs path constraints
-                p_g3 += self.lam_g3 * viol * 100.0 + self.BASE_SPIKE * (1.0 + viol) * 100.0
+                # Use lag_max_g3 specifically
+                p_g3 += self.lam_g3 * viol + self.BASE_SPIKE * (1.0 + viol)
                 step_reward -= p_g3
-                self.lam_g3 = min(self.lag_max, self.lam_g3 + self.lag_lr * viol * 10.0)
+                self.lam_g3 = min(self.lag_max_g3, self.lam_g3 + self.lag_lr * viol)
                 self.violation_count    += 1
                 self.g3_violation_count += 1
             else:
-                self.lam_g3 *= (1.0 - self.lag_decay * 10.0)
+                self.lam_g3 *= (1.0 - self.lag_decay)
 
             # g5: Must end in Idle stage — HARD constraint
             # Enforced via large fixed base spike + adaptive λ_g5
@@ -224,20 +238,18 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
                 current_idle_spike = self.IDLE_BASE_SPIKE
                 p_g5 += self.lam_g5 + current_idle_spike
                 step_reward -= p_g5
-                self.lam_g5 = min(self.lag_max_g5, self.lam_g5 + self.lag_lr * 20.0)
+                self.lam_g5 = min(self.lag_max_g5, self.lam_g5 + self.lag_lr * 5.0)
                 self.violation_count    += 1
                 self.g5_violation_count += 1
             else:
                 self.lam_g5 *= (1.0 - self.lag_decay)
                 step_reward += 50.0  # Idle completion bonus
 
-            # Terminal harvest bonus: reward sum of phycocyanin produced across cycles
-            step_reward += self.total_cq_harvested * 50.0  # Scale total harvest bonus
-
         # ── Metrics bookkeeping ────────────────────────────────────
         self.ep_total_reward += step_reward
         self.ep_rewards.append(step_reward)
         self.ep_prod_rewards.append(prod_r)
+        self.ep_harvest_rewards.append(harvest_r)
         self.ep_smooth_penalties.append(smooth_p)
         self.ep_constraint_penalties.append(constraint_penalty)
         self.ep_raw_mat_penalties.append(raw_mat_p)
@@ -251,6 +263,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             "avg_reward":             float(np.mean(self.ep_rewards)),
             "total_reward":           self.ep_total_reward,
             "avg_prod_reward":        float(np.mean(self.ep_prod_rewards)),
+            "avg_harvest_reward":     float(np.mean(self.ep_harvest_rewards)),
             "avg_smooth_penalty":     float(np.mean(self.ep_smooth_penalties)),
             "avg_constraint_penalty": float(np.mean(self.ep_constraint_penalties)),
             "avg_raw_mat_penalty":    float(np.mean(self.ep_raw_mat_penalties)),

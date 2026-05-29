@@ -31,8 +31,8 @@ CONTROL_INTERVAL = 10.0
 TOTAL_TIME       = 500.0
 SAFE_BUFFER      = 0.98
 THRESHOLD        = 0.95
-MAX_PROJ_STEPS   = 5
-LR_PROJ          = 1.0
+MAX_PROJ_STEPS   = 15
+LR_PROJ          = 0.25
 
 
 def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS,
@@ -49,6 +49,11 @@ def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS,
 
     # SERL checkpoint 2: clamp initial action
     a = action_t.clone().detach() * stage_mask + default_squashed * (1 - stage_mask)
+
+    # Bypass projection in Stage 2 (Cleanup) and Stage 3 (Idle) to avoid phantom gradients
+    is_stage_2_or_3 = (state_fixed[..., 6] > 0.5) | (state_fixed[..., 7] > 0.5)
+    if is_stage_2_or_3.any():
+        return a, 0
 
     with torch.no_grad():
         p = apn.classify(state_fixed, a)

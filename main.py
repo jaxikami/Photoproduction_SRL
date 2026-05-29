@@ -130,6 +130,8 @@ def train_agent(agent_name, agent, logger):
                 "TotR": f"{info['total_reward'] / 300.0:.3f}",
                 "AvgR": f"{info['avg_reward']:.3f}",
                 "VioID": vio_id_str,
+                "ProdR": f"{info['avg_prod_reward']:.2f}",
+                "HarvR": f"{info['avg_harvest_reward']:.2f}",
                 "g1P": f"{info['avg_g1_penalty']:.2f}",
                 "g2P": f"{info['avg_g2_penalty']:.2f}",
                 "g3P": f"{info['avg_g3_penalty']:.2f}",
