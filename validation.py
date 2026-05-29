@@ -1,13 +1,14 @@
 """
 Validation suite for the Photoproduction Safety Boundary Classifier.
 
-Tests the gradient-ascent projection against four instantaneous constraints:
-  Test 1 — G1: Nitrate path constraint
-  Test 2 — G2: Product/biomass ratio
-  Test 4 — Identity mapping (safe states unmodified)
+Tests the gradient-ascent projection (APN) against instantaneous constraints:
+  - Test 1 (G1): Nitrate path constraint
+  - Test 2 (G2): Product/biomass ratio
+  - Test 3 (G4): Reactor overflow
+  - Test 4 (ID): Identity mapping (safe states unmodified)
 
-Note: G3 (terminal nitrate) is handled by the GRU temporal context and
-Lagrangian multiplier, not by the APN.
+Note: G3 (terminal nitrate) and G5 (idle stage) are handled by the GRU temporal 
+context and Lagrangian multipliers, not by the APN's instantaneous projection.
 """
 
 import torch
@@ -28,20 +29,30 @@ V_MAX            = 50.0
 V_MIN            = 5.0
 C_N_STOCK        = 50000.0
 CONTROL_INTERVAL = 10.0
-TOTAL_TIME       = 500.0
+TOTAL_TIME       = 1000.0
 SAFE_BUFFER      = 0.98
 THRESHOLD        = 0.95
 MAX_PROJ_STEPS   = 15
 LR_PROJ          = 0.25
 
 
-def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS,
-                      lr=LR_PROJ, threshold=THRESHOLD):
-    """
-    Gradient-ascent projection — mirrors safe_agent.SPRL_Agent._project_to_safe.
+def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS, lr=LR_PROJ, threshold=THRESHOLD):
+    """Executes gradient-ascent projection to find a safe action proxy.
     
+    Mirrors the safe_agent.SPRL_Agent._project_to_safe logic for validation.
     Includes full SERL masking logic to prevent the APN from cheating
     using structurally inactive flow dimensions.
+
+    Args:
+        apn (ActionProjectionNetwork): The loaded APN model.
+        state_norm_t (torch.Tensor): The current normalized state observation.
+        action_t (torch.Tensor): The unbounded proposed action.
+        max_steps (int, optional): Max optimization iterations. Defaults to MAX_PROJ_STEPS.
+        lr (float, optional): Gradient ascent learning rate. Defaults to LR_PROJ.
+        threshold (float, optional): Target safety probability. Defaults to THRESHOLD.
+
+    Returns:
+        tuple: (projected_action (torch.Tensor), optimization_steps_taken (int))
     """
     state_fixed = state_norm_t.detach()
     stage_mask = PhycocyaninEnvCore.get_action_mask(state_fixed)
@@ -101,7 +112,22 @@ def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS,
 
 
 def _make_state(cx, cN, cq, V, stage_idx, credit_norm, t_norm, supply_norm, device):
-    """Pack physical values into normalised state tensor [1, 12]."""
+    """Packs physical values into a normalized state tensor shape [1, 12].
+
+    Args:
+        cx (float): Biomass concentration (g/L).
+        cN (float): Nitrate concentration (mg/L).
+        cq (float): Phycocyanin concentration (mg/L).
+        V (float): Reactor volume (L).
+        stage_idx (int): Current operational stage index [0-3].
+        credit_norm (float): Normalized remaining stage credit.
+        t_norm (float): Normalized episode time.
+        supply_norm (float): Normalized remaining nitrate supply.
+        device (torch.device): Compute device for the output tensor.
+
+    Returns:
+        torch.Tensor: Normalized observation tensor.
+    """
     s = torch.zeros(1, 12, dtype=torch.float32, device=device)
     s[0, 0] = cx / 6.0
     s[0, 1] = cN / 800.0
@@ -116,11 +142,22 @@ def _make_state(cx, cN, cq, V, stage_idx, credit_norm, t_norm, supply_norm, devi
 
 
 def run_validation(model=None, num_test_samples: int = 2000):
-    """
-    Runs the five constraint validation tests.
+    """Executes the constraint validation suite using physics-based simulations.
+
+    Validates that the APN effectively blocks unsafe actions from breaching
+    the defined hard bounds for the G1, G2, and G4 constraints, and verifies
+    that safe actions remain undisturbed.
+
+    Args:
+        model (ActionProjectionNetwork, optional): Pre-loaded APN. If None, it will
+            be loaded from the policy directory. Defaults to None.
+        num_test_samples (int, optional): Number of randomized samples per test.
+            Defaults to 2000.
 
     Returns:
-        bool — True if all tests pass (≥ 95% projection success rate).
+        tuple:
+            - all_passed (bool): True if all tests exceed the 95% threshold.
+            - pass_rates (dict): Dictionary mapping constraint names to success rates.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

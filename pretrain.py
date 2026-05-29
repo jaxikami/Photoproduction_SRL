@@ -32,19 +32,28 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 
 class ActionProjectionNetwork(nn.Module):
-    """
-    Safety Proximity Regressor for the multi-stage photobioreactor.
+    """Safety Proximity Regressor for the multi-stage photobioreactor.
 
     Given a (state, action) pair, outputs a continuous signed margin score:
-      margin > 0  →  safe
-      margin < 0  →  unsafe
-      margin = 0  →  on the safety boundary
+      - margin > 0: Action is safe.
+      - margin < 0: Action is unsafe.
+      - margin = 0: Action is precisely on the safety boundary.
 
-    auxiliary heads for improved boundary discrimination.
+    Architecture:
+        Linear(15 -> 128) -> LayerNorm -> Mish
+        -> 3x Residual blocks (128 -> 128)
+        -> Linear(128 -> 1) [raw margin score]
+        Also includes 3 per-constraint auxiliary heads used for APN pretraining.
     """
 
-    def __init__(self, state_dim: int = 12, action_dim: int = 4,
-                 latent_dim: int = 160):
+    def __init__(self, state_dim: int = 12, action_dim: int = 4, latent_dim: int = 160):
+        """Initializes the Action Projection Network for pretraining.
+
+        Args:
+            state_dim (int, optional): Dimension of observation space. Defaults to 12.
+            action_dim (int, optional): Dimension of action space. Defaults to 4.
+            latent_dim (int, optional): Width of hidden layers. Defaults to 160.
+        """
         super(ActionProjectionNetwork, self).__init__()
 
         self.encoder = nn.Sequential(
@@ -88,6 +97,15 @@ class ActionProjectionNetwork(nn.Module):
         nn.init.zeros_(self.margin_head.bias)
 
     def forward(self, state_norm, action_norm):
+        """Computes the continuous signed safety margin for the given state and action.
+
+        Args:
+            state_norm (torch.Tensor): Normalized observation vector.
+            action_norm (torch.Tensor): Action vector.
+
+        Returns:
+            torch.Tensor: Continuous margin score.
+        """
         x_in = torch.cat([state_norm, action_norm], dim=-1)
         x_enc = self.encoder(x_in)
         x_enc = self.res_act(x_enc + self.res_block1(x_enc))
@@ -97,7 +115,15 @@ class ActionProjectionNetwork(nn.Module):
         return margin
 
     def forward_aux(self, state_norm, action_norm):
-        """Forward pass returning main margin + per-constraint auxiliary margins."""
+        """Forward pass returning main margin and per-constraint auxiliary margins.
+
+        Args:
+            state_norm (torch.Tensor): Normalized observation vector.
+            action_norm (torch.Tensor): Action vector.
+
+        Returns:
+            tuple: (margin, g1_margin, g2_margin, g4_margin)
+        """
         x_in = torch.cat([state_norm, action_norm], dim=-1)
         x_enc = self.encoder(x_in)
         x_enc = self.res_act(x_enc + self.res_block1(x_enc))
@@ -110,18 +136,33 @@ class ActionProjectionNetwork(nn.Module):
         return margin, g1, g2, g4
 
     def classify(self, state_norm, action_norm):
+        """Returns the probability that the state-action pair is safe (margin > 0).
+
+        Args:
+            state_norm (torch.Tensor): Normalized observation vector.
+            action_norm (torch.Tensor): Action vector.
+
+        Returns:
+            torch.Tensor: Safety probability [0, 1].
+        """
         return torch.sigmoid(self.forward(state_norm, action_norm))
 
 
 def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
                     refresh_interval=100, load=False):
-    """
-    Trains the safety boundary classifier via Binary Cross-Entropy on
-    mass-balance simulation labels.
+    """Trains the safety boundary classifier APN on generated offline datasets.
 
-    The training loop continuously generates fresh randomized datasets
-    (biased toward boundary states) so the classifier generalizes across
-    the full state-action space rather than memorizing a fixed dataset.
+    The training loop continuously generates fresh randomized datasets biased 
+    toward the boundary states so the classifier learns the safety manifold.
+    Optimizes a combination of BCE focal loss, smooth L1 regression, and auxiliary
+    constraint losses.
+
+    Args:
+        epochs (int, optional): Max number of epochs to train. Defaults to 100000.
+        batch_size (int, optional): Mini-batch size. Defaults to 32768.
+        buffer_size (int, optional): Size of the background dataset buffer. Defaults to 1000000.
+        refresh_interval (int, optional): Epochs between dataset refreshes. Defaults to 100.
+        load (bool, optional): Whether to resume from an existing checkpoint. Defaults to False.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")

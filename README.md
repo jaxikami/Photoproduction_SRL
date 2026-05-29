@@ -1,125 +1,102 @@
 # Safe Policy Reinforcement Learning (SPRL) for Bioreactor Control
 
-This repository implements a Safe Reinforcement Learning pipeline for phycocyanin production control in a multi-stage photobioreactor. It compares:
+This repository implements a Safe Reinforcement Learning pipeline for phycocyanin production control in a continuous multi-stage photobioreactor. It compares:
 
-- `Standard RL`: PPO with reward penalties for constraint handling.
-- `SPRL`: PPO with a learned Action Projection Network (APN) that projects intents toward a safe action manifold.
+- `Standard RL`: A baseline Proximal Policy Optimization (PPO) agent using a Lagrangian multiplier approach (reward penalties) for constraint handling.
+- `safe_RL agent`: A PPO agent equipped with a learned Action Projection Network (APN) that projects unsafe action intents onto a safe action manifold.
 
 ## Overview
 
-The environment (`env.py`) is a nonlinear, volume-tracked photobioreactor with Runge-Kutta integration and stage-dependent control.
+The environment is a nonlinear, volume-tracked photobioreactor with Runge-Kutta integration and stage-dependent control.
 
-- Normalized observation (11D):
-	- `[Cx, CN, Cq, V]` normalized
-	- stage one-hot (4 dims)
-	- remaining stage credit
-	- normalized time
-	- normalized nitrate supply
-- Action space (4D, normalized to `[-1, 1]`):
-	- time multiplier
-	- light intensity `I`
-	- nitrate feed `Fn`
-	- outstream flow `Fout`
-- Objective:
-	- maximize phycocyanin production while respecting process and terminal constraints.
+- **Normalized observation (12D):**
+  - `[Cx, CN, Cq, V]` physical states normalized
+  - stage one-hot vector (4 dims)
+  - remaining stage credit
+  - normalized episode time
+  - normalized nitrate supply
+  - operation time left
+- **Action space (4D, bounded to `[-1, 1]`):**
+  - stage duration time multiplier
+  - light intensity `I`
+  - nitrate feed `Fn`
+  - outstream flow `Fout`
+- **Objective:**
+  - Maximize phycocyanin production while strictly respecting process, volume, and terminal constraints.
 
 ## Safety Constraints
 
-Implemented constraints in `env.py`:
+Implemented constraints in the environment (`env_core.py`):
 
-- `g1` (path nitrate): `CN <= 800 mg/L`
-- `g2` (quality ratio): `Cq/Cx <= 0.011`
-- `g3` (terminal nitrate): `CN <= 150 mg/L` at episode end
-- `g4` (overflow): `V <= 50 L`
+- `G1` (Path Nitrate): `CN <= 800 mg/L`
+- `G2` (Quality Ratio): `Cq/Cx <= 0.011`
+- `G3` (Terminal Nitrate): `CN <= 150 mg/L` at episode end
+- `G4` (Reactor Overflow): `V <= 50 L`
+- `G5` (Idle Stage Minimum Volume): `V >= 5 L`
 
-Notes:
-
-- APN pretraining covers `g1`, `g2`, `g4` (instantaneous constraints).
-- `g3` is handled in environment terminal logic and temporal policy behavior.
+*Note: APN pretraining covers instantaneous constraints (G1, G2, G4). Constraints G3 and G5 are handled via Lagrangian multipliers and temporal policy behavior.*
 
 ## Architecture
 
-### SPRL agent (`safe_agent.py`)
+### SPRL Agent (`safe_agent.py`)
+1. **Actor-Critic Policy**: Feedforward MLP with stage-aware action masking.
+2. **Safety Filter (APN)**: Loaded from `policy/action_projection_network.pth`. Uses gradient ascent on the margin surface to project action intents to safe proxies before execution.
 
-1. Actor-Critic policy:
-	 - dual encoder (GRU temporal context + skip encoder)
-	 - stage-aware action masking
-2. Safety filter (APN):
-	 - loaded from `policy/action_projection_network.pth`
-	 - gradient projection of action intent onto safer region
-
-### Baseline agent (`lag_agent.py`)
-
-- standard PPO actor-critic with no projection filter.
-- relies on reward shaping and penalty terms for safety behavior.
+### Baseline Agent (`lag_agent.py`)
+1. **Actor-Critic Policy**: Standard PPO architecture without the projection filter. Relies on reward shaping to learn safety behaviors.
 
 ## Project Structure
 
 | File | Purpose |
 | :--- | :--- |
-| `main.py` | Training/evaluation entry point for `Standard RL` and `SPRL`. |
-| `env.py` | Multi-stage photobioreactor environment, constraints, rewards, RK4 dynamics. |
-| `safe_agent.py` | SPRL implementation (GRU actor-critic + APN projection safety filter). |
-| `lag_agent.py` | Baseline PPO implementation. |
-| `pretrain.py` | APN training loop. |
-| `data_gen.py` | Synthetic dataset generation for APN pretraining. |
-| `validation.py` | APN validation suite (boundary and identity tests). |
-| `utils.py` | Logging and plotting utilities. |
-| `policy/action_projection_network.pth` | APN checkpoint used by `SPRL`. |
-| `plot/` | Generated figures. |
+| `main.py` | Training and evaluation orchestrator for the agents. |
+| `env_core.py` | Base photobioreactor environment, state representation, and RK4 dynamics. |
+| `env_bench.py` | Benchmark environment for Standard RL using Lagrangian penalties. |
+| `env_safe.py` | Safe environment specifically integrated with the APN agent. |
+| `safe_agent.py` | SPRL implementation featuring the APN projection safety filter. |
+| `lag_agent.py` | Baseline Standard RL (Lagrangian) implementation. |
+| `pretrain.py` | Generative dataset training loop for the APN classifier. |
+| `data_gen.py` | Physics-based offline dataset generation for APN pretraining. |
+| `validation.py` | Constraint validation suite for the APN model. |
+| `utils.py` | Logging and plotting utilities for visualizing trajectories and violations. |
+| `policy/` | Checkpoint directory for the APN and RL weights. |
+| `plot/` | Directory where generated training and evaluation plots are saved. |
 
 ## Setup
 
 Use Python 3.10+ (recommended) and install dependencies:
 
 ```bash
-pip install torch numpy numba matplotlib pandas tqdm
+pip install torch numpy matplotlib pandas tqdm
 ```
 
 ## How To Run
 
-1. Pretrain APN (if you need to regenerate the safety filter)
-
+1. **Pretrain APN** (if you need to generate a new safety filter from scratch)
 ```bash
 python pretrain.py
 ```
 
-2. Validate APN safety behavior
-
+2. **Validate APN Safety Behavior**
 ```bash
 python validation.py
 ```
 
-3. Train and/or evaluate RL agents
-
-- Open `main.py` and set:
-	- `EVALUATE_ONLY = False` to train then evaluate
-	- `EVALUATE_ONLY = True` to evaluate existing checkpoints only
+3. **Train and/or Evaluate RL Agents**
+Open `main.py` and set:
+- `EVALUATE_ONLY = False` to train and then evaluate
+- `EVALUATE_ONLY = True` to evaluate existing checkpoints only
+- `RUN_BENCHMARK = True/False` to toggle between Standard RL and Safe RL.
 
 Then run:
-
 ```bash
 python main.py
 ```
 
 ## Outputs
 
-- Policy checkpoints:
-	- `policy/Standard RL_final_weights.pth`
-	- `policy/SPRL_final_weights.pth`
-- Plots:
-	- `plot/training_Standard RL.png`
-	- `plot/training_SPRL.png`
-	- `plot/training_violations.png`
-	- `plot/comprehensive_evaluation.png`
-	- `plot/am_loss.png` (APN pretraining)
-
-## Current Simulation Configuration
-
-From `env.py` defaults:
-
-- total simulated horizon: `500 h`
-- control interval: `10 h`
-- max RL steps per episode: `50`
-
-Adjust constants in `env.py` and `main.py` for your experiment design.
+Generated plots are saved in the `plot/` directory, including:
+- `training_Standard RL.png` / `training_safe_RL agent.png`
+- `training_violations.png`
+- Detailed Evaluation Trajectories: `plot_nitrate.png`, `plot_phycocyanin.png`, `plot_light.png`, `plot_nitrate_feed.png`, `plot_volume.png`, `plot_ratio.png`, and `plot_violations.png`.
+- `am_loss.png` (APN pretraining convergence)

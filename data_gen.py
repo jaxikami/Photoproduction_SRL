@@ -25,24 +25,31 @@ V_MAX           = 50.0
 V_MIN           = 5.0
 C_N_STOCK       = 50000.0
 CONTROL_INTERVAL = 10.0
-TOTAL_TIME      = 500.0
+TOTAL_TIME      = 1000.0
 SAFE_BUFFER     = 0.98
 
 
 def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = None):
-    """
-    Generate a raw batch of (state, action, is_safe, margin) samples.
+    """Generates a raw batch of state-action tuples and physical margins.
 
-    State layout (12D, normalised):
+    Simulates the system dynamics forward by one step to compute instantaneous
+    margins for the G1, G2, and G4 constraints. The dataset is biased toward
+    generating states near the constraint boundaries to train the APN effectively.
+
+    State layout (12D, normalized):
       [cx/6, cN/800, cq/0.2, V/V_MAX, stage_0..3, credit/base, t/500, supply/initial, op_time_left]
 
     Action layout (4D, [-1,1]):
       [time_mult, I_norm, Fn_norm, Fout_norm]
 
-    Sampling strategy:
-      - 30% uniform interior (safe identity region)
-      - 70% biased toward constraint boundaries (mixed safe/unsafe)
-        - Sub-biases for each of G1, G2, G4 near-boundary regions
+    Args:
+        num_samples (int): Number of raw samples to generate.
+        bias (float, optional): Fraction of samples dedicated to boundary regions. Defaults to 0.7.
+        pass_rates (dict, optional): Dictionary of validation pass rates used to dynamically 
+            adjust boundary sub-sampling priorities. Defaults to None.
+
+    Returns:
+        tuple: (states, actions, is_safe, smooth_min_margin, margin_g1, margin_g2, margin_g4, near_boundary_mask)
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -329,8 +336,19 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
 
 
 def get_fresh_batch_dataset(num_samples: int = 500000, bias: float = 0.7, pass_rates: dict = None):
-    """
-    Build one balanced training batch (40% safe / 60% unsafe).
+    """Builds a balanced pretraining dataset by aggregating filtered raw batches.
+
+    Guarantees a class balance of 40% safe and 60% unsafe samples. The safe
+    samples are further divided into regular (interior) safe points and 
+    near-boundary safe points to provide sharp gradient signal near the manifold.
+
+    Args:
+        num_samples (int, optional): Total size of the balanced dataset. Defaults to 500000.
+        bias (float, optional): Passed to the raw batch generator. Defaults to 0.7.
+        pass_rates (dict, optional): Passed to the raw batch generator. Defaults to None.
+
+    Returns:
+        tuple: Permuted balanced tensors (states, actions, labels, min_margin, margin_g1, margin_g2, margin_g4).
     """
     target_safe_reg = num_samples * 15 // 100
     target_safe_bnd = num_samples * 25 // 100

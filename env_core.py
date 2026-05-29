@@ -1,3 +1,11 @@
+"""
+Core Environment Module for the Photoproduction Bioreactor.
+
+This module provides the physics simulation engine and the base environment
+class `PhycocyaninEnvCore` which handles the mass balance equations,
+Runge-Kutta integration, and stage transitions of the Continuous Stirred-Tank
+Reactor (CSTR) for phycocyanin production.
+"""
 import numpy as np
 from numba import njit
 
@@ -10,21 +18,22 @@ C_N_STOCK = 50000.0
 
 @njit
 def calculate_rates_numba(state, I, Fn, F_out):
-    """
-    Computes instantaneous rates for the bioreactor state [Cx, CN, Cq, V].
+    """Computes instantaneous kinetic rates for the bioreactor state.
 
     The CSTR formulation accounts for dilution effects from feed inflow
-    and product removal via outstream.
+    and product removal via outstream. This function is compiled with Numba
+    for fast execution during simulation.
 
     Args:
-        state (array): [Biomass Cx (g/L), Nitrate CN (mg/L),
-                        Phycocyanin Cq (mg/L), Volume V (L)].
-        I (float):     Light intensity (umol/m^2/s).
-        Fn (float):    Nitrate feed concentration rate (mg/L/h).
+        state (np.ndarray): Current physical state [Biomass Cx (g/L), 
+            Nitrate CN (mg/L), Phycocyanin Cq (mg/L), Volume V (L)].
+        I (float): Light intensity (umol/m^2/s).
+        Fn (float): Nitrate feed concentration rate (mg/L/h).
         F_out (float): Outstream volumetric flow (L/h).
 
     Returns:
-        R (array): [dCx/dt, dCN/dt, dCq/dt, dV/dt].
+        np.ndarray: Array of instantaneous rates of change 
+            [dCx/dt, dCN/dt, dCq/dt, dV/dt].
     """
     Cx = state[0]
     CN = state[1]
@@ -71,8 +80,21 @@ def calculate_rates_numba(state, I, Fn, F_out):
 
 @njit
 def integrate_rk4(state_init, I, Fn, F_out, dt, n_steps):
-    """
-    4th-order Runge-Kutta integrator for the CSTR system [Cx, CN, Cq, V].
+    """Executes a 4th-order Runge-Kutta integration step for the CSTR system.
+
+    Advances the physical state of the bioreactor [Cx, CN, Cq, V] over a given
+    time period using the defined instantaneous rates.
+
+    Args:
+        state_init (np.ndarray): The initial physical state before integration.
+        I (float): Light intensity applied during the step.
+        Fn (float): Nitrate feed rate applied during the step.
+        F_out (float): Outstream flow rate during the step.
+        dt (float): Inner integration time step duration (hours).
+        n_steps (int): Number of integration steps to execute.
+
+    Returns:
+        np.ndarray: The updated physical state after integration.
     """
     state = state_init.copy()
     for _ in range(n_steps):
@@ -113,13 +135,13 @@ class PhycocyaninEnvCore:
 
     def __init__(self):
         # --- Simulation Config ---
-        self.total_time = 500.0
+        self.total_time = 1000.0
         self.control_freq = 10.0
-        self.max_steps = int(self.total_time / self.control_freq)  # 50
+        self.max_steps = int(self.total_time / self.control_freq)  # 100
 
         # --- Stage Config ---
         self.n_stage = 4
-        self.BASE_CREDITS = np.array([120.0, 60.0, 50.0, 0.0])
+        self.BASE_CREDITS = np.array([163.0, 81.0, 68.0, 0.0])
         #                              Growth  Prod  Cleanup  Idle
 
         # --- Physical Action Boundaries ---
@@ -152,8 +174,17 @@ class PhycocyaninEnvCore:
         self.reset()
 
     def reset(self, randomize=False):
-        """
-        Resets the environment for a new training episode.
+        """Resets the environment for a new training episode.
+
+        Initializes all tracking variables, physical states, and global nutrient
+        pools. If `randomize` is True, initial concentrations are slightly perturbed.
+
+        Args:
+            randomize (bool, optional): Whether to inject initial state noise.
+                Defaults to False.
+
+        Returns:
+            np.ndarray: The normalized initial observation vector.
         """
         self.time = 0.0
         self.time_step_count = 0
@@ -213,12 +244,22 @@ class PhycocyaninEnvCore:
         return self.get_state_norm()
 
     def get_state_norm(self):
-        """
-        Normalized observation vector (12D):
-          [0] Cx/6.0, [1] CN/800.0, [2] Cq/0.2, [3] V/V_max,
-          [4-7] stage one-hot, [8] credit_remaining/base,
-          [9] t/500, [10] supply_remaining/initial,
-          [11] operation_time_left (1 - t/500)
+        """Calculates and returns the normalized observation vector.
+
+        The observation vector provides the RL agent with a standardized scale
+        (typically [0, 1] bounds) for all features, improving network training.
+
+        Returns:
+            np.ndarray: A 12-dimensional normalized vector containing:
+                - [0] Cx/6.0
+                - [1] CN/800.0
+                - [2] Cq/0.2
+                - [3] V/V_max
+                - [4-7] One-hot encoded current stage (0 to 3)
+                - [8] Remaining stage credit (normalized by base credit)
+                - [9] Normalized episode time (t / total_time)
+                - [10] Normalized remaining nitrate supply
+                - [11] Remaining operation time fraction (1 - t / total_time)
         """
         norm = np.zeros(12, dtype=np.float64)
         norm[0] = self.state[0] / 6.0
@@ -241,14 +282,21 @@ class PhycocyaninEnvCore:
 
     @staticmethod
     def get_action_mask(state_tensor):
-        """
-        Computes the stage-aware binary action mask from the state tensor.
+        """Computes a stage-aware binary action mask from the state tensor.
 
-        Returns mask of shape [..., 4]:
-          dim 0 — time multiplier:  active in Growth (0) & Production (1)
-          dim 1 — light intensity:  active in Growth (0) & Production (1)
-          dim 2 — nitrate feed:     active in Growth (0) & Production (1)
-          dim 3 — outstream flow:   active in Cleanup (2) only
+        This mask ensures that the agent cannot apply actions that are physically
+        impossible or disabled during the current operational stage.
+
+        Args:
+            state_tensor (torch.Tensor): A batch of normalized state vectors.
+
+        Returns:
+            torch.Tensor: Binary mask of shape [..., 4] where 1.0 indicates an
+                active action dimension and 0.0 indicates a masked dimension.
+                - dim 0 (time multiplier): Active in Growth/Prod.
+                - dim 1 (light intensity): Active in Growth/Prod.
+                - dim 2 (nitrate feed): Active in Growth/Prod.
+                - dim 3 (outstream flow): Active in Cleanup only.
         """
         import torch
         # Stage one-hot at indices 4:8
@@ -265,14 +313,28 @@ class PhycocyaninEnvCore:
         return torch.stack([mask_time, mask_I, mask_Fn, mask_Fout], dim=-1)
 
     def _sigmoid_switch(self, x, center=0.0, width=2.0):
-        """Smooth transition factor ∈ [0, 1] for hysteretic switching."""
+        """Calculates a smooth transition factor in the range [0, 1].
+
+        Used to create hysteretic switching logic, primarily for blending
+        Cleanup and Idle stages smoothly.
+
+        Args:
+            x (float): Input value to the sigmoid.
+            center (float, optional): Center point of the sigmoid. Defaults to 0.0.
+            width (float, optional): Scale width of the transition. Defaults to 2.0.
+
+        Returns:
+            float: Sigmoid output value between 0.0 and 1.0.
+        """
         return 1.0 / (1.0 + np.exp(-(x - center) / max(width, 0.01)))
 
     def _partial_reset_reactor(self):
-        """
-        Reset the physical reactor state for a new Growth batch.
-        Preserves episode tracking (time, step count, violations, rewards).
-        Called when Cleanup credits expire → stage 0 backtrack.
+        """Resets the physical reactor state for a new Growth batch.
+
+        This is invoked when the reactor successfully drains during Cleanup
+        and there is enough episode time left to run another batch cycle.
+        It preserves the episode's time, step count, and cumulative rewards/penalties
+        while resetting the physical concentrations, volume, and nutrient supply.
         """
         self.state = np.array([1.1, 150.0, 0.01, self.V_INITIAL], dtype=np.float64)
         self.nitrate_supply = self.INITIAL_NITRATE_SUPPLY
@@ -280,20 +342,29 @@ class PhycocyaninEnvCore:
 
 
     def _physics_step(self, action):
-        """
-        Executes one control step (10 hours) physics simulation.
+        """Executes one control step of the physics simulation.
+
+        This method decodes the agent's normalized action [-1, 1] into physical
+        units, applies stage-based masking and constraints, deducts stage credits,
+        and integrates the bioreactor state forward by `control_freq` hours.
+
+        Args:
+            action (np.ndarray): The raw action vector [time_mult, I, Fn, F_out]
+                proposed by the agent, generally bounded to [-1.0, 1.0].
+
         Returns:
-            a_clipped (ndarray): The clipped action.
-            Fn_phys (float): The actual nitrate feed applied.
-            done (bool): Whether the max time steps has been reached.
+            tuple:
+                - a_clipped (np.ndarray): The clipped action.
+                - Fn_phys (float): The actual nitrate feed applied (mg/L/h).
+                - done (bool): Whether the maximum episode time steps have been reached.
         """
         a_clipped = np.clip(action, -1.0, 1.0)
         a_scaled  = (a_clipped + 1.0) / 2.0   # [0, 1]
 
         # ── Action Decoding (stage-dependent) ─────────────────────────
         if self.current_stage in (0, 1):
-            # Time multiplier: 0.5–2.0
-            multiplier = 0.5 + a_scaled[0] * 1.5
+            # Time multiplier: 0.592–1.968  (cycle ~192–480 h with 312 h credits)
+            multiplier = 0.592 + a_scaled[0] * 1.376
 
             # Light intensity
             I_phys = self.I_MIN + a_scaled[1] * (self.I_MAX - self.I_MIN)
@@ -368,7 +439,7 @@ class PhycocyaninEnvCore:
                     self.stage_credits = 0.0
                 else:
                     # End of stage 2 reached!
-                    min_time_for_cycle = 165.0
+                    min_time_for_cycle = 192.0
                     time_remaining = self.total_time - self.time
                     
                     if time_remaining >= min_time_for_cycle:

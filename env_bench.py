@@ -6,25 +6,24 @@ from env_core import PhycocyaninEnvCore, integrate_rk4
 # =============================================================================
 
 class PhycocyaninEnvBench(PhycocyaninEnvCore):
-    """
-    Benchmark photobioreactor environment with stationary (non-adaptive)
-    constraint penalties. Each hard constraint is enforced via:
+    """Benchmark photobioreactor environment with stationary constraint penalties.
 
+    Each hard constraint is enforced via a combination of a quadratic barrier 
+    penalty when approaching the limit, and a linear spike penalty when breached:
         penalty_i = W_BARRIER * buffer_depth^2          (near-boundary zone)
                   + W_gi_SPIKE * violation_magnitude     (when constraint is breached)
 
-    No Lagrangian multipliers — all penalty weights are fixed throughout training.
+    No Lagrangian multipliers are used in this benchmark environment; all penalty 
+    weights are fixed throughout training.
 
-    Constraints
-    -----------
-    g1 (path):     Nitrate CN ≤ N_LIMIT_PATH (800 mg/L)         — barrier + spike
-    g2 (path):     Cq/Cx ratio ≤ RATIO_LIMIT (0.011)            — barrier + spike
-    g3 (terminal): CN ≤ N_LIMIT_TERM (150 mg/L) at episode end  — spike
-    g4 (path):     Reactor volume ≤ V_MAX                        — barrier + spike
-    g5 (terminal): Episode MUST end in Idle stage (stage 3)      — HARD spike
+    Constraints:
+        g1 (path):     Nitrate CN <= N_LIMIT_PATH (800 mg/L)        — barrier + spike
+        g2 (path):     Cq/Cx ratio <= RATIO_LIMIT (0.011)           — barrier + spike
+        g3 (terminal): CN <= N_LIMIT_TERM (150 mg/L) at episode end — spike
+        g4 (path):     Reactor volume <= V_MAX                      — barrier + spike
+        g5 (terminal): Episode MUST end in Idle stage (stage 3)     — HARD spike
 
-    Reward structure (per step)
-    ---------------------------
+    Reward structure (per step):
         reward = prod_reward
                - constraint_penalty
                - smoothing_penalty
@@ -32,6 +31,7 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
     """
 
     def __init__(self):
+        """Initializes the benchmark environment with fixed penalty weights."""
         self.episode_count = 0
         super().__init__()
 
@@ -62,6 +62,18 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         # g4: inherited self.OVERFLOW_BUFFER_FRAC = 0.10  (90% V_MAX)
 
     def reset(self, randomize=False):
+        """Resets the benchmark environment for a new episode.
+
+        Initializes states and guarantees that the initial state does not
+        violate path constraints (g1, g2, g4).
+
+        Args:
+            randomize (bool, optional): Whether to inject initial state noise.
+                Defaults to False.
+
+        Returns:
+            np.ndarray: The normalized initial observation vector.
+        """
         self.episode_count += 1
         state = super().reset(randomize=randomize)
         # Ensure reset state does not violate g1, g2, g4 constraints
@@ -77,8 +89,21 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
     # Override step() — identical physics, new reward structure
     # ------------------------------------------------------------------
     def step(self, action):
-        """
-        One control step (10 h) with fixed-weight barrier + spike penalties.
+        """Executes one control step using fixed-weight barrier/spike penalties.
+
+        Calculates the physics update, evaluates all constraint margins, applies
+        fixed penalties for constraint violations, and computes the step reward.
+
+        Args:
+            action (np.ndarray): The raw action vector [time_mult, I, Fn, F_out]
+                proposed by the agent, bounded to [-1.0, 1.0].
+
+        Returns:
+            tuple:
+                - norm_state (np.ndarray): The new normalized state.
+                - step_reward (float): The total reward accumulated over the step.
+                - done (bool): Whether the episode has terminated.
+                - info (dict): Diagnostic dictionary containing violation metrics.
         """
         prev_harvested = self.total_cq_harvested
         a_clipped, Fn_phys, done = self._physics_step(action)
@@ -143,9 +168,9 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         if self.current_stage != 3:
             min_time_to_idle = 0.0
             if self.current_stage == 0:
-                min_time_to_idle = (self.stage_credits / 2.0) + (self.BASE_CREDITS[1] / 2.0) + max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
+                min_time_to_idle = (self.stage_credits / 1.968) + (self.BASE_CREDITS[1] / 1.968) + max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
             elif self.current_stage == 1:
-                min_time_to_idle = (self.stage_credits / 2.0) + max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
+                min_time_to_idle = (self.stage_credits / 1.968) + max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
             elif self.current_stage == 2:
                 min_time_to_idle = max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
         

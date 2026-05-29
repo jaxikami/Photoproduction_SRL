@@ -1,3 +1,11 @@
+"""
+Safe Reinforcement Learning Agent using Action Projection.
+
+This module implements a Safe Proximal Policy Optimization (PPO) agent.
+It uses an Action Projection Network (APN) to safeguard the agent's actions
+by projecting unsafe actions onto a learned safety manifold before they are
+applied to the environment.
+"""
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
@@ -14,27 +22,32 @@ if hasattr(torch.backends, 'miopen'):
 
 
 class ActionProjectionNetwork(nn.Module):
-    """
-    Safety Proximity Regressor for the multi-stage photobioreactor.
+    """Safety Proximity Regressor for the multi-stage photobioreactor.
 
-    Given a (normalised-state, action) pair, outputs a continuous signed
+    Given a (normalized-state, action) pair, outputs a continuous signed
     margin score:
-      margin > 0  →  action is safe
-      margin < 0  →  action is unsafe
-      margin = 0  →  action is on the safety boundary
+      - margin > 0: Action is safe.
+      - margin < 0: Action is unsafe.
+      - margin = 0: Action is precisely on the safety boundary.
 
     Constraints covered: G1, G2, G4 (overflow).
-    G3 (terminal nitrate) is handled by the GRU temporal context and
-    Lagrangian multiplier.
+    Note: G3 (terminal nitrate) and G5 (idle stage) are handled by the environment's
+    Lagrangian multipliers and not by the instantaneous step-level projection.
 
     Architecture:
-      Linear(15→128) → LayerNorm → Mish
-      → 3× Residual blocks (128→128)
-      → Linear(128→1)  [raw margin]
-      + 3 per-constraint auxiliary heads (train-only)
+        Linear(15 -> 128) -> LayerNorm -> Mish
+        -> 3x Residual blocks (128 -> 128)
+        -> Linear(128 -> 1) [raw margin score]
+        Also includes 3 per-constraint auxiliary heads used only during APN pretraining.
     """
-    def __init__(self, state_dim: int = 12, action_dim: int = 4,
-                 latent_dim: int = 128):
+    def __init__(self, state_dim: int = 12, action_dim: int = 4, latent_dim: int = 128):
+        """Initializes the Action Projection Network.
+
+        Args:
+            state_dim (int, optional): Dimension of observation space. Defaults to 12.
+            action_dim (int, optional): Dimension of action space. Defaults to 4.
+            latent_dim (int, optional): Width of hidden layers. Defaults to 128.
+        """
         super(ActionProjectionNetwork, self).__init__()
 
         self.encoder = nn.Sequential(
@@ -78,6 +91,15 @@ class ActionProjectionNetwork(nn.Module):
         nn.init.zeros_(self.margin_head.bias)
 
     def forward(self, state_norm, action_norm):
+        """Computes the continuous signed safety margin for the given state and action.
+
+        Args:
+            state_norm (torch.Tensor): Normalized observation vector.
+            action_norm (torch.Tensor): Un-squashed or squashed action vector.
+
+        Returns:
+            torch.Tensor: Continuous margin score.
+        """
         x_in   = torch.cat([state_norm, action_norm], dim=-1)
         x_enc  = self.encoder(x_in)
         x_enc  = self.res_act(x_enc + self.res_block1(x_enc))
@@ -87,6 +109,15 @@ class ActionProjectionNetwork(nn.Module):
         return margin
 
     def classify(self, state_norm, action_norm):
+        """Returns the probability that the state-action pair is safe (margin > 0).
+
+        Args:
+            state_norm (torch.Tensor): Normalized observation vector.
+            action_norm (torch.Tensor): Action vector.
+
+        Returns:
+            torch.Tensor: Safety probability [0, 1].
+        """
         return torch.sigmoid(self.forward(state_norm, action_norm))
 
 
@@ -95,16 +126,20 @@ class ActionProjectionNetwork(nn.Module):
 # =============================================================================
 
 class ActorCritic(nn.Module):
-    """
-    Safe-agent Actor-Critic with feedforward MLP (no GRU) and
-    stage-aware action masking for the 4D action space.
+    """Safe-agent Actor-Critic with feedforward MLP and stage-aware action masking.
 
-    Action masking follows the Fermentation-PPO pattern:
-      - Masked dims get a fixed default intent (pre-Tanh)
-      - Masked dims get near-zero std to suppress exploration
-      - Log-probs exclude masked dims
+    Action masking follows the established protocol:
+        - Masked dims get a fixed default intent (pre-Tanh)
+        - Masked dims get near-zero std to suppress exploration
+        - Log-probs exclude masked dims
     """
     def __init__(self, state_dim=12, action_dim=4):
+        """Initializes the Actor and Critic MLPs.
+
+        Args:
+            state_dim (int, optional): Observation dimension. Defaults to 12.
+            action_dim (int, optional): Action dimension. Defaults to 4.
+        """
         super(ActorCritic, self).__init__()
         self.LOG_STD_MIN = -1.0
         self.LOG_STD_MAX = 0.5
@@ -126,14 +161,18 @@ class ActorCritic(nn.Module):
         )
 
     def act(self, state, hidden=None):
-        """
-        Generates an action with stage-aware masking.
+        """Generates an action with stage-aware masking.
+
+        Args:
+            state (torch.Tensor): Current state tensor.
+            hidden: Dummy argument for API compatibility (no GRU used).
 
         Returns:
-            z        : squashed action [-1, 1]
-            log_prob : log π(z | s)
-            z_raw    : unbounded Gaussian sample
-            hidden   : None (for API compatibility)
+            tuple:
+                - z (torch.Tensor): Squashed action [-1, 1]
+                - log_prob (torch.Tensor): Log probability of chosen action.
+                - z_raw (torch.Tensor): Unbounded Gaussian sample.
+                - hidden (None): Maintained for API compatibility.
         """
         from env_core import PhycocyaninEnvCore
 
@@ -144,12 +183,12 @@ class ActorCritic(nn.Module):
         mask = PhycocyaninEnvCore.get_action_mask(state[..., :self.env_state_dim])
 
         # Default intents for masked dims (pre-Tanh values):
-        # time_mult → tanh(-0.35) ≈ -0.34 → maps to ~0.5 multiplier
+        # time_mult → tanh(0) = 0.0 → maps to 1.0 multiplier (neutral)
         # I → tanh(-10) ≈ -1.0 → maps to I_MIN
         # Fn → tanh(-10) ≈ -1.0 → maps to 0
         # Fout → tanh(-10) ≈ -1.0 → maps to 0
         default_intent = torch.full_like(mean, -10.0)
-        default_intent[..., 0] = -0.34657359  # time_mult default
+        default_intent[..., 0] = -0.4329  # time_mult default: neutral 1.0 multiplier
 
         masked_mean = mean * mask + default_intent * (1 - mask)
         masked_std  = std * mask + 1e-8 * (1 - mask)
@@ -163,8 +202,14 @@ class ActorCritic(nn.Module):
         return z.detach(), log_prob.detach(), z_raw.detach(), None
 
     def evaluate(self, state, z_raw):
-        """
-        Re-evaluates stored intents during the PPO update.
+        """Re-evaluates stored intents during the PPO update.
+
+        Args:
+            state (torch.Tensor): Batch of state tensors.
+            z_raw (torch.Tensor): Batch of unbounded actions.
+
+        Returns:
+            tuple: (log_probs, state_values, dist_entropy)
         """
         from env_core import PhycocyaninEnvCore
 
@@ -174,7 +219,7 @@ class ActorCritic(nn.Module):
         mask = PhycocyaninEnvCore.get_action_mask(state[..., :self.env_state_dim])
 
         default_intent = torch.full_like(mean, -10.0)
-        default_intent[..., 0] = -0.34657359
+        default_intent[..., 0] = -0.4329  # time_mult default: neutral 1.0 multiplier
         masked_mean = mean * mask + default_intent * (1 - mask)
         masked_std  = std * mask + 1e-8 * (1 - mask)
 
@@ -187,10 +232,7 @@ class ActorCritic(nn.Module):
 
 
 class SPRL_Agent:
-    """
-    Safe PPO agent with MLP ActorCritic, stage-aware action masking,
-    and APN gradient projection safety filter.
-    """
+    """Safe PPO agent combining an MLP ActorCritic, stage masking, and APN projection."""
     def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, entropy_coeff):
         self.gamma          = gamma
         self.eps_clip       = eps_clip
@@ -250,11 +292,22 @@ class SPRL_Agent:
         return {'calls': calls, 'noop': noop, 'iters': iters, 'avg_it': avg_it}
 
     def _project_to_safe(self, state_norm, action, lr=0.25, max_steps=15, threshold=0.95):
-        """
-        Gradient-ascend the APN margin surface until classify() >= threshold.
-        Stage-masked dimensions are zeroed in the gradient to prevent the
-        projection from modifying locked action channels.
-        Uses constant step size with mild decay to avoid premature stalling.
+        """Gradient-ascend the APN margin surface to find a safe action proxy.
+
+        If the initially proposed action is unsafe, this method performs gradient
+        ascent on the action space to maximize the APN safety classification score.
+        Stage-masked dimensions are zeroed in the gradient to prevent modifying
+        locked channels. Uses a constant step size with mild decay.
+
+        Args:
+            state_norm (torch.Tensor): Observation tensor.
+            action (torch.Tensor): Initial proposed action tensor.
+            lr (float, optional): Gradient ascent learning rate. Defaults to 0.25.
+            max_steps (int, optional): Maximum optimization steps. Defaults to 15.
+            threshold (float, optional): Target safety probability. Defaults to 0.95.
+
+        Returns:
+            torch.Tensor: The projected, safe action (or closest proxy).
         """
         from env_core import PhycocyaninEnvCore
 
@@ -316,10 +369,19 @@ class SPRL_Agent:
         return best_a
 
     def select_action(self, state_norm):
-        """
-        Full safe action selection: Actor → mask → APN projection → final mask.
-        Returns u_safe as both the action AND the stored raw_action so that
-        PPO gradients are computed against the actually-executed safe action.
+        """Selects a safe action by projecting the raw actor output through the APN.
+
+        Full action pipeline: Actor -> Stage Mask -> APN Projection -> Stage Mask.
+        This ensures the final action is safe while strictly respecting process stages.
+
+        Args:
+            state_norm (np.ndarray): Normalized observation array.
+
+        Returns:
+            tuple:
+                - u_safe_np (np.ndarray): Executed safe action.
+                - log_prob (np.ndarray): Log probability of the raw intent.
+                - z_raw (np.ndarray): Unbounded intent pre-projection.
         """
         from env_core import PhycocyaninEnvCore
 
@@ -331,7 +393,7 @@ class SPRL_Agent:
 
             # Apply SERL mask checkpoint 2 (pre-APN)
             mask = PhycocyaninEnvCore.get_action_mask(state_t)
-            default_squashed = torch.tensor([-0.333, -1.0, -1.0, -1.0], device=device)
+            default_squashed = torch.tensor([-0.407, -1.0, -1.0, -1.0], device=device)
             z_masked = z * mask + default_squashed * (1 - mask)
 
         # APN gradient projection
@@ -350,8 +412,10 @@ class SPRL_Agent:
                 z_raw.cpu().numpy().flatten())
 
     def learn(self, memory):
-        """
-        PPO update with margin-weighted mapping penalty.
+        """Executes the PPO update with an additional manifold-mapping penalty.
+
+        Args:
+            memory (Memory): Buffer containing collected trajectories.
         """
         rewards = []
         discounted_reward = 0

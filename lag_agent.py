@@ -1,4 +1,10 @@
+"""
+Standard Proximal Policy Optimization (PPO) Agent.
 
+This module implements the benchmark PPO agent used for training the
+unconstrained or penalty-based formulation of the photobioreactor environment.
+It includes the Actor-Critic network definition and the PPO update loop.
+"""
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
@@ -9,15 +15,28 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class ActorCriticStandardRL(nn.Module):
-    """
-    Standard PPO Actor-Critic for the multi-stage photobioreactor.
+    """Standard PPO Actor-Critic for the multi-stage photobioreactor.
 
-    Generates raw action intents in a 4D action space:
-      [time_multiplier, light_intensity, nitrate_feed, outstream_flow]
+    This neural network architecture maps the 12D continuous state space
+    to a 4D continuous action space. It uses a Gaussian policy where the
+    actor outputs the mean and a trainable parameter determines the log standard
+    deviation. The critic outputs the state-value estimate.
 
-    Observation is 11D (see env.py get_state_norm for layout).
+    Observation space (12D):
+        Defined by `env.get_state_norm()`. Includes physical states, one-hot
+        encoded operational stages, and remaining time/nutrient credits.
+
+    Action space (4D):
+        [time_multiplier, light_intensity, nitrate_feed, outstream_flow].
+        The outputs are squashed to [-1, 1] using tanh.
     """
     def __init__(self, state_dim=12, action_dim=4):
+        """Initializes the Actor and Critic neural networks.
+
+        Args:
+            state_dim (int, optional): Dimension of the observation space. Defaults to 12.
+            action_dim (int, optional): Dimension of the action space. Defaults to 4.
+        """
         super(ActorCriticStandardRL, self).__init__()
         self.LOG_STD_MIN = -1.0
         self.LOG_STD_MAX = 0.5
@@ -39,13 +58,20 @@ class ActorCriticStandardRL(nn.Module):
         )
 
     def act(self, state):
-        """
-        Generates an action during rollout.
+        """Generates an action during environment rollout.
+
+        Samples an unbounded action from the Gaussian policy, computes its log 
+        probability, and squashes the action to [-1, 1] using tanh. The log 
+        probability is corrected for the tanh squashing function.
+
+        Args:
+            state (torch.Tensor): The current state observation tensor.
 
         Returns:
-            z:        squashed action in [-1, 1]
-            log_prob: log probability of the action
-            z_raw:    unbounded Gaussian sample (for PPO updates)
+            tuple:
+                - z (torch.Tensor): Squashed action in [-1, 1] applied to the env.
+                - log_prob (torch.Tensor): Log probability of the chosen action.
+                - z_raw (torch.Tensor): Unbounded Gaussian sample stored for PPO updates.
         """
         mean = self.actor(state)
         std = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
@@ -60,8 +86,17 @@ class ActorCriticStandardRL(nn.Module):
         return z.detach(), log_prob.detach(), z_raw.detach()
 
     def evaluate(self, state, z_raw):
-        """
-        Re-evaluates stored actions under the current policy for the PPO update.
+        """Re-evaluates stored actions under the current policy for the PPO update.
+
+        Args:
+            state (torch.Tensor): Batch of state observations.
+            z_raw (torch.Tensor): Batch of unbounded actions previously taken.
+
+        Returns:
+            tuple:
+                - log_probs (torch.Tensor): New log probabilities of the actions.
+                - state_values (torch.Tensor): Critic's state-value estimates.
+                - dist_entropy (torch.Tensor): Entropy of the current action distribution.
         """
         mean = self.actor(state)
         std = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
@@ -77,10 +112,24 @@ class ActorCriticStandardRL(nn.Module):
 
 
 class StandardRL_Agent:
-    """
-    PPO wrapper for the standard (unconstrained) RL agent.
+    """PPO algorithm wrapper for the standard (penalty-based) RL agent.
+    
+    This class handles trajectory collection, reward discounting, advantage
+    normalization, and the core PPO surrogate loss optimization loop.
     """
     def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, entropy_coeff):
+        """Initializes the PPO agent, networks, and optimizers.
+
+        Args:
+            state_dim (int): Dimension of the observation space.
+            action_dim (int): Dimension of the action space.
+            lr_actor (float): Learning rate for the actor network.
+            lr_critic (float): Learning rate for the critic network.
+            gamma (float): Discount factor for future rewards.
+            K_epochs (int): Number of optimization epochs per PPO update.
+            eps_clip (float): PPO clipping parameter for the surrogate objective.
+            entropy_coeff (float): Coefficient for the entropy bonus to encourage exploration.
+        """
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
@@ -99,8 +148,16 @@ class StandardRL_Agent:
         self.MseLoss = nn.MSELoss()
 
     def select_action(self, state_norm):
-        """
-        Selects an action using the old policy for trajectory collection.
+        """Selects an action using the old (frozen) policy during trajectory collection.
+
+        Args:
+            state_norm (np.ndarray): The normalized state observation.
+
+        Returns:
+            tuple:
+                - z (np.ndarray): The squashed action array.
+                - log_prob (np.ndarray): Log probability of the action.
+                - z_raw (np.ndarray): Unbounded raw action array.
         """
         with torch.no_grad():
             state_t = torch.FloatTensor(state_norm).to(device).unsqueeze(0)
@@ -109,8 +166,15 @@ class StandardRL_Agent:
         return z.cpu().numpy().flatten(), log_prob.cpu().numpy(), z_raw.cpu().numpy().flatten()
 
     def learn(self, memory):
-        """
-        PPO update with mini-batch training and normalized advantages.
+        """Executes the PPO optimization update.
+
+        Calculates discounted rewards, normalizes advantages, and performs
+        `K_epochs` of mini-batch gradient descent to update the actor and critic
+        networks using the PPO clipped surrogate loss.
+
+        Args:
+            memory (Memory): Buffer containing states, actions, rewards, and logprobs
+                collected during the recent trajectory rollout.
         """
         rewards = []
         discounted_reward = 0

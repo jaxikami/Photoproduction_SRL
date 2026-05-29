@@ -1,3 +1,11 @@
+"""
+Main Training and Evaluation Script for Photoproduction RL.
+
+This script coordinates the training and evaluation of either the Benchmark (Standard)
+PPO agent or the Safe (SPRL) agent within the continuous photobioreactor environment.
+It handles hyperparameter configuration, trajectory collection, early stopping,
+and invoking the DataLogger and Plotter for visualization.
+"""
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning,
                         message=r".*Detected call of `lr_scheduler\.step\(\)` before `optimizer\.step\(\)`.*")
@@ -32,18 +40,36 @@ INITIAL_ENTROPY = 0.05
 MIN_ENTROPY = 1e-5
 EVALUATE_ONLY = False
 RUN_BENCHMARK = False   # True → run Standard RL (bench) only; False → run Safe RL only
-NOISE_STD = 0.1
+NOISE_STD = 0.05
+ACTION_NOISE = True
+STATE_NOISE = False
 
 class Memory:
-    """Buffer for storing environment trajectories."""
+    """Buffer for storing environment trajectories during rollouts.
+    
+    Holds lists of states, actions, rewards, log-probabilities, and terminal
+    flags to be consumed by the PPO optimization step.
+    """
     def __init__(self):
+        """Initializes empty trajectory lists."""
         self.states, self.actions, self.raw_actions, self.logprobs, self.rewards, self.is_terminals = [], [], [], [], [], []
 
     def clear(self):
+        """Clears all stored trajectory data from memory."""
         del self.states[:], self.actions[:], self.raw_actions[:], self.logprobs[:], self.rewards[:], self.is_terminals[:]
 
 def train_agent(agent_name, agent, logger):
-    """Primary training loop for a specified RL agent."""
+    """Primary training loop for a specified RL agent.
+
+    Iteratively collects trajectories using the environment, triggers the agent's
+    PPO optimization subroutine, tracks constraint violations, handles early
+    stopping heuristics, and logs performance metrics.
+
+    Args:
+        agent_name (str): Identifier for the agent (e.g., "Standard RL" or "safe_RL agent").
+        agent (object): The instantiated RL agent object (StandardRL_Agent or SPRL_Agent).
+        logger (DataLogger): The logging utility for tracking metrics.
+    """
     print(f"\n--- Starting Training: {agent_name} ---")
     env = PhycocyaninEnvSafe() if agent_name == "safe_RL agent" else PhycocyaninEnvBench()
     memory = Memory()
@@ -53,7 +79,7 @@ def train_agent(agent_name, agent, logger):
     WINDOW_SIZE = 200
     EARLY_STOP_WARMUP = 5000
     EARLY_STOP_PATIENCE = 3000
-    min_improvement = 1e-4
+    min_improvement = 1e-3 if agent_name == "Standard RL" else 1e-4
     rewards_window = deque(maxlen=WINDOW_SIZE)
     best_avg_reward = -float('inf')
     no_improve_count = 0
@@ -108,7 +134,7 @@ def train_agent(agent_name, agent, logger):
                 os.makedirs("policy", exist_ok=True)
                 torch.save(agent.policy.state_dict(),
                            os.path.join("policy", f"{agent_name}_best_weights.pth"))
-            elif i_episode > 25000:
+            elif i_episode > 15000:
                 no_improve_count += 1
 
             if no_improve_count >= EARLY_STOP_PATIENCE:
@@ -147,9 +173,21 @@ def train_agent(agent_name, agent, logger):
     torch.save(agent.policy.state_dict(), os.path.join("policy", f"{agent_name}_final_weights.pth"))
     Plotter.plot_training_results(logger.training_log, agent_name=agent_name)
 
-def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.05):
-    """
-    Evaluates a trained agent with randomized initial states and intent noise.
+def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.05, action_noise=True, state_noise=True):
+    """Evaluates a trained agent with randomized initial states and injected intent noise.
+
+    Runs the trained policy over a large number of episodes to establish statistical
+    confidence in its safety and performance. Tracks trajectories, constraint
+    violations, and calculates aggregate evaluation metrics.
+
+    Args:
+        agent_name (str): Identifier for the agent to evaluate.
+        agent (object): The instantiated RL agent object.
+        logger (DataLogger): The logging utility for evaluation metrics.
+        eval_episodes (int, optional): Number of episodes to run. Defaults to 10000.
+        noise_std (float, optional): Standard deviation of Gaussian noise. Defaults to 0.05.
+        action_noise (bool, optional): Whether to inject noise into the agent's actions. Defaults to True.
+        state_noise (bool, optional): Whether to inject noise into the environment state observations. Defaults to True.
     """
     print(f"\n--- Evaluating: {agent_name} with N(0, {noise_std}) noise ---")
 
@@ -159,7 +197,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
         agent.policy.eval()
 
     env = PhycocyaninEnvSafe() if agent_name == "safe_RL agent" else PhycocyaninEnvBench()
-    total_g1, total_g2, total_g3, total_g4 = 0, 0, 0, 0
+    total_g1, total_g2, total_g3, total_g4, total_g5 = 0, 0, 0, 0, 0
 
     all_episodes = []
     all_nitrate_trajectories    = []
@@ -174,8 +212,14 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
         eval_hidden = None
 
         while True:
+            if state_noise and noise_std > 0:
+                s_noise = np.random.normal(0, noise_std, size=state.shape)
+                noisy_state = state + s_noise
+            else:
+                noisy_state = state
+
             with torch.no_grad():
-                state_t = torch.FloatTensor(state).to(
+                state_t = torch.FloatTensor(noisy_state).to(
                     torch.device("cuda" if torch.cuda.is_available() else "cpu")).unsqueeze(0)
                 if agent_name == "safe_RL agent":
                     z, _, _, eval_hidden = agent.policy.act(state_t, eval_hidden)
@@ -183,7 +227,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
                     z, _, _ = agent.policy.act(state_t)
                 intent = z.cpu().numpy().flatten()
 
-            if noise_std > 0:
+            if action_noise and noise_std > 0:
                 noise = np.random.normal(0, noise_std, size=intent.shape)
                 noisy_intent = np.clip(intent + noise, -1.0, 1.0)
             else:
@@ -230,15 +274,17 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
                 last_info.get("g1_violation_count", 0),
                 last_info.get("g2_violation_count", 0),
                 last_info.get("g3_violation_count", 0),
-                last_info.get("g4_violation_count", 0)
+                last_info.get("g4_violation_count", 0),
+                last_info.get("g5_violation_count", 0)
             )
             total_g1 += last_info.get("g1_violation_count", 0)
             total_g2 += last_info.get("g2_violation_count", 0)
             total_g3 += last_info.get("g3_violation_count", 0)
             total_g4 += last_info.get("g4_violation_count", 0)
+            total_g5 += last_info.get("g5_violation_count", 0)
 
     print(f"{agent_name} Violations — G1: {total_g1}, G2: {total_g2}, "
-          f"G3: {total_g3}, G4: {total_g4}")
+          f"G3: {total_g3}, G4: {total_g4}, G5: {total_g5}")
 
     all_episodes.sort(key=lambda x: x[0])
     mid_idx = len(all_episodes) // 2
@@ -290,5 +336,5 @@ if __name__ == "__main__":
         if not EVALUATE_ONLY:
             Plotter.plot_training_violations(logger)
 
-    evaluate_agent(agent_name, agent, logger, noise_std=NOISE_STD)
-    Plotter.plot_comprehensive_evaluation(logger.eval_data, logger.eval_violations)
+    evaluate_agent(agent_name, agent, logger, noise_std=NOISE_STD, action_noise=ACTION_NOISE, state_noise=STATE_NOISE)
+    Plotter.plot_comprehensive_evaluation(logger, agent_name)

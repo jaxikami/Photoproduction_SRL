@@ -6,37 +6,34 @@ from env_core import PhycocyaninEnvCore, integrate_rk4
 # =============================================================================
 
 class PhycocyaninEnvSafe(PhycocyaninEnvCore):
-    """
-    Safe photobioreactor environment where each constraint is enforced via its
-    own adaptive Lagrangian multiplier λ_i, updated by primal-dual gradient ascent:
+    """Safe photobioreactor environment using adaptive Lagrangian multipliers.
 
-        λ_i ← clip(λ_i + η * violation_i,  0, λ_max)     (on violation)
-        λ_i ← λ_i * (1 - decay)                           (on satisfaction)
+    Each constraint is enforced via its own adaptive Lagrangian multiplier (λ_i), 
+    updated via primal-dual gradient ascent:
+        λ_i <- clip(λ_i + η * violation_i,  0, λ_max)     (on violation)
+        λ_i <- λ_i * (1 - decay)                          (on satisfaction)
 
     The per-step Lagrangian penalty for a violated constraint is:
-
         penalty_i = λ_i * violation_i + BASE_SPIKE * (1 + violation_i)
 
-    where BASE_SPIKE is a small fixed component that ensures a non-zero signal
+    Where BASE_SPIKE is a small fixed component that ensures a non-zero signal
     even before λ accumulates. A quadratic buffer zone activates near each limit
     to create smooth repulsion before the hard boundary is reached.
 
-    Constraints
-    -----------
-    g1 (path):     Nitrate CN ≤ N_LIMIT_PATH (800 mg/L)         — λ_g1, buffer + spike
-    g2 (path):     Cq/Cx ratio ≤ RATIO_LIMIT (0.011)            — λ_g2, buffer + spike
-    g3 (terminal): CN ≤ N_LIMIT_TERM (150 mg/L) at episode end  — λ_g3, terminal spike
-    g4 (path):     Reactor volume ≤ V_MAX                        — λ_g4, buffer + spike
-    g5 (terminal): Episode MUST end in Idle stage (stage 3)      — λ_g5, HARD terminal spike
+    Constraints:
+        g1 (path):     Nitrate CN <= N_LIMIT_PATH (800 mg/L)        — λ_g1, buffer + spike
+        g2 (path):     Cq/Cx ratio <= RATIO_LIMIT (0.011)           — λ_g2, buffer + spike
+        g3 (terminal): CN <= N_LIMIT_TERM (150 mg/L) at episode end — λ_g3, terminal spike
+        g4 (path):     Reactor volume <= V_MAX                      — λ_g4, buffer + spike
+        g5 (terminal): Episode MUST end in Idle stage (stage 3)     — λ_g5, HARD terminal spike
 
-    g5 is enforced as a hard constraint by using a large fixed IDLE_BASE_SPIKE
-    in addition to the adaptive λ_g5, making it expensive regardless of λ warmup.
+    Note:
+        g5 is enforced as a hard constraint by using a large fixed IDLE_BASE_SPIKE
+        in addition to the adaptive λ_g5, making it expensive regardless of λ warmup.
+        By default λ values persist across episodes to accumulate knowledge of
+        constraint tightness. Set `reset_lambdas_per_episode=True` for evaluation.
 
-    By default λ values persist across episodes to accumulate knowledge of
-    constraint tightness. Set reset_lambdas_per_episode=True for evaluation.
-
-    Reward structure (per step)
-    ---------------------------
+    Reward structure (per step):
         reward = prod_reward
                - constraint_penalty          (Lagrangian + buffer)
                - smoothing_penalty
@@ -44,6 +41,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
     """
 
     def __init__(self):
+        """Initializes the safe environment and all Lagrangian hyperparameters."""
         # ── Initialise attributes used by reset() BEFORE super().__init__() ──
         # super().__init__() calls self.reset(), so these must exist first.
         self.reset_lambdas_per_episode = False
@@ -61,24 +59,25 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         # at severe/persistent violations, not on first contact.
         self.lag_lr     = 0.5          # Slow growth so λ ramps gradually
         self.lag_lr_g1  = 2000.0       # Scaled up for G1 (path nitrate)
-        self.lag_lr_g2  = 2000.0       # Scaled up to handle tiny violation magnitude (~0.02)
+        self.lag_lr_g2  = 8000.0       # Aggressive ramp — g2 violations are tiny magnitude (~0.02)
         self.lag_decay  = 0.5 / 600.0  # Slow decay so λ persists across episodes
+        self.lag_decay_g2 = 0.05 / 600.0  # Near-zero decay for g2 — λ must persist
         self.lag_max    = 15.0         # Default matches env_bench W_g4_SPIKE
         self.lag_max_g1 = 15000.0      # Dedicated high cap for G1 (retains G1 > G2 priority)
-        self.lag_max_g2 = 10000.0      # Dedicated high cap for G2 to allow meaningful penalty density
+        self.lag_max_g2 = 25000.0      # High cap for G2 — small violations need large λ to dominate harvest reward
         self.lag_max_g3 = 200.0        # Matches env_bench W_g3_SPIKE perfectly
         self.lag_max_g5 = 100.0        # G5 cap (hard constraint)
 
         # ── Barrier + base spike params ────────────────────────────
         # BASE_SPIKE fires even at λ=0; must be painful but not catastrophic.
         self.BASE_SPIKE           = 0.5   # Reduced from 2.0 to match Fermentation dynamics closer
-        self.BUFFER_COEF          = 5.0   # Matches env_bench W_BARRIER (was 0.5)
+        self.BUFFER_COEF          = 15.0  # Matches env_bench W_BARRIER (was 0.5)
         self.OVERFLOW_BUFFER_FRAC = 0.10  # buffer activates at 90% V_MAX
         self.IDLE_BASE_SPIKE      = 500.0 # Hard idle spike: ~40× one harvest step
 
         # ── Buffer zone activation thresholds ─────────────────────
         self.G1_BUFFER_START = 0.9
-        self.G2_BUFFER_START = 0.9
+        self.G2_BUFFER_START = 0.8
 
         # ── Reward shaping coefficients ────────────────────────────
         self.prod_coef    = 0.2    # Gentle stockpile nudge
@@ -93,6 +92,18 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
     # ------------------------------------------------------------------
 
     def reset(self, randomize=False):
+        """Resets the safe environment for a new episode.
+
+        Optionally resets the Lagrangian multipliers if `reset_lambdas_per_episode` 
+        is True. Ensures the starting state does not violate path constraints.
+
+        Args:
+            randomize (bool, optional): Whether to inject initial state noise.
+                Defaults to False.
+
+        Returns:
+            np.ndarray: The normalized initial observation vector.
+        """
         self.episode_count += 1
         state = super().reset(randomize=randomize)
         # Ensure reset state does not violate g1, g2, g4 constraints
@@ -115,8 +126,22 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
     # ------------------------------------------------------------------
 
     def step(self, action):
-        """
-        One control step (10 h) with per-constraint Lagrangian multiplier penalties.
+        """Executes one control step using adaptive Lagrangian penalties.
+
+        Evaluates the current state margins and updates the corresponding
+        Lagrangian multipliers dynamically based on violations.
+
+        Args:
+            action (np.ndarray): The raw action vector [time_mult, I, Fn, F_out]
+                proposed by the agent, bounded to [-1.0, 1.0].
+
+        Returns:
+            tuple:
+                - norm_state (np.ndarray): The new normalized state.
+                - step_reward (float): The total reward accumulated over the step.
+                - done (bool): Whether the episode has terminated.
+                - info (dict): Diagnostic dictionary containing violation metrics
+                  and current multiplier values.
         """
         prev_harvested = self.total_cq_harvested
         a_clipped, Fn_phys, done = self._physics_step(action)
@@ -160,7 +185,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             self.violation_count    += 1
             self.g2_violation_count += 1
         else:
-            self.lam_g2 *= (1.0 - self.lag_decay)
+            self.lam_g2 *= (1.0 - self.lag_decay_g2)
 
         # g4: Volume overflow (V ≤ V_MAX)
         v_frac        = self.state[3] / self.V_MAX
@@ -192,9 +217,9 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         if self.current_stage != 3:
             min_time_to_idle = 0.0
             if self.current_stage == 0:
-                min_time_to_idle = (self.stage_credits / 2.0) + (self.BASE_CREDITS[1] / 2.0) + max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
+                min_time_to_idle = (self.stage_credits / 1.968) + (self.BASE_CREDITS[1] / 1.968) + max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
             elif self.current_stage == 1:
-                min_time_to_idle = (self.stage_credits / 2.0) + max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
+                min_time_to_idle = (self.stage_credits / 1.968) + max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
             elif self.current_stage == 2:
                 min_time_to_idle = max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
         
