@@ -29,8 +29,8 @@ from torch.optim.lr_scheduler import LinearLR
 STATE_DIM = 12     # [Cx, CN, Cq, V, stage_0..3, credit, t_norm, supply, op_time_left]
 ACTION_DIM = 4     # [time_mult, I, Fn, Fout]
 MAX_EPISODES = 50000
-UPDATE_TIMESTEP = 1000
-K_EPOCHS = 3
+UPDATE_TIMESTEP = 2048
+K_EPOCHS = 4
 EPS_CLIP = 0.2
 GAMMA = 0.95
 LR_ACTOR = 5e-5
@@ -38,9 +38,9 @@ LR_CRITIC = 1e-4
 MIN_LR = 1e-5
 INITIAL_ENTROPY = 0.05
 MIN_ENTROPY = 1e-5
-EVALUATE_ONLY = False
+EVALUATE_ONLY = True
 RUN_BENCHMARK = False   # True → run Standard RL (bench) only; False → run Safe RL only
-NOISE_STD = 0.05
+NOISE_STD = 0.1
 ACTION_NOISE = True
 STATE_NOISE = False
 
@@ -77,7 +77,7 @@ def train_agent(agent_name, agent, logger):
 
     time_step = 0
     WINDOW_SIZE = 200
-    EARLY_STOP_WARMUP = 5000
+    EARLY_STOP_WARMUP = 15000
     EARLY_STOP_PATIENCE = 3000
     min_improvement = 1e-3 if agent_name == "Standard RL" else 1e-4
     rewards_window = deque(maxlen=WINDOW_SIZE)
@@ -173,7 +173,7 @@ def train_agent(agent_name, agent, logger):
     torch.save(agent.policy.state_dict(), os.path.join("policy", f"{agent_name}_final_weights.pth"))
     Plotter.plot_training_results(logger.training_log, agent_name=agent_name)
 
-def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.05, action_noise=True, state_noise=True):
+def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05, action_noise=False, state_noise=True):
     """Evaluates a trained agent with randomized initial states and injected intent noise.
 
     Runs the trained policy over a large number of episodes to establish statistical
@@ -184,7 +184,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
         agent_name (str): Identifier for the agent to evaluate.
         agent (object): The instantiated RL agent object.
         logger (DataLogger): The logging utility for evaluation metrics.
-        eval_episodes (int, optional): Number of episodes to run. Defaults to 10000.
+        eval_episodes (int, optional): Number of episodes to run. Defaults to 1000.
         noise_std (float, optional): Standard deviation of Gaussian noise. Defaults to 0.05.
         action_noise (bool, optional): Whether to inject noise into the agent's actions. Defaults to True.
         state_noise (bool, optional): Whether to inject noise into the environment state observations. Defaults to True.
@@ -204,6 +204,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
     all_production_trajectories = []
     all_ratio_trajectories      = []
     all_volume_trajectories     = []
+    all_harvested_trajectories  = []
 
     for _ in tqdm(range(eval_episodes), desc=f"Evaluating {agent_name}"):
         state = env.reset(randomize=True)
@@ -265,6 +266,8 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
         all_ratio_trajectories.append(
             [(s[2] * 0.2) / (s[0] * 6.0 + 1e-8) for s in ep_states])
         all_volume_trajectories.append([s[3] for s in ep_states])
+        # Track cumulative harvested mass (starts at 0.0, prepended)
+        all_harvested_trajectories.append([0.0] + [info.get("total_cq_harvested", 0.0) for info in ep_infos])
 
         if len(ep_infos) > 0:
             last_info = ep_infos[-1]
@@ -277,11 +280,11 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
                 last_info.get("g4_violation_count", 0),
                 last_info.get("g5_violation_count", 0)
             )
-            total_g1 += last_info.get("g1_violation_count", 0)
-            total_g2 += last_info.get("g2_violation_count", 0)
-            total_g3 += last_info.get("g3_violation_count", 0)
-            total_g4 += last_info.get("g4_violation_count", 0)
-            total_g5 += last_info.get("g5_violation_count", 0)
+            total_g1 += 1 if last_info.get("g1_violation_count", 0) > 0 else 0
+            total_g2 += 1 if last_info.get("g2_violation_count", 0) > 0 else 0
+            total_g3 += 1 if last_info.get("g3_violation_count", 0) > 0 else 0
+            total_g4 += 1 if last_info.get("g4_violation_count", 0) > 0 else 0
+            total_g5 += 1 if last_info.get("g5_violation_count", 0) > 0 else 0
 
     print(f"{agent_name} Violations — G1: {total_g1}, G2: {total_g2}, "
           f"G3: {total_g3}, G4: {total_g4}, G5: {total_g5}")
@@ -296,6 +299,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
     all_prod    = np.array(all_production_trajectories)
     all_ratio   = np.array(all_ratio_trajectories)
     all_vol     = np.array(all_volume_trajectories)
+    all_harv    = np.array(all_harvested_trajectories)
 
     agg_data = {
         "nitrate_min":    np.min(all_nitrate, axis=0),
@@ -308,6 +312,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
         "volume_min":     np.min(all_vol, axis=0),
         "volume_max":     np.max(all_vol, axis=0),
         "volume_avg":     np.mean(all_vol, axis=0),
+        "harvested_avg":  np.mean(all_harv, axis=0),
     }
 
     logger.log_evaluation_trajectory(agent_name, median_states, median_actions,
@@ -315,6 +320,19 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
     print(f"Median Episode Reward: {median_ep_reward:.2f}")
     print(f"Mean Episode Reward: {np.mean([e[0] for e in all_episodes]):.2f}  |  "
           f"Std: {np.std([e[0] for e in all_episodes]):.2f}")
+
+    # Save evaluation data to npz for comparative plotting (e.g. Gantt charts)
+    suffix = "safe" if "safe" in agent_name.lower() else "standard"
+    npz_path = f"eval_data_{suffix}.npz"
+    stages = np.array([info["current_stage"] for info in median_infos])
+    # Match the stages array to the 101 elements of states (append last stage)
+    stages_101 = np.append(stages, stages[-1])
+    np.savez(npz_path, 
+             states=np.array(median_states), 
+             actions=np.array(median_actions), 
+             stages=stages_101, 
+             rewards=np.array(median_rewards))
+    print(f"Saved evaluation trajectory to {npz_path}")
 
 # =============================================================================
 # SCRIPT EXECUTION

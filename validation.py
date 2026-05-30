@@ -14,7 +14,7 @@ context and Lagrangian multipliers, not by the APN's instantaneous projection.
 import torch
 import numpy as np
 import os
-from pretrain import ActionProjectionNetwork
+from pretrain import ActionProjectionNetwork, load_compatible_checkpoint
 from env_core import PhycocyaninEnvCore
 
 # ── Physical constants (must match env.py and data_gen.py) ────────────────────
@@ -32,8 +32,8 @@ CONTROL_INTERVAL = 10.0
 TOTAL_TIME       = 1000.0
 SAFE_BUFFER      = 0.98
 THRESHOLD        = 0.95
-MAX_PROJ_STEPS   = 15
-LR_PROJ          = 0.25
+MAX_PROJ_STEPS   = 7
+LR_PROJ          = 0.4
 
 
 def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS, lr=LR_PROJ, threshold=THRESHOLD):
@@ -162,13 +162,11 @@ def run_validation(model=None, num_test_samples: int = 2000):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if model is None:
-        apn = ActionProjectionNetwork(state_dim=12, action_dim=4).to(device)
         for ckpt in [os.path.join("policy", "action_projection_network.pth"),
                      "action_projection_network.pth"]:
             if os.path.exists(ckpt):
-                apn.load_state_dict(torch.load(ckpt, map_location=device,
-                                                weights_only=True))
-                print(f"[Validation] Loaded APN from '{ckpt}'.")
+                apn = ActionProjectionNetwork.from_checkpoint(
+                    ckpt, device, state_dim=12, action_dim=4)
                 break
         else:
             print("[Validation] ERROR: No checkpoint found. Run pretrain.py first.")

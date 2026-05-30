@@ -188,7 +188,9 @@ class Plotter:
             print("Evaluation data missing. Cannot plot.")
             return
 
-        time = np.arange(len(data["states"]))
+        CONTROL_INTERVAL = 10.0
+        suffix = "_safe" if "safe" in agent_name.lower() else "_standard"
+        time_hours = np.arange(len(data["states"])) * CONTROL_INTERVAL
         color = 'tab:blue' if agent_name == "Standard RL" else 'tab:orange'
 
         # Constants
@@ -206,26 +208,26 @@ class Plotter:
         # 1. Nitrate concentration
         plt.figure(figsize=(8, 5))
         n_best = data["states"][:, 1] * 800.0
-        plt.plot(time, n_best, label="Best Run", color=color)
+        plt.plot(time_hours, n_best, label="Best Run", color=color)
         agg = data.get("agg_data", {})
         if agg:
-            plt.fill_between(time, agg["nitrate_min"] * 800.0, agg["nitrate_max"] * 800.0,
+            plt.fill_between(time_hours, agg["nitrate_min"] * 800.0, agg["nitrate_max"] * 800.0,
                              color=color, alpha=0.2, label="Min/Max")
         plt.axhline(y=N_LIMIT_PATH, color='r', linestyle='--', alpha=0.5, label="$g_1$")
         plt.axhline(y=N_LIMIT_TERM, color='darkred', linestyle='--', alpha=0.5, label="$g_3$")
         plt.title(f"Nitrate ($c_N$) — {agent_name}")
         plt.ylabel("mg/L")
-        plt.xlabel("Step")
+        plt.xlabel("Time (hours)")
         plt.grid(True, alpha=0.2)
         plt.legend(fontsize=9)
-        plt.savefig(os.path.join("plot", "plot_nitrate.png"), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join("plot", f"plot_nitrate{suffix}.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
         # 2. g1,2,3,4,5 violated during evaluation as a bar chart
         plt.figure(figsize=(8, 5))
         v_details = eval_violations.get(agent_name, {})
         g_labels = ["g1", "g2", "g3", "g4", "g5"]
-        g_counts = [np.sum(v_details.get(g, [])) for g in g_labels]
+        g_counts = [np.sum(np.array(v_details.get(g, [])) > 0) for g in g_labels]
         bars = plt.bar(g_labels, g_counts, color=color)
         plt.title(f"Evaluation Violations — {agent_name}")
         plt.ylabel("Count")
@@ -233,29 +235,33 @@ class Plotter:
         for bar in bars:
             yval = bar.get_height()
             plt.text(bar.get_x() + bar.get_width()/2, yval, int(yval), ha='center', va='bottom')
-        plt.savefig(os.path.join("plot", "plot_violations.png"), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join("plot", f"plot_violations{suffix}.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
         # 3. Final phycocyanin produced in concentration as well as mg
         plt.figure(figsize=(8, 5))
         if agg:
             c_q = agg["production_avg"] * 0.2
-            mass_mg = c_q * (agg["volume_avg"] * V_MAX) * 1000.0
+            # Use cumulative harvested mass from aggregation metrics
+            if "harvested_avg" in agg:
+                mass_mg = agg["harvested_avg"]
+            else:
+                mass_mg = c_q * (agg["volume_avg"] * V_MAX) * 1000.0
             
             fig, ax1 = plt.subplots(figsize=(8, 5))
-            ax1.plot(time, c_q, label="Concentration (g/L)", color=color)
+            ax1.plot(time_hours, c_q, label="Concentration (g/L)", color=color)
             ax1.set_ylabel("Concentration (g/L)", color=color)
             ax1.tick_params(axis='y', labelcolor=color)
-            ax1.set_xlabel("Step")
+            ax1.set_xlabel("Time (hours)")
             
             ax2 = ax1.twinx()
-            ax2.plot(time, mass_mg, label="Total Mass (mg)", color='tab:green', linestyle='--')
+            ax2.plot(time_hours, mass_mg, label="Total Mass (mg)", color='tab:green', linestyle='--')
             ax2.set_ylabel("Total Mass (mg)", color='tab:green')
             ax2.tick_params(axis='y', labelcolor='tab:green')
             
             plt.title(f"Average Phycocyanin Production — {agent_name}")
             fig.tight_layout()
-            plt.savefig(os.path.join("plot", "plot_phycocyanin.png"), dpi=300, bbox_inches='tight')
+            plt.savefig(os.path.join("plot", f"plot_phycocyanin{suffix}.png"), dpi=300, bbox_inches='tight')
             plt.close(fig)
         else:
             plt.close()
@@ -263,56 +269,75 @@ class Plotter:
         # 4. Light intensity control plot for the best episode
         plt.figure(figsize=(8, 5))
         best_I = I_MIN + ((data["actions"][:, 1] + 1.0) / 2.0) * (I_MAX - I_MIN)
-        t_act = np.arange(len(best_I) + 1)
+        t_act = np.arange(len(best_I) + 1) * CONTROL_INTERVAL
         plt.step(t_act, np.append(best_I, best_I[-1]), where='post', label="Best Run", color=color)
         plt.title(f"Light Intensity ($I$) — {agent_name}")
         plt.ylabel(r"$\mu mol/m^2/s$")
-        plt.xlabel("Step")
+        plt.xlabel("Time (hours)")
         plt.grid(True, alpha=0.2)
         plt.legend()
-        plt.savefig(os.path.join("plot", "plot_light.png"), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join("plot", f"plot_light{suffix}.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
         # 5. Nitrate feed control plot for the best episode
         plt.figure(figsize=(8, 5))
         best_Fn = ((data["actions"][:, 2] + 1.0) / 2.0) * FN_MAX_GROWTH
-        t_act = np.arange(len(best_Fn) + 1)
+        t_act = np.arange(len(best_Fn) + 1) * CONTROL_INTERVAL
         plt.step(t_act, np.append(best_Fn, best_Fn[-1]), where='post', label="Best Run", color=color)
         plt.title(f"Nitrate Feed ($F_N$) — {agent_name}")
         plt.ylabel("mg/L/h")
-        plt.xlabel("Step")
+        plt.xlabel("Time (hours)")
         plt.grid(True, alpha=0.2)
         plt.legend()
-        plt.savefig(os.path.join("plot", "plot_nitrate_feed.png"), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join("plot", f"plot_nitrate_feed{suffix}.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
         # 6. Reactor volume with min and max shadow area
         plt.figure(figsize=(8, 5))
         v_best = data["states"][:, 3] * V_MAX
-        plt.plot(time, v_best, label="Best Run", color=color)
+        plt.plot(time_hours, v_best, label="Best Run", color=color)
         if agg and "volume_min" in agg:
-            plt.fill_between(time, agg["volume_min"] * V_MAX, agg["volume_max"] * V_MAX,
+            plt.fill_between(time_hours, agg["volume_min"] * V_MAX, agg["volume_max"] * V_MAX,
                              color=color, alpha=0.2, label="Min/Max")
         plt.axhline(y=V_MAX, color='r', linestyle='--', alpha=0.5, label="$g_4$")
         plt.axhline(y=V_MIN, color='darkred', linestyle='--', alpha=0.5, label="$g_5$")
         plt.title(f"Reactor Volume — {agent_name}")
         plt.ylabel("L")
-        plt.xlabel("Step")
+        plt.xlabel("Time (hours)")
         plt.grid(True, alpha=0.2)
         plt.legend(fontsize=9)
-        plt.savefig(os.path.join("plot", "plot_volume.png"), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join("plot", f"plot_volume{suffix}.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
         # 7. Cq/Cx with min and max shadow area
         plt.figure(figsize=(8, 5))
         if agg:
-            plt.fill_between(time, agg["ratio_min"], agg["ratio_max"], color=color, alpha=0.2, label="Min/Max")
-            plt.plot(time, agg["ratio_avg"], color=color, label="Mean")
+            plt.fill_between(time_hours, agg["ratio_min"], agg["ratio_max"], color=color, alpha=0.2, label="Min/Max")
+            plt.plot(time_hours, agg["ratio_avg"], color=color, label="Mean")
         plt.axhline(y=RATIO_LIMIT, color='r', linestyle='--', alpha=0.5, label="$g_2$")
+        
+        # Shade untracked stages (Stages 2/3) in background
+        has_untracked = False
+        if "metrics" in data and "current_stage" in data["metrics"]:
+            stages = data["metrics"]["current_stage"].values
+            for i in range(len(stages)):
+                start_t = i * CONTROL_INTERVAL
+                end_t = (i + 1) * CONTROL_INTERVAL
+                if stages[i] in (2, 3):
+                    plt.axvspan(start_t, end_t, color='black', alpha=0.07)
+                    has_untracked = True
+
         plt.title(f"$c_q / c_x$ Ratio — {agent_name}")
         plt.ylabel("Ratio")
-        plt.xlabel("Step")
+        plt.xlabel("Time (hours)")
         plt.grid(True, alpha=0.2)
-        plt.legend(fontsize=9)
-        plt.savefig(os.path.join("plot", "plot_ratio.png"), dpi=300, bbox_inches='tight')
+        
+        import matplotlib.patches as mpatches
+        handles, labels = plt.gca().get_legend_handles_labels()
+        if has_untracked:
+            untracked_patch = mpatches.Patch(color='black', alpha=0.07, label='Untracked (Stages 2/3)')
+            handles.append(untracked_patch)
+        plt.legend(handles=handles, fontsize=9)
+        
+        plt.savefig(os.path.join("plot", f"plot_ratio{suffix}.png"), dpi=300, bbox_inches='tight')
         plt.close()

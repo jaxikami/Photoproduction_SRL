@@ -197,7 +197,7 @@ class PhycocyaninEnvCore:
         self._cleanup_latch = False
 
         # Physical state: [Cx (g/L), CN (mg/L), Cq (mg/L), V (L)]
-        self.state = np.array([1.1, 150.0, 0.01, self.V_INITIAL], dtype=np.float64)
+        self.state = np.array([1.1, 150.0, 0.005, self.V_INITIAL], dtype=np.float64)
 
         if randomize:
             noise_factor = 0.10
@@ -336,7 +336,7 @@ class PhycocyaninEnvCore:
         It preserves the episode's time, step count, and cumulative rewards/penalties
         while resetting the physical concentrations, volume, and nutrient supply.
         """
-        self.state = np.array([1.1, 150.0, 0.01, self.V_INITIAL], dtype=np.float64)
+        self.state = np.array([1.1, 150.0, 0.005, self.V_INITIAL], dtype=np.float64)
         self.nitrate_supply = self.INITIAL_NITRATE_SUPPLY
         self.prev_action = np.zeros(4)
 

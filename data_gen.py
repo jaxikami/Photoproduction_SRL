@@ -63,13 +63,13 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
         err_g4 = max(0.0, 1.0 - pass_rates.get("G4", 1.0))
         total_err = err_g1 + err_g2 + err_g4
         if total_err > 1e-8:
-            w_g1 = 0.2 * 0.2 + 0.8 * (err_g1 / total_err)
-            w_g2 = 0.2 * 0.5 + 0.8 * (err_g2 / total_err)
-            w_g4 = 0.2 * 0.3 + 0.8 * (err_g4 / total_err)
+            w_g1 = 0.2 * 0.35 + 0.8 * (err_g1 / total_err)
+            w_g2 = 0.2 * 0.30 + 0.8 * (err_g2 / total_err)
+            w_g4 = 0.2 * 0.35 + 0.8 * (err_g4 / total_err)
         else:
-            w_g1, w_g2, w_g4 = 0.2, 0.5, 0.3
+            w_g1, w_g2, w_g4 = 0.35, 0.30, 0.35
     else:
-        w_g1, w_g2, w_g4 = 0.2, 0.5, 0.3
+        w_g1, w_g2, w_g4 = 0.35, 0.30, 0.35
 
     n_g2 = int(n_boundary * w_g2)
     n_g4 = int(n_boundary * w_g4)

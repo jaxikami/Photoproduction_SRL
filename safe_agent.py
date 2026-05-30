@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch.distributions import Normal
 import numpy as np
 import os
+from pretrain import ActionProjectionNetwork
 
 # Hardware acceleration setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -21,162 +22,93 @@ if hasattr(torch.backends, 'miopen'):
     torch.backends.miopen.enabled = False
 
 
-class ActionProjectionNetwork(nn.Module):
-    """Safety Proximity Regressor for the multi-stage photobioreactor.
-
-    Given a (normalized-state, action) pair, outputs a continuous signed
-    margin score:
-      - margin > 0: Action is safe.
-      - margin < 0: Action is unsafe.
-      - margin = 0: Action is precisely on the safety boundary.
-
-    Constraints covered: G1, G2, G4 (overflow).
-    Note: G3 (terminal nitrate) and G5 (idle stage) are handled by the environment's
-    Lagrangian multipliers and not by the instantaneous step-level projection.
-
-    Architecture:
-        Linear(15 -> 128) -> LayerNorm -> Mish
-        -> 3x Residual blocks (128 -> 128)
-        -> Linear(128 -> 1) [raw margin score]
-        Also includes 3 per-constraint auxiliary heads used only during APN pretraining.
-    """
-    def __init__(self, state_dim: int = 12, action_dim: int = 4, latent_dim: int = 128):
-        """Initializes the Action Projection Network.
-
-        Args:
-            state_dim (int, optional): Dimension of observation space. Defaults to 12.
-            action_dim (int, optional): Dimension of action space. Defaults to 4.
-            latent_dim (int, optional): Width of hidden layers. Defaults to 128.
-        """
-        super(ActionProjectionNetwork, self).__init__()
-
-        self.encoder = nn.Sequential(
-            nn.Linear(state_dim + action_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.Mish()
-        )
-
-        # Three residual blocks for depth
-        self.res_block1 = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.Mish(),
-            nn.Linear(latent_dim, latent_dim),
-            nn.LayerNorm(latent_dim)
-        )
-        self.res_block2 = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.Mish(),
-            nn.Linear(latent_dim, latent_dim),
-            nn.LayerNorm(latent_dim)
-        )
-        self.res_block3 = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.Mish(),
-            nn.Linear(latent_dim, latent_dim),
-            nn.LayerNorm(latent_dim)
-        )
-        self.res_act = nn.Mish()
-
-        self.margin_head = nn.Linear(latent_dim, 1)
-
-        # Per-constraint auxiliary heads (train-only, direct gradient signal)
-        self.g1_head = nn.Linear(latent_dim, 1)
-        self.g2_head = nn.Linear(latent_dim, 1)
-        self.g4_head = nn.Linear(latent_dim, 1)
-
-        nn.init.zeros_(self.margin_head.weight)
-        nn.init.zeros_(self.margin_head.bias)
-
-    def forward(self, state_norm, action_norm):
-        """Computes the continuous signed safety margin for the given state and action.
-
-        Args:
-            state_norm (torch.Tensor): Normalized observation vector.
-            action_norm (torch.Tensor): Un-squashed or squashed action vector.
-
-        Returns:
-            torch.Tensor: Continuous margin score.
-        """
-        x_in   = torch.cat([state_norm, action_norm], dim=-1)
-        x_enc  = self.encoder(x_in)
-        x_enc  = self.res_act(x_enc + self.res_block1(x_enc))
-        x_enc  = self.res_act(x_enc + self.res_block2(x_enc))
-        x_enc  = self.res_act(x_enc + self.res_block3(x_enc))
-        margin = self.margin_head(x_enc).squeeze(-1)
-        return margin
-
-    def classify(self, state_norm, action_norm):
-        """Returns the probability that the state-action pair is safe (margin > 0).
-
-        Args:
-            state_norm (torch.Tensor): Normalized observation vector.
-            action_norm (torch.Tensor): Action vector.
-
-        Returns:
-            torch.Tensor: Safety probability [0, 1].
-        """
-        return torch.sigmoid(self.forward(state_norm, action_norm))
-
-
 # =============================================================================
 # GRU + Skip-Connection Actor-Critic Architecture
 # =============================================================================
 
 class ActorCritic(nn.Module):
-    """Safe-agent Actor-Critic with feedforward MLP and stage-aware action masking.
+    """Safe-agent Actor-Critic with GRU temporal encoder and skip-connection.
+
+    The GRU provides temporal memory so the agent can anticipate constraint
+    violations (especially g2 ratio buildup) before they occur. A skip
+    connection concatenates GRU output with the raw state for both heads.
 
     Action masking follows the established protocol:
         - Masked dims get a fixed default intent (pre-Tanh)
         - Masked dims get near-zero std to suppress exploration
         - Log-probs exclude masked dims
     """
-    def __init__(self, state_dim=12, action_dim=4):
-        """Initializes the Actor and Critic MLPs.
+    def __init__(self, state_dim=12, action_dim=4, hidden_dim=128):
+        """Initializes the GRU encoder and Actor/Critic heads.
 
         Args:
             state_dim (int, optional): Observation dimension. Defaults to 12.
             action_dim (int, optional): Action dimension. Defaults to 4.
+            hidden_dim (int, optional): GRU hidden state dimension. Defaults to 128.
         """
         super(ActorCritic, self).__init__()
         self.LOG_STD_MIN = -1.0
         self.LOG_STD_MAX = 0.5
         self.env_state_dim = state_dim
+        self.hidden_dim = hidden_dim
 
-        # Actor head (3-layer MLP with 256 units and ELU activations)
+        # GRU temporal encoder
+        self.gru = nn.GRU(state_dim, hidden_dim, batch_first=False)
+
+        # Actor head: GRU features + skip connection from raw state
+        actor_input_dim = hidden_dim + state_dim
         self.actor = nn.Sequential(
-            nn.Linear(state_dim, 256), nn.ELU(),
-            nn.Linear(256, 256),       nn.ELU(),
+            nn.Linear(actor_input_dim, 256), nn.ELU(),
+            nn.Linear(256, 256),             nn.ELU(),
             nn.Linear(256, action_dim)
         )
         self.log_std = nn.Parameter(torch.ones(action_dim) * -0.5)
 
-        # Critic head (3-layer MLP with 256 units and ELU activations)
+        # Critic head: GRU features + skip connection from raw state
         self.critic = nn.Sequential(
-            nn.Linear(state_dim, 256), nn.ELU(),
-            nn.Linear(256, 256),       nn.ELU(),
+            nn.Linear(actor_input_dim, 256), nn.ELU(),
+            nn.Linear(256, 256),             nn.ELU(),
             nn.Linear(256, 1)
         )
 
-    def act(self, state, hidden=None):
-        """Generates an action with stage-aware masking.
+    def init_hidden(self, batch_size=1):
+        """Creates a zero-initialized GRU hidden state.
 
         Args:
-            state (torch.Tensor): Current state tensor.
-            hidden: Dummy argument for API compatibility (no GRU used).
+            batch_size (int): Batch dimension for the hidden state.
+
+        Returns:
+            torch.Tensor: Zero tensor of shape (1, batch_size, hidden_dim).
+        """
+        return torch.zeros(1, batch_size, self.hidden_dim, device=next(self.parameters()).device)
+
+    def act(self, state, hidden=None):
+        """Generates an action using GRU temporal encoding and stage-aware masking.
+
+        Args:
+            state (torch.Tensor): Current state tensor of shape (1, state_dim).
+            hidden (torch.Tensor or None): GRU hidden state from previous step.
 
         Returns:
             tuple:
                 - z (torch.Tensor): Squashed action [-1, 1]
                 - log_prob (torch.Tensor): Log probability of chosen action.
                 - z_raw (torch.Tensor): Unbounded Gaussian sample.
-                - hidden (None): Maintained for API compatibility.
+                - hidden_new (torch.Tensor): Updated GRU hidden state.
         """
         from env_core import PhycocyaninEnvCore
 
-        mean = self.actor(state)
+        if hidden is None:
+            hidden = self.init_hidden(batch_size=state.shape[0])
+
+        # GRU forward: state shape (1, batch, state_dim) -> gru_out (1, batch, hidden_dim)
+        gru_out, hidden_new = self.gru(state.unsqueeze(0), hidden)
+        gru_out = gru_out.squeeze(0)  # (batch, hidden_dim)
+
+        # Skip connection: concatenate GRU features with raw state
+        features = torch.cat([gru_out, state], dim=-1)  # (batch, hidden_dim + state_dim)
+
+        mean = self.actor(features)
         std  = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
 
         # Stage mask from observation
@@ -199,21 +131,54 @@ class ActorCritic(nn.Module):
 
         log_prob = (dist.log_prob(z_raw) * mask).sum(dim=-1)
 
-        return z.detach(), log_prob.detach(), z_raw.detach(), None
+        return z.detach(), log_prob.detach(), z_raw.detach(), hidden_new.detach()
 
-    def evaluate(self, state, z_raw):
-        """Re-evaluates stored intents during the PPO update.
+    def evaluate(self, state, z_raw, is_terminals=None):
+        """Re-evaluates stored intents during the PPO update with GRU context.
+
+        Uses chunked GRU processing for speed: processes contiguous segments
+        between episode boundaries as single batched sequences, avoiding the
+        overhead of per-timestep Python loops.
 
         Args:
-            state (torch.Tensor): Batch of state tensors.
-            z_raw (torch.Tensor): Batch of unbounded actions.
+            state (torch.Tensor): Batch of state tensors (T, state_dim).
+            z_raw (torch.Tensor): Batch of unbounded actions (T, action_dim).
+            is_terminals (torch.Tensor or None): Episode boundary flags (T,).
 
         Returns:
             tuple: (log_probs, state_values, dist_entropy)
         """
         from env_core import PhycocyaninEnvCore
 
-        mean = self.actor(state)
+        T = state.shape[0]
+
+        # Find episode boundaries to process in chunks
+        if is_terminals is not None:
+            # Indices where episodes end (terminal flag is True)
+            boundary_indices = torch.where(is_terminals)[0].tolist()
+        else:
+            boundary_indices = []
+
+        # Build segment start/end list
+        segments = []
+        start = 0
+        for end_idx in boundary_indices:
+            segments.append((start, end_idx + 1))
+            start = end_idx + 1
+        if start < T:
+            segments.append((start, T))
+
+        # Process each segment as a batched GRU sequence
+        features = torch.empty(T, self.hidden_dim + state.shape[-1], device=state.device)
+        for seg_start, seg_end in segments:
+            seg_states = state[seg_start:seg_end].unsqueeze(1)  # (L, 1, state_dim)
+            hidden = self.init_hidden(batch_size=1)
+            gru_out, _ = self.gru(seg_states, hidden)  # (L, 1, hidden_dim)
+            gru_out = gru_out.squeeze(1)  # (L, hidden_dim)
+            features[seg_start:seg_end] = torch.cat(
+                [gru_out, state[seg_start:seg_end]], dim=-1)
+
+        mean = self.actor(features)
         std  = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
 
         mask = PhycocyaninEnvCore.get_action_mask(state[..., :self.env_state_dim])
@@ -227,12 +192,12 @@ class ActorCritic(nn.Module):
 
         log_probs    = (dist.log_prob(z_raw) * mask).sum(dim=-1)
         dist_entropy = (dist.entropy() * mask).sum(dim=-1)
-        state_values = self.critic(state)
+        state_values = self.critic(features)
         return log_probs, state_values, dist_entropy
 
 
 class SPRL_Agent:
-    """Safe PPO agent combining an MLP ActorCritic, stage masking, and APN projection."""
+    """Safe PPO agent combining a GRU ActorCritic, stage masking, and APN projection."""
     def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, entropy_coeff):
         self.gamma          = gamma
         self.eps_clip       = eps_clip
@@ -244,6 +209,7 @@ class SPRL_Agent:
         # Actor-Critic
         self.policy = ActorCritic(state_dim=state_dim, action_dim=action_dim).to(device)
         self.optimizer = torch.optim.Adam([
+            {'params': self.policy.gru.parameters(),          'lr': lr_actor},
             {'params': self.policy.actor.parameters(),        'lr': lr_actor},
             {'params': [self.policy.log_std],                 'lr': lr_actor},
             {'params': self.policy.critic.parameters(),       'lr': lr_critic, 'weight_decay': 1e-5}
@@ -253,27 +219,29 @@ class SPRL_Agent:
         self.policy_old.load_state_dict(self.policy.state_dict())
 
         # Safeguard (APN)
-        self.safeguard = ActionProjectionNetwork(
-            state_dim=state_dim, action_dim=action_dim, latent_dim=160).to(device)
         _ckpt_paths = [
             os.path.join("policy", "action_projection_network.pth"),
             "action_projection_network.pth",
         ]
         for _ckpt in _ckpt_paths:
             if os.path.exists(_ckpt):
-                self.safeguard.load_state_dict(
-                    torch.load(_ckpt, map_location=device, weights_only=True))
+                self.safeguard = ActionProjectionNetwork.from_checkpoint(
+                    _ckpt, device, state_dim=state_dim, action_dim=action_dim)
                 self.safeguard.eval()
                 for p in self.safeguard.parameters():
                     p.requires_grad_(False)
-                print(f"[Safeguard] Loaded APN from '{_ckpt}'.")
                 break
         else:
             print("[Safeguard] WARNING: APN not found. Actions will be unfiltered.")
+            self.safeguard = ActionProjectionNetwork(
+                state_dim=state_dim, action_dim=action_dim).to(device)
 
         self._proj_calls = 0
         self._proj_noop  = 0
         self._proj_iters = 0
+
+        # Pre-allocate constant tensors for select_action hot path
+        self._default_squashed = torch.tensor([-0.407, -1.0, -1.0, -1.0], device=device)
 
         self.MseLoss           = nn.MSELoss()
         self.mapping_criterion = nn.MSELoss()
@@ -291,7 +259,7 @@ class SPRL_Agent:
         self._proj_calls = self._proj_noop = self._proj_iters = 0
         return {'calls': calls, 'noop': noop, 'iters': iters, 'avg_it': avg_it}
 
-    def _project_to_safe(self, state_norm, action, lr=0.25, max_steps=15, threshold=0.95):
+    def _project_to_safe(self, state_norm, action, lr=0.4, max_steps=7, threshold=0.95):
         """Gradient-ascend the APN margin surface to find a safe action proxy.
 
         If the initially proposed action is unsafe, this method performs gradient
@@ -393,15 +361,14 @@ class SPRL_Agent:
 
             # Apply SERL mask checkpoint 2 (pre-APN)
             mask = PhycocyaninEnvCore.get_action_mask(state_t)
-            default_squashed = torch.tensor([-0.407, -1.0, -1.0, -1.0], device=device)
-            z_masked = z * mask + default_squashed * (1 - mask)
+            z_masked = z * mask + self._default_squashed * (1 - mask)
 
         # APN gradient projection
         u_safe = self._project_to_safe(state_t, z_masked)
 
         # Final SERL mask checkpoint 3 (post-APN)
         with torch.no_grad():
-            u_safe = u_safe * mask + default_squashed * (1 - mask)
+            u_safe = u_safe * mask + self._default_squashed * (1 - mask)
 
         # CRITICAL: store u_safe (the actually-executed action) as raw_action
         # so PPO update gradients align with what was truly executed in the env.
@@ -412,7 +379,7 @@ class SPRL_Agent:
                 z_raw.cpu().numpy().flatten())
 
     def learn(self, memory):
-        """Executes the PPO update with an additional manifold-mapping penalty.
+        """Executes the PPO update with sequential GRU processing and manifold-mapping penalty.
 
         Args:
             memory (Memory): Buffer containing collected trajectories.
@@ -432,9 +399,11 @@ class SPRL_Agent:
         old_z_raw     = torch.squeeze(torch.stack(memory.raw_actions, dim=0)).detach().to(device)
         old_logprobs  = torch.squeeze(torch.stack(memory.logprobs, dim=0)).detach().to(device)
         old_safe_acts = torch.squeeze(torch.stack(memory.actions, dim=0)).detach().to(device)
+        is_terminals  = torch.tensor(memory.is_terminals, dtype=torch.bool).to(device)
 
         for _ in range(self.K_epochs):
-            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_z_raw)
+            logprobs, state_values, dist_entropy = self.policy.evaluate(
+                old_states, old_z_raw, is_terminals=is_terminals)
 
             ratios     = torch.exp(logprobs - old_logprobs)
             advantages = rewards - state_values.detach().squeeze()

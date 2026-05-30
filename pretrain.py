@@ -9,11 +9,12 @@ Trains the ActionProjectionNetwork as a margin regressor covering:
 Note: G3 (terminal nitrate ≤ 150 mg/L) is handled by the GRU's temporal
 context and the Lagrangian multiplier, not by the APN.
 
-Architecture (12D state + 4D action = 16 input):
-  Linear(15→128) → LayerNorm → Mish
-  → 3× Residual blocks (128→128)
-  → Linear(128→1) [raw margin]
-  + 4× per-constraint auxiliary heads (train-only)
+Architecture (FiLM-conditioned, spectral-normalized):
+  State encoder: Linear(12→256) → LN → Mish → Linear(256→256) → LN → Mish
+  FiLM generators: 3× Linear(256→512) producing (γ,β) pairs
+  Action trunk: Linear(4→256) → 3× [FC → LN → FiLM → Mish] (spectral-normed)
+  → Linear(256→1) [raw margin]
+  + 3× per-constraint auxiliary heads (train-only)
 """
 
 import os
@@ -39,62 +40,106 @@ class ActionProjectionNetwork(nn.Module):
       - margin < 0: Action is unsafe.
       - margin = 0: Action is precisely on the safety boundary.
 
-    Architecture:
-        Linear(15 -> 128) -> LayerNorm -> Mish
-        -> 3x Residual blocks (128 -> 128)
-        -> Linear(128 -> 1) [raw margin score]
+    Architecture (FiLM-conditioned with spectral normalization):
+        State encoder: Linear(12→256) → Mish → Linear(256→256) → Mish
+        State → FiLM params: 3× (γ, β) pairs for action trunk modulation
+        Action trunk: Linear(4→256) → [FiLM block]×3 → Linear(256→1)
+        Spectral norm on action-path layers for Lipschitz-bounded ∂margin/∂action.
         Also includes 3 per-constraint auxiliary heads used for APN pretraining.
     """
 
-    def __init__(self, state_dim: int = 12, action_dim: int = 4, latent_dim: int = 160):
-        """Initializes the Action Projection Network for pretraining.
+    def __init__(self, state_dim: int = 12, action_dim: int = 4, latent_dim: int = 256):
+        """Initializes the Action Projection Network with FiLM conditioning.
+
+        The state is encoded separately and produces scale/shift (γ, β) parameters
+        that modulate the action processing trunk. This yields cleaner ∂margin/∂action
+        gradients for the projection step. Spectral normalization ensures Lipschitz
+        continuity for stable gradient ascent convergence.
 
         Args:
             state_dim (int, optional): Dimension of observation space. Defaults to 12.
             action_dim (int, optional): Dimension of action space. Defaults to 4.
-            latent_dim (int, optional): Width of hidden layers. Defaults to 160.
+            latent_dim (int, optional): Width of hidden layers. Defaults to 256.
         """
         super(ActionProjectionNetwork, self).__init__()
+        self.latent_dim = latent_dim
 
-        self.encoder = nn.Sequential(
-            nn.Linear(state_dim + action_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.Mish()
-        )
-
-        # Three residual blocks for depth
-        self.res_block1 = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
+        # ── State encoder (no spectral norm — not differentiated during projection)
+        self.state_encoder = nn.Sequential(
+            nn.Linear(state_dim, latent_dim),
             nn.LayerNorm(latent_dim),
             nn.Mish(),
             nn.Linear(latent_dim, latent_dim),
-            nn.LayerNorm(latent_dim)
-        )
-        self.res_block2 = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim),
             nn.Mish(),
-            nn.Linear(latent_dim, latent_dim),
-            nn.LayerNorm(latent_dim)
         )
-        self.res_block3 = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.Mish(),
-            nn.Linear(latent_dim, latent_dim),
-            nn.LayerNorm(latent_dim)
-        )
-        self.res_act = nn.Mish()
 
-        self.margin_head = nn.Linear(latent_dim, 1)
+        # FiLM generators: state → (γ, β) for each of 3 action trunk blocks.
+        # Zero-initialised so all generators start as identity (γ=0, β=0),
+        # preventing activation explosions before the first gradient update.
+        self.film1 = nn.Linear(latent_dim, latent_dim * 2)
+        self.film2 = nn.Linear(latent_dim, latent_dim * 2)
+        self.film3 = nn.Linear(latent_dim, latent_dim * 2)
+        for _film in (self.film1, self.film2, self.film3):
+            nn.init.zeros_(_film.weight)
+            nn.init.zeros_(_film.bias)
+
+        # ── Action trunk (spectral-normed for Lipschitz-bounded action gradients)
+        self.action_lift = nn.utils.spectral_norm(nn.Linear(action_dim, latent_dim))
+
+        self.trunk_fc1 = nn.utils.spectral_norm(nn.Linear(latent_dim, latent_dim))
+        self.trunk_ln1 = nn.LayerNorm(latent_dim)
+        self.trunk_fc2 = nn.utils.spectral_norm(nn.Linear(latent_dim, latent_dim))
+        self.trunk_ln2 = nn.LayerNorm(latent_dim)
+        self.trunk_fc3 = nn.utils.spectral_norm(nn.Linear(latent_dim, latent_dim))
+        self.trunk_ln3 = nn.LayerNorm(latent_dim)
+
+        self.act = nn.Mish()
+
+        # ── Output heads
+        # spectral_norm wraps weight_orig — do NOT zero-init weight_orig as
+        # σ = u^T W v → 0 causes NaN (division by zero in the SN forward hook).
+        self.margin_head = nn.utils.spectral_norm(nn.Linear(latent_dim, 1))
+        nn.init.zeros_(self.margin_head.bias)
 
         # Per-constraint auxiliary heads (train-only, direct gradient signal)
         self.g1_head = nn.Linear(latent_dim, 1)
         self.g2_head = nn.Linear(latent_dim, 1)
         self.g4_head = nn.Linear(latent_dim, 1)
 
-        nn.init.zeros_(self.margin_head.weight)
-        nn.init.zeros_(self.margin_head.bias)
+    def _encode_state(self, state_norm):
+        """Encodes state into FiLM conditioning parameters."""
+        h_s = self.state_encoder(state_norm)
+        film1 = self.film1(h_s)
+        film2 = self.film2(h_s)
+        film3 = self.film3(h_s)
+        return h_s, film1, film2, film3
+
+    def _apply_film(self, x, film_params):
+        """Applies FiLM: x * (1 + γ) + β."""
+        gamma, beta = film_params.chunk(2, dim=-1)
+        return x * (1.0 + gamma) + beta
+
+    def _action_trunk(self, action_norm, film1, film2, film3):
+        """Processes action through FiLM-modulated trunk."""
+        h = self.act(self.action_lift(action_norm))
+
+        h = self.trunk_fc1(h)
+        h = self.trunk_ln1(h)
+        h = self._apply_film(h, film1)
+        h = self.act(h)
+
+        h = self.trunk_fc2(h)
+        h = self.trunk_ln2(h)
+        h = self._apply_film(h, film2)
+        h = self.act(h)
+
+        h = self.trunk_fc3(h)
+        h = self.trunk_ln3(h)
+        h = self._apply_film(h, film3)
+        h = self.act(h)
+
+        return h
 
     def forward(self, state_norm, action_norm):
         """Computes the continuous signed safety margin for the given state and action.
@@ -106,12 +151,9 @@ class ActionProjectionNetwork(nn.Module):
         Returns:
             torch.Tensor: Continuous margin score.
         """
-        x_in = torch.cat([state_norm, action_norm], dim=-1)
-        x_enc = self.encoder(x_in)
-        x_enc = self.res_act(x_enc + self.res_block1(x_enc))
-        x_enc = self.res_act(x_enc + self.res_block2(x_enc))
-        x_enc = self.res_act(x_enc + self.res_block3(x_enc))
-        margin = self.margin_head(x_enc).squeeze(-1)
+        _, film1, film2, film3 = self._encode_state(state_norm)
+        h = self._action_trunk(action_norm, film1, film2, film3)
+        margin = self.margin_head(h).squeeze(-1)
         return margin
 
     def forward_aux(self, state_norm, action_norm):
@@ -124,15 +166,12 @@ class ActionProjectionNetwork(nn.Module):
         Returns:
             tuple: (margin, g1_margin, g2_margin, g4_margin)
         """
-        x_in = torch.cat([state_norm, action_norm], dim=-1)
-        x_enc = self.encoder(x_in)
-        x_enc = self.res_act(x_enc + self.res_block1(x_enc))
-        x_enc = self.res_act(x_enc + self.res_block2(x_enc))
-        x_enc = self.res_act(x_enc + self.res_block3(x_enc))
-        margin = self.margin_head(x_enc).squeeze(-1)
-        g1 = self.g1_head(x_enc).squeeze(-1)
-        g2 = self.g2_head(x_enc).squeeze(-1)
-        g4 = self.g4_head(x_enc).squeeze(-1)
+        _, film1, film2, film3 = self._encode_state(state_norm)
+        h = self._action_trunk(action_norm, film1, film2, film3)
+        margin = self.margin_head(h).squeeze(-1)
+        g1 = self.g1_head(h).squeeze(-1)
+        g2 = self.g2_head(h).squeeze(-1)
+        g4 = self.g4_head(h).squeeze(-1)
         return margin, g1, g2, g4
 
     def classify(self, state_norm, action_norm):
@@ -146,6 +185,45 @@ class ActionProjectionNetwork(nn.Module):
             torch.Tensor: Safety probability [0, 1].
         """
         return torch.sigmoid(self.forward(state_norm, action_norm))
+
+    @classmethod
+    def from_checkpoint(cls, path: str, device: torch.device, **kwargs) -> "ActionProjectionNetwork":
+        """Instantiate an APN and load a checkpoint with shape-safe partial loading.
+
+        Keys present in the checkpoint but with a shape mismatch against the
+        current architecture are silently skipped, so weights always load without
+        crashing across architecture changes (e.g. latent_dim 160 → 256).
+
+        Args:
+            path (str): Path to the .pth checkpoint file.
+            device (torch.device): Target device.
+            **kwargs: Forwarded to __init__ (e.g. state_dim, action_dim, latent_dim).
+
+        Returns:
+            ActionProjectionNetwork: Model with compatible weights loaded.
+        """
+        model = cls(**kwargs).to(device)
+        ckpt = torch.load(path, map_location=device, weights_only=True)
+        current = model.state_dict()
+        compatible = {k: v for k, v in ckpt.items()
+                      if k in current and current[k].shape == v.shape}
+        skipped = len(ckpt) - len(compatible)
+        model.load_state_dict(compatible, strict=False)
+        print(f"[APN] Loaded '{path}' — {len(compatible)} tensors restored, "
+              f"{skipped} skipped (shape mismatch / new layers).")
+        return model
+
+
+# Keep as a module-level alias so existing call sites in validation/safe_agent
+# that import load_compatible_checkpoint still work without changes.
+def load_compatible_checkpoint(model: nn.Module, checkpoint_path: str, device: torch.device):
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    current = model.state_dict()
+    compatible = {k: v for k, v in ckpt.items()
+                  if k in current and current[k].shape == v.shape}
+    skipped = len(ckpt) - len(compatible)
+    model.load_state_dict(compatible, strict=False)
+    return len(compatible), skipped
 
 
 def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
@@ -171,9 +249,8 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
 
     policy_path = os.path.join("policy", "action_projection_network.pth")
     if load and os.path.exists(policy_path):
-        model.load_state_dict(torch.load(policy_path, map_location=device,
-                                         weights_only=True))
-        print(f"[Load] Resumed from checkpoint: {policy_path}")
+        model = ActionProjectionNetwork.from_checkpoint(
+            policy_path, device, state_dim=12, action_dim=4)
 
     # Optimizer settings tuned for long (~20k epoch) runs:
     # lower start LR, gentler decay envelope, and stronger L2 regularization.
@@ -238,7 +315,7 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
     patience = 3000
     window_size = 200
     improvement_threshold = 1e-4
-    min_training = 15000
+    min_training = 10000
 
     pbar = tqdm(range(epochs), desc="Training Safety Classifier")
 
@@ -378,11 +455,14 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
                 with autocast(device_type='cuda'):
                     loss, correct, total = calculate_loss()
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss, correct, total = calculate_loss()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
             scheduler.step(epoch + i / steps_per_epoch)

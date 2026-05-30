@@ -41,9 +41,13 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         # ── Fixed constraint penalty weights ───────────────────────
         # Scale: harvest_r peaks ~13/step. Spikes should dominate reward
         # at hard violations, but not be so large they prevent learning.
-        self.W_BARRIER   = 5.0     # Quadratic buffer-zone scaling coefficient
-        self.W_g1_SPIKE  = 30.0   # G1: 3× base; painful but not catastrophic
-        self.W_g2_SPIKE  = 20.0   # G2: 2× base
+        self.W_BARRIER   = 5.0     # Default quadratic buffer-zone scaling coefficient
+        self.W_g1_BARRIER = 40.0  # G1-specific pre-limit pressure (stronger than default barrier)
+        self.W_g1_SPIKE  = 250.0  # G1: very strong linear spike to suppress nitrate-limit reward hacking
+        self.W_g1_QUAD   = 900.0  # Extra superlinear term once over limit
+        self.W_g2_BARRIER = 40.0  # G2-specific pre-limit pressure (matched to g1)
+        self.W_g2_SPIKE  = 250.0  # G2: very strong linear spike (matched to g1)
+        self.W_g2_QUAD   = 900.0  # Extra superlinear term once over limit (matched to g1)
         self.W_g3_SPIKE  = 200.0  # G3: terminal, so higher
         self.W_g4_SPIKE  = 15.0   # G4: volume overflow
         self.W_IDLE_HARD = 500.0  # G5: ~40× one harvest step — hard terminal
@@ -80,8 +84,8 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         self.state[1] = min(self.state[1], self.N_LIMIT_PATH * 0.9)
         self.state[3] = min(self.state[3], self.V_MAX * 0.9)
         ratio = self.state[2] / (self.state[0] + 1e-8)
-        if ratio > self.RATIO_LIMIT * 0.9:
-            self.state[2] = self.state[0] * self.RATIO_LIMIT * 0.9
+        if ratio > self.RATIO_LIMIT * 0.7:
+            self.state[2] = self.state[0] * self.RATIO_LIMIT * 0.7
         
         return self.get_state_norm()
 
@@ -123,9 +127,11 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         if n_ratio > self.G1_BUFFER_START:
             buf_depth = min(1.0, (n_ratio - self.G1_BUFFER_START) /
                            (1.0 - self.G1_BUFFER_START))
-            p_g1 += self.W_BARRIER * buf_depth ** 2
+            p_g1 += self.W_g1_BARRIER * buf_depth ** 2
         if n_ratio > 1.0:
-            p_g1 += self.W_g1_SPIKE * (n_ratio - 1.0)
+            n_viol = n_ratio - 1.0
+            # Superlinear growth makes large g1 violations disproportionately expensive.
+            p_g1 += self.W_g1_SPIKE * n_viol + self.W_g1_QUAD * (n_viol ** 2)
             self.violation_count    += 1
             self.g1_violation_count += 1
 
@@ -135,9 +141,11 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         if q_ratio > self.G2_BUFFER_START:
             buf_depth = min(1.0, (q_ratio - self.G2_BUFFER_START) /
                            (1.0 - self.G2_BUFFER_START))
-            p_g2 += self.W_BARRIER * buf_depth ** 2
+            p_g2 += self.W_g2_BARRIER * buf_depth ** 2
         if q_ratio > 1.0:
-            p_g2 += self.W_g2_SPIKE * (q_ratio - 1.0)
+            q_viol = q_ratio - 1.0
+            # Superlinear growth makes large g2 violations disproportionately expensive.
+            p_g2 += self.W_g2_SPIKE * q_viol + self.W_g2_QUAD * (q_viol ** 2)
             self.violation_count    += 1
             self.g2_violation_count += 1
 
