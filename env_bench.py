@@ -62,7 +62,7 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         # ── Buffer zone activation thresholds ─────────────────────
         # g1/g2: buffer activates at 90% of limit
         self.G1_BUFFER_START = 0.9
-        self.G2_BUFFER_START = 0.9
+        self.G2_BUFFER_START = 0.95
         # g4: inherited self.OVERFLOW_BUFFER_FRAC = 0.10  (90% V_MAX)
 
     def reset(self, randomize=False):

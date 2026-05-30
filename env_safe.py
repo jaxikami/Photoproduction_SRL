@@ -82,7 +82,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
 
         # ── Buffer zone activation thresholds ─────────────────────
         self.G1_BUFFER_START = 0.9
-        self.G2_BUFFER_START = 0.9   # Was 0.8; initial q_ratio=0.826 started IN buffer
+        self.G2_BUFFER_START = 0.95  # Barrier penalty starts at 95% of the ratio limit
 
         # ── Reward shaping coefficients ────────────────────────────
         self.prod_coef    = 0.2    # Gentle stockpile nudge

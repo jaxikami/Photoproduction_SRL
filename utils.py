@@ -315,29 +315,10 @@ class Plotter:
             plt.fill_between(time_hours, agg["ratio_min"], agg["ratio_max"], color=color, alpha=0.2, label="Min/Max")
             plt.plot(time_hours, agg["ratio_avg"], color=color, label="Mean")
         plt.axhline(y=RATIO_LIMIT, color='r', linestyle='--', alpha=0.5, label="$g_2$")
-        
-        # Shade untracked stages (Stages 2/3) in background
-        has_untracked = False
-        if "metrics" in data and "current_stage" in data["metrics"]:
-            stages = data["metrics"]["current_stage"].values
-            for i in range(len(stages)):
-                start_t = i * CONTROL_INTERVAL
-                end_t = (i + 1) * CONTROL_INTERVAL
-                if stages[i] in (2, 3):
-                    plt.axvspan(start_t, end_t, color='black', alpha=0.07)
-                    has_untracked = True
-
         plt.title(f"$c_q / c_x$ Ratio — {agent_name}")
         plt.ylabel("Ratio")
         plt.xlabel("Time (hours)")
         plt.grid(True, alpha=0.2)
-        
-        import matplotlib.patches as mpatches
-        handles, labels = plt.gca().get_legend_handles_labels()
-        if has_untracked:
-            untracked_patch = mpatches.Patch(color='black', alpha=0.07, label='Untracked (Stages 2/3)')
-            handles.append(untracked_patch)
-        plt.legend(handles=handles, fontsize=9)
-        
+        plt.legend(fontsize=9)
         plt.savefig(os.path.join("plot", f"plot_ratio{suffix}.png"), dpi=300, bbox_inches='tight')
         plt.close()
