@@ -47,7 +47,6 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         self.reset_lambdas_per_episode = False
         self.episode_count = 0
         self.lag_ep_decay_g2 = 0.90    # Set early; reset() uses it
-        self.lag_warmup = 500           # Set early; step() uses it
         self.lam_g1 = 0.0
         self.lam_g2 = 0.0
         self.lam_g3 = 0.0
@@ -63,7 +62,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         self.lag_lr     = 0.5          # Slow growth so λ ramps gradually
         self.lag_lr_g1  = 2000.0       # Scaled up for G1 (path nitrate)
         self.lag_lr_g2  = 500.0        # Gentle ramp — g2 is borderline-feasible, agent needs time to learn
-        self.lag_decay  = 0.5 / 600.0  # Slow decay so λ persists across episodes
+        self.lag_decay  = 1.0 / 600.0  # Faster decay to recover production signal after compliance
         self.lag_decay_g2 = 2.0 / 600.0  # Meaningful per-step decay (was 0.3/600)
         self.lag_ep_decay_g2 = 0.90    # Per-EPISODE multiplicative decay to prevent death spiral
         self.lag_max    = 15.0         # Default matches env_bench W_g4_SPIKE
@@ -71,7 +70,6 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         self.lag_max_g2 = 500.0        # Hard cap prevents reward signal death
         self.lag_max_g3 = 200.0        # Matches env_bench W_g3_SPIKE perfectly
         self.lag_max_g5 = 100.0        # G5 cap (hard constraint)
-        self.lag_warmup = 500          # Episodes before λ_g2 starts ramping
 
         # ── Barrier + base spike params ────────────────────────────
         # BASE_SPIKE fires even at λ=0; must be painful but not catastrophic.
@@ -81,7 +79,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         self.IDLE_BASE_SPIKE      = 500.0 # Hard idle spike: ~40× one harvest step
 
         # ── Buffer zone activation thresholds ─────────────────────
-        self.G1_BUFFER_START = 0.9
+        self.G1_BUFFER_START = 0.95
         self.G2_BUFFER_START = 0.95  # Barrier penalty starts at 95% of the ratio limit
 
         # ── Reward shaping coefficients ────────────────────────────
@@ -204,8 +202,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             if q_ratio > 1.0:
                 # Beyond limit: linear penalty proportional to violation magnitude
                 viol = q_ratio - 1.0
-                if self.episode_count > self.lag_warmup:
-                    self.lam_g2 = min(self.lag_max_g2, self.lam_g2 + self.lag_lr_g2 * viol)
+                self.lam_g2 = min(self.lag_max_g2, self.lam_g2 + self.lag_lr_g2 * viol)
                 p_g2 += self.lam_g2 * viol + self.BASE_SPIKE * (1.0 + viol)
                 # Cap per-step g2 penalty to preserve learning signal
                 p_g2 = min(p_g2, 10.0)
@@ -239,21 +236,6 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         # ── Raw material usage penalty ─────────────────────────────
         raw_mat_p = self.raw_mat_coef * (Fn_phys / self.FN_MAX_GROWTH)
 
-        # ── Biomass growth bonus (g2 avoidance shaping) ────────────
-        # Growing Cx is the PRIMARY mechanism to satisfy g2 (dilutes Cq/Cx ratio).
-        # Bonus scales with proximity to g2 limit — stronger signal when close.
-        growth_bonus = 0.0
-        if self.current_stage in (0, 1):
-            delta_Cx = self.state[0] - self.prev_Cx
-            if delta_Cx > 0:
-                # Base bonus for any growth
-                growth_bonus = 0.3 * delta_Cx
-                # Extra urgency bonus when near g2 limit
-                curr_ratio = self.state[2] / (self.state[0] + 1e-8)
-                curr_q_ratio = curr_ratio / self.RATIO_LIMIT
-                if curr_q_ratio > 0.8:
-                    urgency = min(2.0, (curr_q_ratio - 0.8) / 0.2)  # 0→2 as ratio 0.8→1.0
-                    growth_bonus += urgency * delta_Cx  # Up to 2× extra
         self.prev_Cx = self.state[0]
 
         # ── G5 Directional Guiding ─────────────────────────────────────
@@ -283,7 +265,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
                 p_g5 += guiding_p
 
         # ── Aggregate step reward ──────────────────────────────────
-        step_reward = prod_r + harvest_r + growth_bonus - constraint_penalty - smooth_p - raw_mat_p - p_g5 - self.time_penalty
+        step_reward = prod_r + harvest_r - constraint_penalty - smooth_p - raw_mat_p - p_g5 - self.time_penalty
 
         # ── Terminal checks ────────────────────────────────────────
 

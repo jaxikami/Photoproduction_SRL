@@ -31,9 +31,9 @@ C_N_STOCK        = 50000.0
 CONTROL_INTERVAL = 10.0
 TOTAL_TIME       = 1000.0
 SAFE_BUFFER      = 0.98
-THRESHOLD        = 0.95
-MAX_PROJ_STEPS   = 7
-LR_PROJ          = 0.4
+THRESHOLD        = 0.711
+MAX_PROJ_STEPS   = 4
+LR_PROJ          = 0.5
 
 
 def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS, lr=LR_PROJ, threshold=THRESHOLD):

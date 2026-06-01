@@ -39,24 +39,78 @@ MIN_LR = 1e-5
 INITIAL_ENTROPY = 0.05
 MIN_ENTROPY = 1e-5
 EVALUATE_ONLY = False  # True → skip training and run evaluation only; False → run full train + eval
-RUN_BENCHMARK = False   # True → run Standard RL (bench) only; False → run Safe RL only
-NOISE_STD = 0.1
+RUN_BENCHMARK = True   # True → run Standard RL (bench) only; False → run Safe RL only
+RESUME_TRAINING = True # True → load existing weights before training
+NOISE_STD = 0.05
 ACTION_NOISE = True
 STATE_NOISE = False
 
 class Memory:
     """Buffer for storing environment trajectories during rollouts.
     
-    Holds lists of states, actions, rewards, log-probabilities, and terminal
-    flags to be consumed by the PPO optimization step.
+    Holds pre-allocated numpy arrays for states, actions, rewards, log-probabilities,
+    and terminal flags to be consumed by the PPO optimization step.
+    Avoids per-step tensor allocation overhead.
     """
-    def __init__(self):
-        """Initializes empty trajectory lists."""
-        self.states, self.actions, self.raw_actions, self.logprobs, self.rewards, self.is_terminals = [], [], [], [], [], []
+    def __init__(self, capacity=UPDATE_TIMESTEP + 200, state_dim=STATE_DIM, action_dim=ACTION_DIM):
+        """Initializes pre-allocated numpy trajectory arrays."""
+        self.capacity = capacity
+        self._states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self._actions = np.zeros((capacity, action_dim), dtype=np.float32)
+        self._raw_actions = np.zeros((capacity, action_dim), dtype=np.float32)
+        self._logprobs = np.zeros(capacity, dtype=np.float32)
+        self._rewards = np.zeros(capacity, dtype=np.float32)
+        self._is_terminals = np.zeros(capacity, dtype=np.bool_)
+        self._ptr = 0
+
+    def push(self, state, action, raw_action, logprob, reward, is_terminal):
+        """Stores one transition into pre-allocated arrays."""
+        i = self._ptr
+        self._states[i] = state
+        self._actions[i] = action
+        self._raw_actions[i] = raw_action
+        self._logprobs[i] = np.asarray(logprob).item()
+        self._rewards[i] = reward
+        self._is_terminals[i] = is_terminal
+        self._ptr += 1
+
+    @property
+    def states(self):
+        return [torch.from_numpy(self._states[i]) for i in range(self._ptr)]
+
+    @property
+    def actions(self):
+        return [torch.from_numpy(self._actions[i]) for i in range(self._ptr)]
+
+    @property
+    def raw_actions(self):
+        return [torch.from_numpy(self._raw_actions[i]) for i in range(self._ptr)]
+
+    @property
+    def logprobs(self):
+        return [torch.tensor(self._logprobs[i]) for i in range(self._ptr)]
+
+    @property
+    def rewards(self):
+        return self._rewards[:self._ptr].tolist()
+
+    @property
+    def is_terminals(self):
+        return self._is_terminals[:self._ptr].tolist()
+
+    def get_tensors(self, device):
+        """Returns all data as pre-stacked tensors on the given device (fast path)."""
+        n = self._ptr
+        states = torch.from_numpy(self._states[:n]).to(device)
+        actions = torch.from_numpy(self._actions[:n]).to(device)
+        raw_actions = torch.from_numpy(self._raw_actions[:n]).to(device)
+        logprobs = torch.from_numpy(self._logprobs[:n]).to(device)
+        is_terminals = torch.from_numpy(self._is_terminals[:n]).to(device)
+        return states, actions, raw_actions, logprobs, is_terminals
 
     def clear(self):
-        """Clears all stored trajectory data from memory."""
-        del self.states[:], self.actions[:], self.raw_actions[:], self.logprobs[:], self.rewards[:], self.is_terminals[:]
+        """Resets pointer to reuse pre-allocated memory."""
+        self._ptr = 0
 
 def train_agent(agent_name, agent, logger):
     """Primary training loop for a specified RL agent.
@@ -71,6 +125,14 @@ def train_agent(agent_name, agent, logger):
         logger (DataLogger): The logging utility for tracking metrics.
     """
     print(f"\n--- Starting Training: {agent_name} ---")
+    if RESUME_TRAINING:
+        load_path = os.path.join("policy", f"{agent_name}_final_weights.pth")
+        if os.path.exists(load_path):
+            print(f"Resuming training from {load_path}")
+            agent.policy.load_state_dict(torch.load(load_path))
+        else:
+            print(f"Warning: {load_path} not found. Starting from scratch.")
+
     env = PhycocyaninEnvSafe() if agent_name == "safe_RL agent" else PhycocyaninEnvBench()
     memory = Memory()
     scheduler = LinearLR(agent.optimizer, start_factor=1.0, end_factor=MIN_LR / LR_ACTOR, total_iters=MAX_EPISODES)
@@ -99,16 +161,11 @@ def train_agent(agent_name, agent, logger):
 
             action, log_prob, raw_act = agent.select_action(state)
 
-            memory.states.append(torch.tensor(state, dtype=torch.float32))
-            memory.actions.append(torch.tensor(action, dtype=torch.float32))
-            memory.raw_actions.append(torch.tensor(raw_act, dtype=torch.float32))
-            memory.logprobs.append(torch.tensor(log_prob, dtype=torch.float32))
+            next_state, reward, done, info = env.step(action)
 
-            state, reward, done, info = env.step(action)
-
+            memory.push(state, action, raw_act, log_prob, reward, done)
             current_ep_reward += reward
-            memory.rewards.append(reward)
-            memory.is_terminals.append(done)
+            state = next_state
 
             if time_step % UPDATE_TIMESTEP == 0:
                 agent.learn(memory)
@@ -223,7 +280,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
                 state_t = torch.FloatTensor(noisy_state).to(
                     torch.device("cuda" if torch.cuda.is_available() else "cpu")).unsqueeze(0)
                 if agent_name == "safe_RL agent":
-                    z, _, _, eval_hidden = agent.policy.act(state_t, eval_hidden)
+                    z, _, _, eval_hidden, _, _, _ = agent.policy.act(state_t, eval_hidden)
                 else:
                     z, _, _ = agent.policy.act(state_t)
                 intent = z.cpu().numpy().flatten()

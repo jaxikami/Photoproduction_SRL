@@ -82,7 +82,7 @@ def generate_gantt():
     
     # Grid and ticks
     ax.set_xticks(np.arange(0, 1001, 100))
-    ax.grid(axis='x', linestyle='--', alpha=0.5)
+    ax.grid(False)
 
     # Create manual legend patches
     legend_patches = [

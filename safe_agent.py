@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch.distributions import Normal
 import numpy as np
 import os
+from numba import njit
 from pretrain import ActionProjectionNetwork
 
 # Hardware acceleration setup
@@ -20,6 +21,20 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.backends.cudnn.enabled = False
 if hasattr(torch.backends, 'miopen'):
     torch.backends.miopen.enabled = False
+
+
+@njit(cache=True)
+def _discount_rewards(raw_rewards, terminals, gamma):
+    """Numba-accelerated GAE-style reward discounting."""
+    n = len(raw_rewards)
+    discounted = np.zeros(n, dtype=np.float32)
+    running = 0.0
+    for i in range(n - 1, -1, -1):
+        if terminals[i]:
+            running = 0.0
+        running = raw_rewards[i] + gamma * running
+        discounted[i] = running
+    return discounted
 
 
 # =============================================================================
@@ -95,6 +110,9 @@ class ActorCritic(nn.Module):
                 - log_prob (torch.Tensor): Log probability of chosen action.
                 - z_raw (torch.Tensor): Unbounded Gaussian sample.
                 - hidden_new (torch.Tensor): Updated GRU hidden state.
+                - masked_mean (torch.Tensor): Distribution mean (for log-prob reuse).
+                - masked_std (torch.Tensor): Distribution std (for log-prob reuse).
+                - mask (torch.Tensor): Stage action mask.
         """
         from env_core import PhycocyaninEnvCore
 
@@ -107,8 +125,10 @@ class ActorCritic(nn.Module):
 
         # Skip connection: concatenate GRU features with raw state
         features = torch.cat([gru_out, state], dim=-1)  # (batch, hidden_dim + state_dim)
+        features = torch.nan_to_num(features, nan=0.0)
 
         mean = self.actor(features)
+        mean = torch.nan_to_num(mean, nan=0.0)
         std  = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
 
         # Stage mask from observation
@@ -131,7 +151,7 @@ class ActorCritic(nn.Module):
 
         log_prob = (dist.log_prob(z_raw) * mask).sum(dim=-1)
 
-        return z.detach(), log_prob.detach(), z_raw.detach(), hidden_new.detach()
+        return z.detach(), log_prob.detach(), z_raw.detach(), hidden_new.detach(), masked_mean.detach(), masked_std.detach(), mask.detach()
 
     def evaluate(self, state, z_raw, is_terminals=None):
         """Re-evaluates stored intents during the PPO update with GRU context.
@@ -148,18 +168,26 @@ class ActorCritic(nn.Module):
         Returns:
             tuple: (log_probs, state_values, dist_entropy)
         """
-        from env_core import PhycocyaninEnvCore
+        features = self.compute_features(state, is_terminals)
+        return self.evaluate_from_features(features, state, z_raw)
 
+    def compute_features(self, state, is_terminals=None):
+        """Runs the GRU over full sequences to produce temporal features.
+
+        Args:
+            state (torch.Tensor): Batch of state tensors (T, state_dim).
+            is_terminals (torch.Tensor or None): Episode boundary flags (T,).
+
+        Returns:
+            torch.Tensor: Feature tensor of shape (T, hidden_dim + state_dim).
+        """
         T = state.shape[0]
 
-        # Find episode boundaries to process in chunks
         if is_terminals is not None:
-            # Indices where episodes end (terminal flag is True)
             boundary_indices = torch.where(is_terminals)[0].tolist()
         else:
             boundary_indices = []
 
-        # Build segment start/end list
         segments = []
         start = 0
         for end_idx in boundary_indices:
@@ -168,32 +196,86 @@ class ActorCritic(nn.Module):
         if start < T:
             segments.append((start, T))
 
-        # Process each segment as a batched GRU sequence
         features = torch.empty(T, self.hidden_dim + state.shape[-1], device=state.device)
         for seg_start, seg_end in segments:
-            seg_states = state[seg_start:seg_end].unsqueeze(1)  # (L, 1, state_dim)
+            seg_states = state[seg_start:seg_end].unsqueeze(1)
             hidden = self.init_hidden(batch_size=1)
-            gru_out, _ = self.gru(seg_states, hidden)  # (L, 1, hidden_dim)
-            gru_out = gru_out.squeeze(1)  # (L, hidden_dim)
+            gru_out, _ = self.gru(seg_states, hidden)
+            gru_out = gru_out.squeeze(1)
             features[seg_start:seg_end] = torch.cat(
                 [gru_out, state[seg_start:seg_end]], dim=-1)
 
+        features = torch.nan_to_num(features, nan=0.0)
+        return features
+
+    def evaluate_from_features(self, features, state, z_raw):
+        """Evaluates log-probs, values, entropy from pre-computed GRU features.
+
+        Args:
+            features (torch.Tensor): (T, hidden_dim + state_dim) from compute_features.
+            state (torch.Tensor): Batch of state tensors (T, state_dim) for masking.
+            z_raw (torch.Tensor): Batch of unbounded actions (T, action_dim).
+
+        Returns:
+            tuple: (log_probs, state_values, dist_entropy)
+        """
+        from env_core import PhycocyaninEnvCore
+
         mean = self.actor(features)
+        mean = torch.nan_to_num(mean, nan=0.0)
         std  = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
 
         mask = PhycocyaninEnvCore.get_action_mask(state[..., :self.env_state_dim])
 
         default_intent = torch.full_like(mean, -10.0)
-        default_intent[..., 0] = -0.4329  # time_mult default: neutral 1.0 multiplier
+        default_intent[..., 0] = -0.4329
         masked_mean = mean * mask + default_intent * (1 - mask)
         masked_std  = std * mask + 1e-8 * (1 - mask)
 
         dist = Normal(masked_mean, masked_std)
-
         log_probs    = (dist.log_prob(z_raw) * mask).sum(dim=-1)
         dist_entropy = (dist.entropy() * mask).sum(dim=-1)
+
         state_values = self.critic(features)
         return log_probs, state_values, dist_entropy
+
+    def evaluate_single(self, state, z_raw, hidden=None):
+        """Evaluates one state-action pair under a provided GRU hidden state.
+
+        This is used during rollout to compute a behavior-consistent log-prob
+        for the actually executed (projected) action.
+
+        Args:
+            state (torch.Tensor): Tensor of shape (1, state_dim).
+            z_raw (torch.Tensor): Tensor of shape (1, action_dim), pre-tanh.
+            hidden (torch.Tensor or None): GRU hidden state at this timestep.
+
+        Returns:
+            tuple: (log_prob, state_value, dist_entropy, hidden_new)
+        """
+        from env_core import PhycocyaninEnvCore
+
+        if hidden is None:
+            hidden = self.init_hidden(batch_size=state.shape[0])
+
+        gru_out, hidden_new = self.gru(state.unsqueeze(0), hidden)
+        gru_out = gru_out.squeeze(0)
+        features = torch.cat([gru_out, state], dim=-1)
+
+        mean = self.actor(features)
+        std  = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
+
+        mask = PhycocyaninEnvCore.get_action_mask(state[..., :self.env_state_dim])
+        default_intent = torch.full_like(mean, -10.0)
+        default_intent[..., 0] = -0.4329
+        masked_mean = mean * mask + default_intent * (1 - mask)
+        masked_std  = std * mask + 1e-8 * (1 - mask)
+
+        dist = Normal(masked_mean, masked_std)
+        log_prob = (dist.log_prob(z_raw) * mask).sum(dim=-1)
+        dist_entropy = (dist.entropy() * mask).sum(dim=-1)
+        state_value = self.critic(features)
+        return log_prob, state_value, dist_entropy, hidden_new
 
 
 class SPRL_Agent:
@@ -242,9 +324,9 @@ class SPRL_Agent:
 
         # Pre-allocate constant tensors for select_action hot path
         self._default_squashed = torch.tensor([-0.407, -1.0, -1.0, -1.0], device=device)
+        self._state_buffer = torch.zeros(1, state_dim, device=device)  # Reusable input buffer
 
-        self.MseLoss           = nn.MSELoss()
-        self.mapping_criterion = nn.MSELoss()
+        self.MseLoss = nn.MSELoss()
 
     def reset_hidden(self):
         """Reset GRU hidden state at episode start."""
@@ -259,7 +341,7 @@ class SPRL_Agent:
         self._proj_calls = self._proj_noop = self._proj_iters = 0
         return {'calls': calls, 'noop': noop, 'iters': iters, 'avg_it': avg_it}
 
-    def _project_to_safe(self, state_norm, action, lr=0.4, max_steps=7, threshold=0.95):
+    def _project_to_safe(self, state_norm, action, lr=0.5, max_steps=4, threshold=0.711):
         """Gradient-ascend the APN margin surface to find a safe action proxy.
 
         If the initially proposed action is unsafe, this method performs gradient
@@ -351,16 +433,14 @@ class SPRL_Agent:
                 - log_prob (np.ndarray): Log probability of the raw intent.
                 - z_raw (np.ndarray): Unbounded intent pre-projection.
         """
-        from env_core import PhycocyaninEnvCore
 
         with torch.no_grad():
             state_t = torch.FloatTensor(state_norm).to(device).unsqueeze(0)
 
             # Generate intent via GRU actor (mask baked into act())
-            z, log_prob, z_raw, self._hidden = self.policy_old.act(state_t, self._hidden)
+            z, log_prob, z_raw, self._hidden, dist_mean, dist_std, mask = self.policy_old.act(state_t, self._hidden)
 
             # Apply SERL mask checkpoint 2 (pre-APN)
-            mask = PhycocyaninEnvCore.get_action_mask(state_t)
             z_masked = z * mask + self._default_squashed * (1 - mask)
 
         # APN gradient projection
@@ -370,65 +450,104 @@ class SPRL_Agent:
         with torch.no_grad():
             u_safe = u_safe * mask + self._default_squashed * (1 - mask)
 
-        # CRITICAL: store u_safe (the actually-executed action) as raw_action
-        # so PPO update gradients align with what was truly executed in the env.
-        # Using z_raw (pre-APN) would teach the policy to reproduce unsafe actions.
+        # Convert executed squashed action to pre-tanh space for PPO storage.
+        # This keeps memory.raw_actions aligned with what was executed in env.
         u_safe_np = u_safe.cpu().numpy().flatten()
+        u_safe_raw_np = np.arctanh(np.clip(u_safe_np, -0.999999, 0.999999))
+
+        # Compute log-prob for projected action analytically from cached distribution.
+        # This avoids a redundant GRU forward pass — same result as evaluate_single.
+        with torch.no_grad():
+            u_safe_raw_t = torch.FloatTensor(u_safe_raw_np).to(device).unsqueeze(0)
+            dist = Normal(dist_mean, dist_std)
+            log_prob_exec = (dist.log_prob(u_safe_raw_t) * mask).sum(dim=-1)
+
         return (u_safe_np,
-                log_prob.cpu().numpy(),
-                z_raw.cpu().numpy().flatten())
+                log_prob_exec.cpu().numpy(),
+                u_safe_raw_np)
 
     def learn(self, memory):
-        """Executes the PPO update with sequential GRU processing and manifold-mapping penalty.
+        """Executes the PPO update with chunked GRU processing.
 
         Args:
             memory (Memory): Buffer containing collected trajectories.
         """
-        rewards = []
-        discounted_reward = 0
-        for reward, is_terminal in zip(reversed(memory.rewards), reversed(memory.is_terminals)):
-            if is_terminal:
-                discounted_reward = 0
-            discounted_reward = reward + (self.gamma * discounted_reward)
-            rewards.insert(0, discounted_reward)
+        # Fast vectorized reward discounting using numba
+        if hasattr(memory, '_rewards'):
+            # Fast path: use pre-allocated numpy arrays directly
+            raw_rewards = memory._rewards[:memory._ptr].copy()
+            terminals = memory._is_terminals[:memory._ptr].astype(np.float32)
+        else:
+            raw_rewards = np.array(memory.rewards, dtype=np.float32)
+            terminals = np.array(memory.is_terminals, dtype=np.float32)
+        discounted = _discount_rewards(raw_rewards, terminals, self.gamma)
 
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
+        rewards = torch.from_numpy(discounted).to(device)
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
-        old_states    = torch.squeeze(torch.stack(memory.states, dim=0)).detach().to(device)
-        old_z_raw     = torch.squeeze(torch.stack(memory.raw_actions, dim=0)).detach().to(device)
-        old_logprobs  = torch.squeeze(torch.stack(memory.logprobs, dim=0)).detach().to(device)
-        old_safe_acts = torch.squeeze(torch.stack(memory.actions, dim=0)).detach().to(device)
-        is_terminals  = torch.tensor(memory.is_terminals, dtype=torch.bool).to(device)
+        # Use fast pre-stacked tensor path if available
+        if hasattr(memory, 'get_tensors'):
+            old_states, _, old_z_raw, old_logprobs, is_terminals = memory.get_tensors(device)
+        else:
+            old_states    = torch.squeeze(torch.stack(memory.states, dim=0)).detach().to(device)
+            old_z_raw     = torch.squeeze(torch.stack(memory.raw_actions, dim=0)).detach().to(device)
+            old_logprobs  = torch.squeeze(torch.stack(memory.logprobs, dim=0)).detach().to(device)
+            is_terminals  = torch.tensor(memory.is_terminals, dtype=torch.bool).to(device)
+
+        # Pre-compute fixed advantages once (stable target across all epochs, like Standard RL)
+        with torch.no_grad():
+            _, old_state_values, _ = self.policy.evaluate(
+                old_states, old_z_raw, is_terminals=is_terminals)
+            advantages = rewards - old_state_values.squeeze()
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        batch_size     = old_states.size(0)
+        mini_batch_size = 256
 
         for _ in range(self.K_epochs):
-            logprobs, state_values, dist_entropy = self.policy.evaluate(
-                old_states, old_z_raw, is_terminals=is_terminals)
-
-            ratios     = torch.exp(logprobs - old_logprobs)
-            advantages = rewards - state_values.detach().squeeze()
-            surr1      = ratios * advantages
-            surr2      = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-            ppo_loss   = -torch.min(surr1, surr2).mean()
-
-            # Manifold-mapping regression penalty matching Fermentation PPO
-            z_sq = torch.tanh(old_z_raw)
+            # GRU features computed once per epoch then detached — temporal context
+            # is preserved but actor/critic get fresh forward passes per mini-batch
+            # (matching the fermentation PPO update mechanism exactly).
             with torch.no_grad():
-                margin = self.safeguard(old_states, z_sq)
-                # Apply higher weight to more severe violations
-                unsafe_weight = torch.clamp(-margin, min=0.0) + 0.1
-            
-            per_sample_loss = (z_sq - old_safe_acts.detach()).pow(2).mean(dim=-1)
-            mapping_penalty = (per_sample_loss * unsafe_weight).mean()
+                features_all = self.policy.compute_features(
+                    old_states, is_terminals=is_terminals)
 
-            loss = (ppo_loss
-                    + 0.5  * self.MseLoss(state_values.squeeze(), rewards)
-                    - self.entropy_coeff * dist_entropy.mean()
-                    + 0.01 * mapping_penalty)  # matched to 0.01 from fermentation PPO
+            permutation = torch.randperm(batch_size)
+            for start_idx in range(0, batch_size, mini_batch_size):
+                batch_indices = permutation[start_idx : start_idx + mini_batch_size]
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
-            self.optimizer.step()
+                b_features = features_all[batch_indices]
+                b_states   = old_states[batch_indices]
+                b_z_raw    = old_z_raw[batch_indices]
+                b_old_lp   = old_logprobs[batch_indices]
+                b_rewards  = rewards[batch_indices]
+                b_adv      = advantages[batch_indices]
+
+                logprobs, state_values, dist_entropy = self.policy.evaluate_from_features(
+                    b_features, b_states, b_z_raw)
+
+                ratios = torch.exp(logprobs - b_old_lp)
+                surr1  = ratios * b_adv
+                surr2  = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * b_adv
+                ppo_loss = -torch.min(surr1, surr2).mean()
+
+                loss = (ppo_loss
+                        + 0.5  * self.MseLoss(state_values.squeeze(), b_rewards)
+                        - self.entropy_coeff * dist_entropy.mean())
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    self.policy.load_state_dict(self.policy_old.state_dict())
+                    self.policy_old.load_state_dict(self.policy.state_dict())
+                    return
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+                self.optimizer.step()
+
+                if any(torch.isnan(p).any() for p in self.policy.parameters()):
+                    self.policy.load_state_dict(self.policy_old.state_dict())
+                    self.policy_old.load_state_dict(self.policy.state_dict())
+                    return
 
         self.policy_old.load_state_dict(self.policy.state_dict())

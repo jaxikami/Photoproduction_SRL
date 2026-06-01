@@ -56,8 +56,8 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         self.prod_coef    = 0.2    # Gentle stockpile nudge
         self.harvest_coef = 200.0  # Massive payout for physical harvesting
         self.time_penalty = 0.05   # Small operational cost
-        self.smooth_coef  = 0.5    # Action-smoothing penalty coefficient
-        self.raw_mat_coef = 0.5    # Nitrate feed penalty (reduced)
+        self.smooth_coef  = 0.05   # Action-smoothing penalty coefficient
+        self.raw_mat_coef = 0.1    # Nitrate feed penalty (reduced)
 
         # ── Buffer zone activation thresholds ─────────────────────
         # g1/g2: buffer activates at 90% of limit
@@ -122,44 +122,52 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         # ── Fixed-weight barrier + spike constraint penalties ──────
         p_g1 = p_g2 = p_g3 = p_g4 = p_g5 = 0.0
 
-        # g1: Path nitrate (CN ≤ 800 mg/L)
-        n_ratio = self.state[1] / self.N_LIMIT_PATH
-        if n_ratio > self.G1_BUFFER_START:
-            buf_depth = min(1.0, (n_ratio - self.G1_BUFFER_START) /
-                           (1.0 - self.G1_BUFFER_START))
-            p_g1 += self.W_g1_BARRIER * buf_depth ** 2
-        if n_ratio > 1.0:
-            n_viol = n_ratio - 1.0
-            # Superlinear growth makes large g1 violations disproportionately expensive.
-            p_g1 += self.W_g1_SPIKE * n_viol + self.W_g1_QUAD * (n_viol ** 2)
-            self.violation_count    += 1
-            self.g1_violation_count += 1
+        # Only apply instantaneous path constraints (g1, g2, g4) during Stages 0-1
+        # (Growth / Production) where the agent controls I and Fn.
+        # In Stage 2 (Cleanup), I is hard-coded to I_MIN and Fn=0; the agent
+        # only controls F_out, which doesn't affect concentrations.  Cq/Cx
+        # inevitably drifts up as product synthesis continues while growth
+        # stalls from CN depletion — penalising this is unfair.
+        # In Stage 3 (Idle), all controls are masked.
+        if self.current_stage in (0, 1):
+            # g1: Path nitrate (CN ≤ 800 mg/L)
+            n_ratio = self.state[1] / self.N_LIMIT_PATH
+            if n_ratio > self.G1_BUFFER_START:
+                buf_depth = min(1.0, (n_ratio - self.G1_BUFFER_START) /
+                               (1.0 - self.G1_BUFFER_START))
+                p_g1 += self.W_g1_BARRIER * buf_depth ** 2
+            if n_ratio > 1.0:
+                n_viol = n_ratio - 1.0
+                # Superlinear growth makes large g1 violations disproportionately expensive.
+                p_g1 += self.W_g1_SPIKE * n_viol + self.W_g1_QUAD * (n_viol ** 2)
+                self.violation_count    += 1
+                self.g1_violation_count += 1
 
-        # g2: Product ratio (Cq/Cx ≤ 0.011)
-        ratio   = self.state[2] / (self.state[0] + 1e-8)
-        q_ratio = ratio / self.RATIO_LIMIT
-        if q_ratio > self.G2_BUFFER_START:
-            buf_depth = min(1.0, (q_ratio - self.G2_BUFFER_START) /
-                           (1.0 - self.G2_BUFFER_START))
-            p_g2 += self.W_g2_BARRIER * buf_depth ** 2
-        if q_ratio > 1.0:
-            q_viol = q_ratio - 1.0
-            # Superlinear growth makes large g2 violations disproportionately expensive.
-            p_g2 += self.W_g2_SPIKE * q_viol + self.W_g2_QUAD * (q_viol ** 2)
-            self.violation_count    += 1
-            self.g2_violation_count += 1
+            # g2: Product ratio (Cq/Cx ≤ 0.011)
+            ratio   = self.state[2] / (self.state[0] + 1e-8)
+            q_ratio = ratio / self.RATIO_LIMIT
+            if q_ratio > self.G2_BUFFER_START:
+                buf_depth = min(1.0, (q_ratio - self.G2_BUFFER_START) /
+                               (1.0 - self.G2_BUFFER_START))
+                p_g2 += self.W_g2_BARRIER * buf_depth ** 2
+            if q_ratio > 1.0:
+                q_viol = q_ratio - 1.0
+                # Superlinear growth makes large g2 violations disproportionately expensive.
+                p_g2 += self.W_g2_SPIKE * q_viol + self.W_g2_QUAD * (q_viol ** 2)
+                self.violation_count    += 1
+                self.g2_violation_count += 1
 
-        # g4: Volume overflow (V ≤ V_MAX)
-        v_frac        = self.state[3] / self.V_MAX
-        overflow_edge = 1.0 - self.OVERFLOW_BUFFER_FRAC
-        if v_frac > overflow_edge:
-            buf_depth = min(1.0, (v_frac - overflow_edge) / self.OVERFLOW_BUFFER_FRAC)
-            p_g4 += self.W_BARRIER * buf_depth ** 2
-        overflow_viol = max(0.0, v_frac - 1.0)
-        if overflow_viol > 0:
-            p_g4 += self.W_g4_SPIKE * overflow_viol
-            self.violation_count    += 1
-            self.g4_violation_count += 1
+            # g4: Volume overflow (V ≤ V_MAX)
+            v_frac        = self.state[3] / self.V_MAX
+            overflow_edge = 1.0 - self.OVERFLOW_BUFFER_FRAC
+            if v_frac > overflow_edge:
+                buf_depth = min(1.0, (v_frac - overflow_edge) / self.OVERFLOW_BUFFER_FRAC)
+                p_g4 += self.W_BARRIER * buf_depth ** 2
+            overflow_viol = max(0.0, v_frac - 1.0)
+            if overflow_viol > 0:
+                p_g4 += self.W_g4_SPIKE * overflow_viol
+                self.violation_count    += 1
+                self.g4_violation_count += 1
 
         constraint_penalty = p_g1 + p_g2 + p_g4
 

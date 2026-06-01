@@ -9,9 +9,24 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 import numpy as np
+from numba import njit
 
 # Hardware setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+@njit(cache=True)
+def _discount_rewards(raw_rewards, terminals, gamma):
+    """Numba-accelerated reward discounting."""
+    n = len(raw_rewards)
+    discounted = np.zeros(n, dtype=np.float32)
+    running = 0.0
+    for i in range(n - 1, -1, -1):
+        if terminals[i]:
+            running = 0.0
+        running = raw_rewards[i] + gamma * running
+        discounted[i] = running
+    return discounted
 
 
 class ActorCriticStandardRL(nn.Module):
@@ -176,19 +191,25 @@ class StandardRL_Agent:
             memory (Memory): Buffer containing states, actions, rewards, and logprobs
                 collected during the recent trajectory rollout.
         """
-        rewards = []
-        discounted_reward = 0
-        for reward, is_terminal in zip(reversed(memory.rewards), reversed(memory.is_terminals)):
-            if is_terminal: discounted_reward = 0
-            discounted_reward = reward + (self.gamma * discounted_reward)
-            rewards.insert(0, discounted_reward)
+        # Fast vectorized reward discounting using numba
+        if hasattr(memory, '_rewards'):
+            raw_rewards = memory._rewards[:memory._ptr].copy()
+            terminals = memory._is_terminals[:memory._ptr].astype(np.float32)
+        else:
+            raw_rewards = np.array(memory.rewards, dtype=np.float32)
+            terminals = np.array(memory.is_terminals, dtype=np.float32)
+        discounted = _discount_rewards(raw_rewards, terminals, self.gamma)
 
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
+        rewards = torch.from_numpy(discounted).to(device)
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
-        old_states = torch.squeeze(torch.stack(memory.states, dim=0)).detach().to(device)
-        old_z_raw = torch.squeeze(torch.stack(memory.raw_actions, dim=0)).detach().to(device)
-        old_logprobs = torch.squeeze(torch.stack(memory.logprobs, dim=0)).detach().to(device)
+        # Use fast pre-stacked tensor path if available
+        if hasattr(memory, 'get_tensors'):
+            old_states, _, old_z_raw, old_logprobs, _ = memory.get_tensors(device)
+        else:
+            old_states = torch.squeeze(torch.stack(memory.states, dim=0)).detach().to(device)
+            old_z_raw = torch.squeeze(torch.stack(memory.raw_actions, dim=0)).detach().to(device)
+            old_logprobs = torch.squeeze(torch.stack(memory.logprobs, dim=0)).detach().to(device)
 
         # Precalculate and normalize advantages over the entire batch
         with torch.no_grad():
