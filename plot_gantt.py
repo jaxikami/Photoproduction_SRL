@@ -9,13 +9,13 @@ import os
 
 def generate_gantt():
     # Load evaluation npz files
-    safe_path = "eval_data_safe.npz"
-    std_path = "eval_data_standard.npz"
+    safe_path = os.path.join("policy", "eval_data_safe.npz")
+    std_path = os.path.join("policy", "eval_data_standard.npz")
     
     if not os.path.exists(safe_path) or not os.path.exists(std_path):
-        print("Error: Make sure both eval_data_safe.npz and eval_data_standard.npz exist.")
-        print(f"eval_data_safe.npz exists: {os.path.exists(safe_path)}")
-        print(f"eval_data_standard.npz exists: {os.path.exists(std_path)}")
+        print("Error: Make sure both policy/eval_data_safe.npz and policy/eval_data_standard.npz exist.")
+        print(f"policy/eval_data_safe.npz exists: {os.path.exists(safe_path)}")
+        print(f"policy/eval_data_standard.npz exists: {os.path.exists(std_path)}")
         return
 
     safe_data = np.load(safe_path)

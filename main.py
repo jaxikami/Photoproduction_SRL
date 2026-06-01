@@ -380,7 +380,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
 
     # Save evaluation data to npz for comparative plotting (e.g. Gantt charts)
     suffix = "safe" if "safe" in agent_name.lower() else "standard"
-    npz_path = f"eval_data_{suffix}.npz"
+    npz_path = os.path.join("policy", f"eval_data_{suffix}.npz")
     stages = np.array([info["current_stage"] for info in median_infos])
     # Match the stages array to the 101 elements of states (append last stage)
     stages_101 = np.append(stages, stages[-1])
