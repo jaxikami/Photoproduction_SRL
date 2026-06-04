@@ -120,17 +120,17 @@ class PhycocyaninEnvCore:
     Multi-stage photobioreactor RL environment core.
 
     Stages:
-        0 — Growth:     Rapid biomass accumulation (I: 120-400, Fn: 0-40)
-        1 — Production: Bioproduct synthesis      (I: 120-400, Fn: 0-10)
-        2 — Cleanup:    Reactor harvest/drain      (Fout active, I/Fn masked)
+        0 — Inoculation: Rapid biomass accumulation (I: 120-400, Fn: 0-40)
+        1 — Growth:       Bioproduct synthesis      (I: 120-400, Fn: 0-10)
+        2 — Harvesting:   Reactor harvest/drain      (Fout active, I/Fn masked)
                         → stage 3 (volume latch) OR stage 0 (credit expiry, partial reset)
-        3 — Idle:       Reactor off, system shutdown (all masked)
+        3 — Idle:         Reactor off, system shutdown (all masked)
 
     Action dimensions (4):
-        0 — Time multiplier  (0.5–2.0, active in Growth/Production)
-        1 — Light intensity  (120–400 μmol/m²/s, active in Growth/Production)
-        2 — Nitrate feed     (0–40 or 0–10 mg/L/h, active in Growth/Production)
-        3 — Outstream flow   (0–Fout_max L/h, active in Cleanup only)
+        0 — Time multiplier  (0.5–2.0, active in Inoculation/Growth)
+        1 — Light intensity  (120–400 μmol/m²/s, active in Inoculation/Growth)
+        2 — Nitrate feed     (0–40 or 0–10 mg/L/h, active in Inoculation/Growth)
+        3 — Outstream flow   (0–Fout_max L/h, active in Harvesting only)
     """
 
     def __init__(self):
@@ -142,7 +142,7 @@ class PhycocyaninEnvCore:
         # --- Stage Config ---
         self.n_stage = 4
         self.BASE_CREDITS = np.array([163.0, 81.0, 68.0, 0.0])
-        #                              Growth  Prod  Cleanup  Idle
+        #                              Inoc   Growth  Harvest  Idle
 
         # --- Physical Action Boundaries ---
         self.I_MIN, self.I_MAX = 120.0, 400.0
@@ -293,16 +293,16 @@ class PhycocyaninEnvCore:
         Returns:
             torch.Tensor: Binary mask of shape [..., 4] where 1.0 indicates an
                 active action dimension and 0.0 indicates a masked dimension.
-                - dim 0 (time multiplier): Active in Growth/Prod.
-                - dim 1 (light intensity): Active in Growth/Prod.
-                - dim 2 (nitrate feed): Active in Growth/Prod.
-                - dim 3 (outstream flow): Active in Cleanup only.
+                - dim 0 (time multiplier): Active in Inoculation/Growth.
+                - dim 1 (light intensity): Active in Inoculation/Growth.
+                - dim 2 (nitrate feed): Active in Inoculation/Growth.
+                - dim 3 (outstream flow): Active in Harvesting only.
         """
         import torch
         # Stage one-hot at indices 4:8
-        stage_0 = state_tensor[..., 4]   # Growth
-        stage_1 = state_tensor[..., 5]   # Production
-        stage_2 = state_tensor[..., 6]   # Cleanup
+        stage_0 = state_tensor[..., 4]   # Inoculation
+        stage_1 = state_tensor[..., 5]   # Growth
+        stage_2 = state_tensor[..., 6]   # Harvesting
         # stage_3 = state_tensor[..., 7]  # Idle — all masked
 
         mask_time = stage_0 + stage_1
@@ -316,7 +316,7 @@ class PhycocyaninEnvCore:
         """Calculates a smooth transition factor in the range [0, 1].
 
         Used to create hysteretic switching logic, primarily for blending
-        Cleanup and Idle stages smoothly.
+        Harvesting and Idle stages smoothly.
 
         Args:
             x (float): Input value to the sigmoid.
@@ -329,9 +329,9 @@ class PhycocyaninEnvCore:
         return 1.0 / (1.0 + np.exp(-(x - center) / max(width, 0.01)))
 
     def _partial_reset_reactor(self):
-        """Resets the physical reactor state for a new Growth batch.
+        """Resets the physical reactor state for a new Inoculation batch.
 
-        This is invoked when the reactor successfully drains during Cleanup
+        This is invoked when the reactor successfully drains during Harvesting
         and there is enough episode time left to run another batch cycle.
         It preserves the episode's time, step count, and cumulative rewards/penalties
         while resetting the physical concentrations, volume, and nutrient supply.
@@ -376,7 +376,7 @@ class PhycocyaninEnvCore:
             # Outstream masked
             F_out = 0.0
         elif self.current_stage == 2:
-            # Cleanup: only outstream active
+            # Harvesting: only outstream active
             multiplier = 1.0
             I_phys  = self.I_MIN  # baseline
             Fn_phys = 0.0
@@ -399,7 +399,7 @@ class PhycocyaninEnvCore:
         elif self.nitrate_supply <= 0:
             Fn_phys = 0.0
 
-        # ── Hysteretic Sigmoid Blending (Cleanup → Idle) ─────────────
+        # ── Hysteretic Sigmoid Blending (Harvesting → Idle) ─────────────
         blend = 0.0
         if self.current_stage == 2:
             if not self._cleanup_latch and self.state[3] < self.V_DRAIN:
@@ -443,7 +443,7 @@ class PhycocyaninEnvCore:
                     time_remaining = self.total_time - self.time
                     
                     if time_remaining >= min_time_for_cycle:
-                        # Backtrack to Growth (stage 0) to start a new batch
+                        # Backtrack to Inoculation (stage 0) to start a new batch
                         self._partial_reset_reactor()
                         self.current_stage = 0
                         self.stage_credits = float(self.BASE_CREDITS[0])

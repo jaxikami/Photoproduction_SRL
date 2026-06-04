@@ -24,7 +24,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         g1 (path):     Nitrate CN <= N_LIMIT_PATH (800 mg/L)        — λ_g1, buffer + spike
         g2 (path):     Cq/Cx ratio <= RATIO_LIMIT (0.011)           — λ_g2, buffer + spike
         g3 (terminal): CN <= N_LIMIT_TERM (150 mg/L) — λ_g3 spike applied at every
-            Stage 1→2 transition and at episode end
+            Stage 1→2 (Growth→Harvesting) transition and at episode end
         g4 (path):     Reactor volume <= V_MAX                      — λ_g4, buffer + spike
         g5 (terminal): Episode MUST end in Idle stage (stage 3)     — λ_g5, HARD terminal spike
 
@@ -145,7 +145,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         Lagrangian multipliers dynamically based on violations.
 
         g3 is evaluated on any step where a Stage 1→2 transition occurs (i.e.
-        whenever Production ends and Cleanup begins) as well as on the final
+        whenever Growth ends and Harvesting begins) as well as on the final
         step of the episode.  λ_g3 is updated each time a violation is
         detected, allowing it to accumulate pressure across multiple batches
         within the same episode.
@@ -178,8 +178,8 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         p_g1 = p_g2 = p_g3 = p_g4 = p_g5 = 0.0
 
         # Only apply instantaneous path constraints (g1, g2, g4) during Stages 0-1
-        # (Growth / Production) where the agent controls I and Fn.
-        # In Stage 2 (Cleanup), I is hard-coded to I_MIN and Fn=0; the agent
+        # (Inoculation / Growth) where the agent controls I and Fn.
+        # In Stage 2 (Harvesting), I is hard-coded to I_MIN and Fn=0; the agent
         # only controls F_out, which doesn't affect concentrations.  Cq/Cx
         # inevitably drifts up as product synthesis continues while growth
         # stalls from CN depletion — penalising this is unfair.

@@ -29,16 +29,16 @@ def generate_gantt():
 
     # Stage metadata: labels, colors, and descriptions
     stage_colors = {
-        0: '#4c72b0',  # Growth: muted blue
-        1: '#dd8452',  # Production: muted orange
-        2: '#55a868',  # Cleanup: muted green
+        0: '#4c72b0',  # Inoculation: muted blue
+        1: '#dd8452',  # Growth: muted orange
+        2: '#55a868',  # Harvesting: muted green
         3: '#c44e52'   # Idle: muted red
     }
     
     stage_labels = {
-        0: 'Growth (Stage 0)',
-        1: 'Production (Stage 1)',
-        2: 'Cleanup (Stage 2)',
+        0: 'Inoculation (Stage 0)',
+        1: 'Growth (Stage 1)',
+        2: 'Harvesting (Stage 2)',
         3: 'Idle (Stage 3)'
     }
 
