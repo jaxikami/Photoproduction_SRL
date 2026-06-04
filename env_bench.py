@@ -19,7 +19,8 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
     Constraints:
         g1 (path):     Nitrate CN <= N_LIMIT_PATH (800 mg/L)        — barrier + spike
         g2 (path):     Cq/Cx ratio <= RATIO_LIMIT (0.011)           — barrier + spike
-        g3 (terminal): CN <= N_LIMIT_TERM (150 mg/L) at episode end — spike
+        g3 (terminal): CN <= N_LIMIT_TERM (150 mg/L) — spike applied at every
+            Stage 1→2 transition and at episode end
         g4 (path):     Reactor volume <= V_MAX                      — barrier + spike
         g5 (terminal): Episode MUST end in Idle stage (stage 3)     — HARD spike
 
@@ -98,6 +99,12 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         Calculates the physics update, evaluates all constraint margins, applies
         fixed penalties for constraint violations, and computes the step reward.
 
+        g3 is evaluated on any step where a Stage 1→2 transition occurs (i.e.
+        whenever Production ends and Cleanup begins) as well as on the final
+        step of the episode.  This ensures the agent is penalised for high
+        nitrate at the moment it exits the Production stage, not only at
+        episode termination.
+
         Args:
             action (np.ndarray): The raw action vector [time_mult, I, Fn, F_out]
                 proposed by the agent, bounded to [-1.0, 1.0].
@@ -110,8 +117,10 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
                 - info (dict): Diagnostic dictionary containing violation metrics.
         """
         prev_harvested = self.total_cq_harvested
+        prev_stage = self.current_stage          # capture BEFORE physics step
         a_clipped, Fn_phys, done = self._physics_step(action)
         harvested_step = self.total_cq_harvested - prev_harvested
+        stage_transitioned_to_cleanup = (prev_stage == 1 and self.current_stage == 2)
 
         # ── Production & Harvest rewards (dense) ───────────────────
         # Small reward for holding product
@@ -210,14 +219,16 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
 
         # ── Terminal checks ────────────────────────────────────────
 
-        if done:
-            # g3: Terminal nitrate (hard spike)
+        # g3: Terminal nitrate — checked at Stage 1→2 transition AND at episode end
+        if stage_transitioned_to_cleanup or done:
             t_ratio = self.state[1] / self.N_LIMIT_TERM
             if t_ratio > 1.0:
                 p_g3 += self.W_g3_SPIKE * (t_ratio - 1.0)
                 step_reward -= p_g3
                 self.violation_count    += 1
                 self.g3_violation_count += 1
+
+        if done:
 
             # g5: Must end in Idle stage (hard constraint — fixed large penalty)
             if self.current_stage != 3:

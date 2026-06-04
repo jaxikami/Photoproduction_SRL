@@ -23,11 +23,15 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
     Constraints:
         g1 (path):     Nitrate CN <= N_LIMIT_PATH (800 mg/L)        — λ_g1, buffer + spike
         g2 (path):     Cq/Cx ratio <= RATIO_LIMIT (0.011)           — λ_g2, buffer + spike
-        g3 (terminal): CN <= N_LIMIT_TERM (150 mg/L) at episode end — λ_g3, terminal spike
+        g3 (terminal): CN <= N_LIMIT_TERM (150 mg/L) — λ_g3 spike applied at every
+            Stage 1→2 transition and at episode end
         g4 (path):     Reactor volume <= V_MAX                      — λ_g4, buffer + spike
         g5 (terminal): Episode MUST end in Idle stage (stage 3)     — λ_g5, HARD terminal spike
 
     Note:
+        g3 λ is updated every time a violation is detected — both at Stage 1→2
+        transitions and at episode end — so it accumulates pressure across
+        multiple batches within the same episode.
         g5 is enforced as a hard constraint by using a large fixed IDLE_BASE_SPIKE
         in addition to the adaptive λ_g5, making it expensive regardless of λ warmup.
         By default λ values persist across episodes to accumulate knowledge of
@@ -140,6 +144,12 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         Evaluates the current state margins and updates the corresponding
         Lagrangian multipliers dynamically based on violations.
 
+        g3 is evaluated on any step where a Stage 1→2 transition occurs (i.e.
+        whenever Production ends and Cleanup begins) as well as on the final
+        step of the episode.  λ_g3 is updated each time a violation is
+        detected, allowing it to accumulate pressure across multiple batches
+        within the same episode.
+
         Args:
             action (np.ndarray): The raw action vector [time_mult, I, Fn, F_out]
                 proposed by the agent, bounded to [-1.0, 1.0].
@@ -153,8 +163,10 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
                   and current multiplier values.
         """
         prev_harvested = self.total_cq_harvested
+        prev_stage = self.current_stage          # capture BEFORE physics step
         a_clipped, Fn_phys, done = self._physics_step(action)
         harvested_step = self.total_cq_harvested - prev_harvested
+        stage_transitioned_to_cleanup = (prev_stage == 1 and self.current_stage == 2)
 
         # ── Production & Harvest rewards (dense) ───────────────────
         # Small reward for holding product
@@ -269,8 +281,9 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
 
         # ── Terminal checks ────────────────────────────────────────
 
-        if done:
-            # g3: Terminal nitrate — Lagrangian updated once at end of episode
+        # g3: Terminal nitrate — checked at Stage 1→2 transition AND at episode end
+        # Lagrangian updated each time a violation is detected.
+        if stage_transitioned_to_cleanup or done:
             t_ratio = self.state[1] / self.N_LIMIT_TERM
             if t_ratio > 1.0:
                 viol = t_ratio - 1.0
@@ -282,6 +295,8 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
                 self.g3_violation_count += 1
             else:
                 self.lam_g3 *= (1.0 - self.lag_decay)
+
+        if done:
 
             # g5: Must end in Idle stage — HARD constraint
             # Enforced via large fixed base spike + adaptive λ_g5
