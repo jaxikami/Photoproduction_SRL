@@ -20,7 +20,7 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         g1 (path):     Nitrate CN <= N_LIMIT_PATH (800 mg/L)        — barrier + spike
         g2 (path):     Cq/Cx ratio <= RATIO_LIMIT (0.011)           — barrier + spike
         g3 (terminal): CN <= N_LIMIT_TERM (150 mg/L) — spike applied at every
-            Stage 1→2 (Growth→Harvesting) transition and at episode end
+            Stage 1→2 (Growth→Harvesting) transition
         g4 (path):     Reactor volume <= V_MAX                      — barrier + spike
         g5 (terminal): Episode MUST end in Idle stage (stage 3)     — HARD spike
 
@@ -99,11 +99,10 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         Calculates the physics update, evaluates all constraint margins, applies
         fixed penalties for constraint violations, and computes the step reward.
 
-        g3 is evaluated on any step where a Stage 1→2 transition occurs (i.e.
-        whenever Growth ends and Harvesting begins) as well as on the final
-        step of the episode.  This ensures the agent is penalised for high
-        nitrate at the moment it exits the Growth stage, not only at
-        episode termination.
+        g3 is evaluated on every step where a Stage 1→2 (Growth→Harvesting)
+        transition occurs, i.e. whenever the Growth stage ends and Harvesting
+        begins.  This is the sole enforcement point for the terminal nitrate
+        constraint; it is no longer re-checked at episode termination.
 
         Args:
             action (np.ndarray): The raw action vector [time_mult, I, Fn, F_out]
@@ -219,8 +218,8 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
 
         # ── Terminal checks ────────────────────────────────────────
 
-        # g3: Terminal nitrate — checked at Stage 1→2 transition AND at episode end
-        if stage_transitioned_to_cleanup or done:
+        # g3: Nitrate check at Stage 1→2 (Growth→Harvesting) transition only
+        if stage_transitioned_to_cleanup:
             t_ratio = self.state[1] / self.N_LIMIT_TERM
             if t_ratio > 1.0:
                 p_g3 += self.W_g3_SPIKE * (t_ratio - 1.0)

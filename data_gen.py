@@ -200,7 +200,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
         torch.tensor(1, device=device),
         stage_idx[g2_start:g2_start + n_g2]
     )
-    # Cycle-initial samples: always Growth stage (just started / backtracked)
+    # Cycle-initial samples: always Inoculation stage (just started / backtracked)
     post_start = n_interior + n_g1 + n_g2 + n_g4
     stage_idx[post_start:post_start + n_postcycle] = 0
 
@@ -213,7 +213,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # Supply remaining
     supply_norm = torch.rand(num_samples, device=device)
 
-    # Cycle-initial overrides: fresh Growth credits, supply split pre/post
+    # Cycle-initial overrides: fresh Inoculation credits, supply split pre/post
     n_pre_total = int(n_postcycle * 0.4)
     credit_norm[post_start:post_start + n_postcycle] = (
         0.7 + torch.rand(n_postcycle, device=device) * 0.3)   # near-full credits
@@ -236,7 +236,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # ── Decode physical actions ───────────────────────────────────────────────
     a_scaled = (actions + 1.0) / 2.0
 
-    # Fn depends on stage: Growth uses FN_MAX_GROWTH, Production/Cleanup uses FN_MAX_PROD
+    # Fn depends on stage: Inoculation uses FN_MAX_GROWTH, Growth/Harvesting uses FN_MAX_PROD
     is_growth = stage_onehot[:, 0].bool()
     is_prod   = stage_onehot[:, 1].bool()
     is_cleanup = stage_onehot[:, 2].bool()
@@ -245,8 +245,8 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
                              torch.tensor(0.0, device=device)))
     Fn_phys = a_scaled[:, 2] * fn_max
 
-    # Outstream: only active in Cleanup
-    # Outstream: only active in Cleanup
+    # Outstream: only active in Harvesting
+    # Outstream: only active in Harvesting
     Fout_phys = torch.where(is_cleanup, a_scaled[:, 3] * FOUT_MAX,
                              torch.zeros(num_samples, device=device))
 

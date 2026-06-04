@@ -24,14 +24,14 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         g1 (path):     Nitrate CN <= N_LIMIT_PATH (800 mg/L)        — λ_g1, buffer + spike
         g2 (path):     Cq/Cx ratio <= RATIO_LIMIT (0.011)           — λ_g2, buffer + spike
         g3 (terminal): CN <= N_LIMIT_TERM (150 mg/L) — λ_g3 spike applied at every
-            Stage 1→2 (Growth→Harvesting) transition and at episode end
+            Stage 1→2 (Growth→Harvesting) transition
         g4 (path):     Reactor volume <= V_MAX                      — λ_g4, buffer + spike
         g5 (terminal): Episode MUST end in Idle stage (stage 3)     — λ_g5, HARD terminal spike
 
     Note:
-        g3 λ is updated every time a violation is detected — both at Stage 1→2
-        transitions and at episode end — so it accumulates pressure across
-        multiple batches within the same episode.
+        g3 λ is updated every time a violation is detected at a Stage 1→2
+        transition.  This is the sole enforcement point; g3 is no longer
+        re-checked at episode termination.
         g5 is enforced as a hard constraint by using a large fixed IDLE_BASE_SPIKE
         in addition to the adaptive λ_g5, making it expensive regardless of λ warmup.
         By default λ values persist across episodes to accumulate knowledge of
@@ -144,11 +144,12 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         Evaluates the current state margins and updates the corresponding
         Lagrangian multipliers dynamically based on violations.
 
-        g3 is evaluated on any step where a Stage 1→2 transition occurs (i.e.
-        whenever Growth ends and Harvesting begins) as well as on the final
-        step of the episode.  λ_g3 is updated each time a violation is
-        detected, allowing it to accumulate pressure across multiple batches
-        within the same episode.
+        g3 is evaluated on every step where a Stage 1→2 (Growth→Harvesting)
+        transition occurs, i.e. whenever the Growth stage ends and Harvesting
+        begins.  This is the sole enforcement point for the terminal nitrate
+        constraint; it is no longer re-checked at episode termination.
+        λ_g3 is updated on each detected violation, allowing it to accumulate
+        pressure across multiple batches within the same episode.
 
         Args:
             action (np.ndarray): The raw action vector [time_mult, I, Fn, F_out]
@@ -281,9 +282,9 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
 
         # ── Terminal checks ────────────────────────────────────────
 
-        # g3: Terminal nitrate — checked at Stage 1→2 transition AND at episode end
-        # Lagrangian updated each time a violation is detected.
-        if stage_transitioned_to_cleanup or done:
+        # g3: Nitrate check at Stage 1→2 (Growth→Harvesting) transition only
+        # λ_g3 is updated on each detected violation.
+        if stage_transitioned_to_cleanup:
             t_ratio = self.state[1] / self.N_LIMIT_TERM
             if t_ratio > 1.0:
                 viol = t_ratio - 1.0

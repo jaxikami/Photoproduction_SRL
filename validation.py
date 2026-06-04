@@ -61,7 +61,7 @@ def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS, lr=L
     # SERL checkpoint 2: clamp initial action
     a = action_t.clone().detach() * stage_mask + default_squashed * (1 - stage_mask)
 
-    # Bypass projection in Stage 2 (Cleanup) and Stage 3 (Idle) to avoid phantom gradients
+    # Bypass projection in Stage 2 (Harvesting) and Stage 3 (Idle) to avoid phantom gradients
     is_stage_2_or_3 = (state_fixed[..., 6] > 0.5) | (state_fixed[..., 7] > 0.5)
     if is_stage_2_or_3.any():
         return a, 0
