@@ -3,42 +3,41 @@ Core Environment Module for the Photoproduction Bioreactor.
 
 This module provides the physics simulation engine and the base environment
 class `PhycocyaninEnvCore` which handles the mass balance equations,
-Runge-Kutta integration, and stage transitions of the Continuous Stirred-Tank
-Reactor (CSTR) for phycocyanin production.
+Runge-Kutta integration, and stage transitions of the photobioreactor
+for phycocyanin production.
+
+Volume-less formulation: concentrations evolve by pure kinetics with no
+dilution terms. Fn enters dCN/dt directly as mg/L/h. state[3] is a derived
+total mass concentration (mg/L) = Cx*1000 + CN + Cq.
 """
 import numpy as np
 from numba import njit
 
 # =============================================================================
-# KINETIC ENGINE (Photoproduction CSTR with Volume Tracking)
+# KINETIC ENGINE (Volume-Less Photoproduction)
 # =============================================================================
 
-# Feed stock concentration (mg/L) — concentrated nitrate solution
-C_N_STOCK = 50000.0
-
 @njit
-def calculate_rates_numba(state, I, Fn, F_out):
+def calculate_rates_numba(state, I, Fn):
     """Computes instantaneous kinetic rates for the bioreactor state.
 
-    The CSTR formulation accounts for dilution effects from feed inflow
-    and product removal via outstream. This function is compiled with Numba
-    for fast execution during simulation.
+    Volume-less formulation: concentrations evolve by pure kinetics.
+    Fn enters dCN/dt directly as a concentration addition rate (mg/L/h).
+    No dilution terms. state[3] (total mass conc.) is derived, not integrated.
 
     Args:
-        state (np.ndarray): Current physical state [Biomass Cx (g/L), 
-            Nitrate CN (mg/L), Phycocyanin Cq (mg/L), Volume V (L)].
+        state (np.ndarray): Current physical state [Biomass Cx (g/L),
+            Nitrate CN (mg/L), Phycocyanin Cq (mg/L), M_total (mg/L)].
         I (float): Light intensity (umol/m^2/s).
         Fn (float): Nitrate feed concentration rate (mg/L/h).
-        F_out (float): Outstream volumetric flow (L/h).
 
     Returns:
-        np.ndarray: Array of instantaneous rates of change 
-            [dCx/dt, dCN/dt, dCq/dt, dV/dt].
+        np.ndarray: Array of instantaneous rates of change
+            [dCx/dt, dCN/dt, dCq/dt, 0.0].
     """
     Cx = state[0]
     CN = state[1]
     Cq = state[2]
-    V  = max(state[3], 0.1)
 
     # Static Kinetic Parameters
     um  = 0.0572     # h^-1
@@ -46,15 +45,12 @@ def calculate_rates_numba(state, I, Fn, F_out):
     KN  = 393.1      # mg/L
     YNX = 504.5      # mg/g
     km  = 0.00016    # mg/g/h
-    kd  = 0.281      # h^-1
+    kd  = 0.281      # mg/L/h
     ks  = 178.9      # umol/m^2/s
     ki  = 447.1      # umol/m^2/s
     ksq = 23.51      # umol/m^2/s
     kiq = 800.0      # umol/m^2/s
     KNp = 16.89      # mg/L
-
-    # Volumetric inflow from concentrated nitrate feed
-    F_in_vol = max(0.0, Fn * V / C_N_STOCK)   # L/h
 
     # Growth photolimitation (Aiba model)
     phi_I  = I / (I + ks + (I**2 / ki))
@@ -66,30 +62,29 @@ def calculate_rates_numba(state, I, Fn, F_out):
     growth = um * phi_I * Cx * phi_N
 
     R = np.zeros(4)
-    # dCx/dt: growth – death – dilution from inflow (no biomass in feed)
-    R[0] = growth - ud * Cx - F_in_vol * Cx / V
-    # dCN/dt: consumption + CSTR feed term
-    R[1] = -YNX * growth + F_in_vol * (C_N_STOCK - CN) / V
-    # dCq/dt: synthesis – degradation – dilution from inflow
-    R[2] = km * phi_Iq * Cx - (kd * Cq) / (CN + KNp) - F_in_vol * Cq / V
-    # dV/dt: inflow – outflow
-    R[3] = F_in_vol - F_out
+    # dCx/dt: growth – death (no dilution)
+    R[0] = growth - ud * Cx
+    # dCN/dt: consumption + direct feed addition (no dilution)
+    R[1] = -YNX * growth + Fn
+    # dCq/dt: synthesis – degradation (no dilution)
+    R[2] = km * phi_Iq * Cx - (kd * Cq) / (CN + KNp)
+    # state[3] is derived (M_total = Cx*1000 + CN + Cq), not integrated
+    R[3] = 0.0
 
     return R
 
 
 @njit
-def integrate_rk4(state_init, I, Fn, F_out, dt, n_steps):
-    """Executes a 4th-order Runge-Kutta integration step for the CSTR system.
+def integrate_rk4(state_init, I, Fn, dt, n_steps):
+    """Executes a 4th-order Runge-Kutta integration for the volume-less system.
 
-    Advances the physical state of the bioreactor [Cx, CN, Cq, V] over a given
-    time period using the defined instantaneous rates.
+    Advances the physical state [Cx, CN, Cq] using pure kinetics.
+    state[3] (total mass concentration) is recomputed after integration.
 
     Args:
         state_init (np.ndarray): The initial physical state before integration.
         I (float): Light intensity applied during the step.
-        Fn (float): Nitrate feed rate applied during the step.
-        F_out (float): Outstream flow rate during the step.
+        Fn (float): Nitrate feed rate applied during the step (mg/L/h).
         dt (float): Inner integration time step duration (hours).
         n_steps (int): Number of integration steps to execute.
 
@@ -98,16 +93,17 @@ def integrate_rk4(state_init, I, Fn, F_out, dt, n_steps):
     """
     state = state_init.copy()
     for _ in range(n_steps):
-        k1 = calculate_rates_numba(state, I, Fn, F_out)
-        k2 = calculate_rates_numba(state + 0.5 * dt * k1, I, Fn, F_out)
-        k3 = calculate_rates_numba(state + 0.5 * dt * k2, I, Fn, F_out)
-        k4 = calculate_rates_numba(state + dt * k3, I, Fn, F_out)
+        k1 = calculate_rates_numba(state, I, Fn)
+        k2 = calculate_rates_numba(state + 0.5 * dt * k1, I, Fn)
+        k3 = calculate_rates_numba(state + 0.5 * dt * k2, I, Fn)
+        k4 = calculate_rates_numba(state + dt * k3, I, Fn)
         state += (dt / 6.0) * (k1 + 2.0*k2 + 2.0*k3 + k4)
         # Clamp non-physical values
         state[0] = max(state[0], 0.0)
         state[1] = max(state[1], 0.0)
         state[2] = max(state[2], 0.0)
-        state[3] = max(state[3], 0.1)
+    # Recompute derived total mass concentration (mg/L)
+    state[3] = state[0] * 1000.0 + state[1] + state[2]
     return state
 
 
@@ -148,16 +144,14 @@ class PhycocyaninEnvCore:
         self.I_MIN, self.I_MAX = 120.0, 400.0
         self.FN_MAX_GROWTH = 40.0
         self.FN_MAX_PROD   = 10.0
-        self.FOUT_MAX      = 2.0   # L/h max outstream
+        self.FOUT_MAX      = 0.05  # h^-1 fractional drain rate
 
-        # --- Reactor Volume Specs ---
-        self.V_MAX     = 50.0    # L — reactor capacity
-        self.V_MIN     = 5.0     # L — dry floor
-        self.V_INITIAL = 40.0    # L — initial fill (80%)
-        self.V_DRAIN   = 10.0    # L — cleanup→idle trigger
+        # --- Total Mass Concentration Constraint (g4) ---
+        self.M_CONC_LIMIT  = 5000.0  # mg/L — total dissolved concentration limit
+        self.DRAIN_FRAC    = 0.25    # remaining fraction to trigger idle
 
-        # --- Global Nutrient Pool ---
-        self.INITIAL_NITRATE_SUPPLY = 250_000.0  # mg total
+        # --- Global Nutrient Pool (per-episode concentration budget) ---
+        self.INITIAL_NITRATE_SUPPLY = 8000.0  # mg/L concentration budget
 
         # --- Constraint Limits ---
         self.N_LIMIT_PATH  = 800.0    # g1: Max path nitrate (mg/L)
@@ -165,7 +159,7 @@ class PhycocyaninEnvCore:
         self.N_LIMIT_TERM  = 150.0    # g3: Terminal nitrate (mg/L)
 
         # --- Buffer / Barrier Zone Config ---
-        self.OVERFLOW_BUFFER_FRAC = 0.10   # g4 buffer activates at 90% V_MAX
+        self.OVERFLOW_BUFFER_FRAC = 0.10   # g4 buffer activates at 90% of limit
 
         # --- Integration Config ---
         self.dt = 10.0 / 60.0   # 10 minutes (0.1667 h)
@@ -196,21 +190,22 @@ class PhycocyaninEnvCore:
         # Hysteretic latch for cleanup→idle transition
         self._cleanup_latch = False
 
-        # Physical state: [Cx (g/L), CN (mg/L), Cq (mg/L), V (L)]
-        self.state = np.array([1.1, 150.0, 0.005, self.V_INITIAL], dtype=np.float64)
+        # Drain progress fraction (1.0 = full, 0.0 = empty)
+        self.remaining_frac = 1.0
+
+        # Physical state: [Cx (g/L), CN (mg/L), Cq (mg/L), M_total (mg/L)]
+        self.state = np.array([1.1, 150.0, 0.005, 0.0], dtype=np.float64)
+        self.state[3] = self.state[0] * 1000.0 + self.state[1] + self.state[2]
 
         if randomize:
             noise_factor = 0.10
-            # Only randomize concentrations, not volume
+            # Randomize concentrations
             conc_noise = np.random.normal(1.0, noise_factor, size=3)
             self.state[:3] *= np.maximum(0.01, conc_noise)
-            # Slight volume randomization
-            self.state[3] = np.clip(
-                self.state[3] * np.random.normal(1.0, 0.05),
-                self.V_MIN + 5.0, self.V_MAX - 5.0
-            )
+            # Recompute derived total mass concentration
+            self.state[3] = self.state[0] * 1000.0 + self.state[1] + self.state[2]
 
-        # Global nutrient pool
+        # Global nutrient pool (per-episode concentration budget, mg/L)
         self.nitrate_supply = self.INITIAL_NITRATE_SUPPLY
 
         # Action smoothing
@@ -238,7 +233,7 @@ class PhycocyaninEnvCore:
         self.ep_g4_penalties = []
         self.ep_g5_penalties = []
 
-        # Phycocyanin harvested during cleanup (mass in mg)
+        # Phycocyanin harvested during cleanup (concentration equivalent, mg/L)
         self.total_cq_harvested = 0.0
 
         return self.get_state_norm()
@@ -254,7 +249,7 @@ class PhycocyaninEnvCore:
                 - [0] Cx/6.0
                 - [1] CN/800.0
                 - [2] Cq/0.2
-                - [3] V/V_max
+                - [3] M_total/M_CONC_LIMIT (total mass concentration)
                 - [4-7] One-hot encoded current stage (0 to 3)
                 - [8] Remaining stage credit (normalized by base credit)
                 - [9] Normalized episode time (t / total_time)
@@ -265,7 +260,7 @@ class PhycocyaninEnvCore:
         norm[0] = self.state[0] / 6.0
         norm[1] = self.state[1] / 800.0
         norm[2] = self.state[2] / 0.2
-        norm[3] = self.state[3] / self.V_MAX
+        norm[3] = self.state[3] / self.M_CONC_LIMIT
 
         # One-hot stage encoding
         norm[4 + self.current_stage] = 1.0
@@ -333,11 +328,13 @@ class PhycocyaninEnvCore:
 
         This is invoked when the reactor successfully drains during Harvesting
         and there is enough episode time left to run another batch cycle.
-        It preserves the episode's time, step count, and cumulative rewards/penalties
-        while resetting the physical concentrations, volume, and nutrient supply.
+        It preserves the episode's time, step count, cumulative rewards/penalties,
+        and the nitrate supply (shared per-episode resource).
         """
-        self.state = np.array([1.1, 150.0, 0.005, self.V_INITIAL], dtype=np.float64)
-        self.nitrate_supply = self.INITIAL_NITRATE_SUPPLY
+        self.state = np.array([1.1, 150.0, 0.005, 0.0], dtype=np.float64)
+        self.state[3] = self.state[0] * 1000.0 + self.state[1] + self.state[2]
+        # NOTE: nitrate_supply is NOT reset — it is a per-episode resource
+        self.remaining_frac = 1.0
         self.prev_action = np.zeros(4)
 
 
@@ -347,6 +344,9 @@ class PhycocyaninEnvCore:
         This method decodes the agent's normalized action [-1, 1] into physical
         units, applies stage-based masking and constraints, deducts stage credits,
         and integrates the bioreactor state forward by `control_freq` hours.
+
+        In the volume-less model, F_out is a fractional drain rate (h^-1) that
+        only affects `remaining_frac` and harvest tracking, not concentrations.
 
         Args:
             action (np.ndarray): The raw action vector [time_mult, I, Fn, F_out]
@@ -373,25 +373,25 @@ class PhycocyaninEnvCore:
             fn_max = self.FN_MAX_GROWTH if self.current_stage == 0 else self.FN_MAX_PROD
             Fn_phys = a_scaled[2] * fn_max
 
-            # Outstream masked
-            F_out = 0.0
+            # Drain rate masked during growth
+            F_out_rate = 0.0
         elif self.current_stage == 2:
-            # Harvesting: only outstream active
+            # Harvesting: only drain rate active
             multiplier = 1.0
             I_phys  = self.I_MIN  # baseline
             Fn_phys = 0.0
-            F_out   = a_scaled[3] * self.FOUT_MAX
+            F_out_rate = a_scaled[3] * self.FOUT_MAX  # h^-1
         else:
             # Idle: everything at baseline
             multiplier = 1.0
             I_phys  = self.I_MIN
             Fn_phys = 0.0
-            F_out   = 0.0
+            F_out_rate = 0.0
 
-        # ── Mass Balance: Cap Fn by available supply ──────────────────
+        # ── Nitrate Supply Budget: Cap Fn by available supply ─────────
         if Fn_phys > 0 and self.nitrate_supply > 0:
-            # Approximate demand over control period
-            nitrate_demand = Fn_phys * self.state[3] * self.control_freq  # mg
+            # Demand in concentration budget units (mg/L)
+            nitrate_demand = Fn_phys * self.control_freq  # mg/L consumed
             actual_consumed = min(nitrate_demand, self.nitrate_supply)
             if actual_consumed < nitrate_demand and nitrate_demand > 0:
                 Fn_phys *= (actual_consumed / nitrate_demand)
@@ -402,17 +402,17 @@ class PhycocyaninEnvCore:
         # ── Hysteretic Sigmoid Blending (Harvesting → Idle) ─────────────
         blend = 0.0
         if self.current_stage == 2:
-            if not self._cleanup_latch and self.state[3] < self.V_DRAIN:
+            if not self._cleanup_latch and self.remaining_frac < self.DRAIN_FRAC:
                 self._cleanup_latch = True
 
             if self._cleanup_latch:
-                # Sigmoid soft-switch: blend towards idle as V drops
+                # Sigmoid soft-switch: blend towards idle as drain completes
                 blend = self._sigmoid_switch(
-                    self.V_DRAIN - self.state[3], center=0.0, width=2.0)
+                    self.DRAIN_FRAC - self.remaining_frac, center=0.0, width=0.05)
                 # Blend actions toward idle defaults
-                I_phys  = I_phys * (1.0 - blend) + self.I_MIN * blend
-                Fn_phys = Fn_phys * (1.0 - blend)
-                F_out   = F_out * (1.0 - blend)
+                I_phys     = I_phys * (1.0 - blend) + self.I_MIN * blend
+                Fn_phys    = Fn_phys * (1.0 - blend)
+                F_out_rate = F_out_rate * (1.0 - blend)
 
         # ── Time Credit Update ────────────────────────────────────────
         dt_hours = self.control_freq   # effective step duration
@@ -426,6 +426,7 @@ class PhycocyaninEnvCore:
             self.current_stage += 1
             self.stage_credits = float(self.BASE_CREDITS[self.current_stage])
             self._cleanup_latch = False
+            self.remaining_frac = 1.0  # reset drain progress for new harvest
 
         elif self.current_stage == 2:
             # Immediate transition bypass if harvest is complete
@@ -441,7 +442,7 @@ class PhycocyaninEnvCore:
                     # End of stage 2 reached!
                     min_time_for_cycle = 192.0
                     time_remaining = self.total_time - self.time
-                    
+
                     if time_remaining >= min_time_for_cycle:
                         # Backtrack to Inoculation (stage 0) to start a new batch
                         self._partial_reset_reactor()
@@ -454,14 +455,18 @@ class PhycocyaninEnvCore:
                         self.stage_credits = 0.0
 
 
-        # ── CSTR Integration ─────────────────────────────────────────
+        # ── Volume-Less Integration ──────────────────────────────────
         self.state = integrate_rk4(
-            self.state, I_phys, Fn_phys, F_out,
+            self.state, I_phys, Fn_phys,
             self.dt, self.n_inner_steps)
 
-        # Track harvested phycocyanin mass during cleanup outflow
-        if F_out > 0:
-            self.total_cq_harvested += self.state[2] * F_out * self.control_freq
+        # ── Drain & Harvest Tracking ─────────────────────────────────
+        if F_out_rate > 0:
+            drain_this_step = F_out_rate * self.control_freq
+            self.remaining_frac -= drain_this_step
+            self.remaining_frac = max(self.remaining_frac, 0.0)
+            # Harvest: concentration-equivalent of product removed (mg/L)
+            self.total_cq_harvested += self.state[2] * drain_this_step
 
         self.time += self.control_freq
         self.time_step_count += 1

@@ -25,7 +25,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         g2 (path):     Cq/Cx ratio <= RATIO_LIMIT (0.011)           — λ_g2, buffer + spike
         g3 (terminal): CN <= N_LIMIT_TERM (150 mg/L) — λ_g3 spike applied at every
             Stage 1→2 (Growth→Harvesting) transition
-        g4 (path):     Reactor volume <= V_MAX                      — λ_g4, buffer + spike
+        g4 (path):     Total mass concentration <= M_CONC_LIMIT    — λ_g4, buffer + spike
         g5 (terminal): Episode MUST end in Idle stage (stage 3)     — λ_g5, HARD terminal spike
 
     Note:
@@ -79,7 +79,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         # BASE_SPIKE fires even at λ=0; must be painful but not catastrophic.
         self.BASE_SPIKE           = 0.5   # Reduced from 2.0 to match Fermentation dynamics closer
         self.BUFFER_COEF          = 15.0  # Matches env_bench W_BARRIER (was 0.5)
-        self.OVERFLOW_BUFFER_FRAC = 0.10  # buffer activates at 90% V_MAX
+        self.OVERFLOW_BUFFER_FRAC = 0.10  # buffer activates at 90% M_CONC_LIMIT
         self.IDLE_BASE_SPIKE      = 500.0 # Hard idle spike: ~40× one harvest step
 
         # ── Buffer zone activation thresholds ─────────────────────
@@ -88,7 +88,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
 
         # ── Reward shaping coefficients ────────────────────────────
         self.prod_coef    = 0.2    # Gentle stockpile nudge
-        self.harvest_coef = 200.0  # Massive payout for physical harvesting
+        self.harvest_coef = 8000.0  # Massive payout for physical harvesting (scaled for conc. units)
         self.time_penalty = 0.05   # Small operational cost (was 0.2, too aggressive)
         self.smooth_coef  = 0.05   # Action-smoothing penalty coefficient
         self.raw_mat_coef = 0.1    # Nitrate feed penalty (was 0.5; conflicted with g2 avoidance)
@@ -97,6 +97,14 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         self.lagrange_updates_enabled = False
 
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def get_action_mask(state_tensor):
+        mask = PhycocyaninEnvCore.get_action_mask(state_tensor).clone()
+        supply = state_tensor[..., 10]
+        has_supply = (supply > 0.0).float()
+        mask[..., 2] = mask[..., 2] * has_supply
+        return mask
 
     def reset(self, randomize=False):
         """Resets the safe environment for a new episode.
@@ -113,12 +121,14 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         """
         self.episode_count += 1
         state = super().reset(randomize=randomize)
-        # Ensure reset state does not violate g1, g2, g4 constraints
+        # Ensure reset state does not violate g1, g2 constraints
         self.state[1] = min(self.state[1], self.N_LIMIT_PATH * 0.9)
-        self.state[3] = min(self.state[3], self.V_MAX * 0.9)
+        # Recompute derived total mass concentration
+        self.state[3] = self.state[0] * 1000.0 + self.state[1] + self.state[2]
         ratio = self.state[2] / (self.state[0] + 1e-8)
         if ratio > self.RATIO_LIMIT * 0.7:
             self.state[2] = self.state[0] * self.RATIO_LIMIT * 0.7
+            self.state[3] = self.state[0] * 1000.0 + self.state[1] + self.state[2]
 
         # Track previous Cx for growth bonus (g2 avoidance shaping)
         self.prev_Cx = self.state[0]
@@ -171,7 +181,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
 
         # ── Production & Harvest rewards (dense) ───────────────────
         # Small reward for holding product
-        prod_r = self.prod_coef * ((self.state[2] * self.state[3]) / (0.2 * self.V_MAX))
+        prod_r = self.prod_coef * ((self.state[2] * self.state[3]) / (0.2 * self.M_CONC_LIMIT))
         # Large reward for draining product out of the tank
         harvest_r = harvested_step * self.harvest_coef
 
@@ -224,13 +234,13 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             else:
                 self.lam_g2 *= (1.0 - self.lag_decay_g2)
 
-            # g4: Volume overflow (V ≤ V_MAX)
-            v_frac        = self.state[3] / self.V_MAX
+            # g4: Total mass concentration limit (M_total ≤ M_CONC_LIMIT)
+            m_frac        = self.state[3] / self.M_CONC_LIMIT
             overflow_edge = 1.0 - self.OVERFLOW_BUFFER_FRAC
-            if v_frac > overflow_edge:
-                buf_depth = min(1.0, (v_frac - overflow_edge) / self.OVERFLOW_BUFFER_FRAC)
+            if m_frac > overflow_edge:
+                buf_depth = min(1.0, (m_frac - overflow_edge) / self.OVERFLOW_BUFFER_FRAC)
                 p_g4 += self.BUFFER_COEF * buf_depth ** 2
-            overflow_viol = max(0.0, v_frac - 1.0)
+            overflow_viol = max(0.0, m_frac - 1.0)
             if overflow_viol > 0:
                 p_g4 += self.lam_g4 * overflow_viol + self.BASE_SPIKE * (1.0 + overflow_viol)
                 self.lam_g4 = min(self.lag_max, self.lam_g4 + self.lag_lr * overflow_viol)
@@ -256,11 +266,11 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         if self.current_stage != 3:
             min_time_to_idle = 0.0
             if self.current_stage == 0:
-                min_time_to_idle = (self.stage_credits / 1.968) + (self.BASE_CREDITS[1] / 1.968) + max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
+                min_time_to_idle = (self.stage_credits / 1.968) + (self.BASE_CREDITS[1] / 1.968) + max(0.0, (self.remaining_frac - self.DRAIN_FRAC) / self.FOUT_MAX)
             elif self.current_stage == 1:
-                min_time_to_idle = (self.stage_credits / 1.968) + max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
+                min_time_to_idle = (self.stage_credits / 1.968) + max(0.0, (self.remaining_frac - self.DRAIN_FRAC) / self.FOUT_MAX)
             elif self.current_stage == 2:
-                min_time_to_idle = max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
+                min_time_to_idle = max(0.0, (self.remaining_frac - self.DRAIN_FRAC) / self.FOUT_MAX)
         
             g5_buffer = 30.0  # Danger zone width (hours)
             margin = time_remaining - min_time_to_idle
@@ -303,8 +313,9 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             # Enforced via large fixed base spike + adaptive λ_g5
             if self.current_stage != 3:
                 current_idle_spike = self.IDLE_BASE_SPIKE
-                p_g5 += self.lam_g5 + current_idle_spike
-                step_reward -= p_g5
+                added_penalty = self.lam_g5 + current_idle_spike
+                p_g5 += added_penalty
+                step_reward -= added_penalty
                 self.lam_g5 = min(self.lag_max_g5, self.lam_g5 + self.lag_lr * 5.0)
                 self.violation_count    += 1
                 self.g5_violation_count += 1
@@ -346,7 +357,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             "g4_violation_count":     self.g4_violation_count,
             "g5_violation_count":     self.g5_violation_count,
             "current_stage":          self.current_stage,
-            "volume":                 float(self.state[3]),
+            "mass_conc":              float(self.state[3]),
             "nitrate_supply":         float(self.nitrate_supply),
             "total_cq_harvested":     float(self.total_cq_harvested),
             # Expose current λ values for monitoring / logging

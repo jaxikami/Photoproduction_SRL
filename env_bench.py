@@ -21,7 +21,7 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         g2 (path):     Cq/Cx ratio <= RATIO_LIMIT (0.011)           — barrier + spike
         g3 (terminal): CN <= N_LIMIT_TERM (150 mg/L) — spike applied at every
             Stage 1→2 (Growth→Harvesting) transition
-        g4 (path):     Reactor volume <= V_MAX                      — barrier + spike
+        g4 (path):     Total mass concentration <= M_CONC_LIMIT     — barrier + spike
         g5 (terminal): Episode MUST end in Idle stage (stage 3)     — HARD spike
 
     Reward structure (per step):
@@ -50,12 +50,12 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         self.W_g2_SPIKE  = 250.0  # G2: very strong linear spike (matched to g1)
         self.W_g2_QUAD   = 900.0  # Extra superlinear term once over limit (matched to g1)
         self.W_g3_SPIKE  = 200.0  # G3: terminal, so higher
-        self.W_g4_SPIKE  = 15.0   # G4: volume overflow
+        self.W_g4_SPIKE  = 15.0   # G4: total mass concentration overflow
         self.W_IDLE_HARD = 500.0  # G5: ~40× one harvest step — hard terminal
 
         # ── Reward shaping coefficients ────────────────────────────
         self.prod_coef    = 0.2    # Gentle stockpile nudge
-        self.harvest_coef = 200.0  # Massive payout for physical harvesting
+        self.harvest_coef = 8000.0  # Massive payout for physical harvesting (scaled for conc. units)
         self.time_penalty = 0.05   # Small operational cost
         self.smooth_coef  = 0.05   # Action-smoothing penalty coefficient
         self.raw_mat_coef = 0.1    # Nitrate feed penalty (reduced)
@@ -64,7 +64,7 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         # g1/g2: buffer activates at 90% of limit
         self.G1_BUFFER_START = 0.9
         self.G2_BUFFER_START = 0.95
-        # g4: inherited self.OVERFLOW_BUFFER_FRAC = 0.10  (90% V_MAX)
+        # g4: inherited self.OVERFLOW_BUFFER_FRAC = 0.10  (90% M_CONC_LIMIT)
 
     def reset(self, randomize=False):
         """Resets the benchmark environment for a new episode.
@@ -81,12 +81,14 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         """
         self.episode_count += 1
         state = super().reset(randomize=randomize)
-        # Ensure reset state does not violate g1, g2, g4 constraints
+        # Ensure reset state does not violate g1, g2 constraints
         self.state[1] = min(self.state[1], self.N_LIMIT_PATH * 0.9)
-        self.state[3] = min(self.state[3], self.V_MAX * 0.9)
+        # Recompute derived total mass concentration
+        self.state[3] = self.state[0] * 1000.0 + self.state[1] + self.state[2]
         ratio = self.state[2] / (self.state[0] + 1e-8)
         if ratio > self.RATIO_LIMIT * 0.7:
             self.state[2] = self.state[0] * self.RATIO_LIMIT * 0.7
+            self.state[3] = self.state[0] * 1000.0 + self.state[1] + self.state[2]
         
         return self.get_state_norm()
 
@@ -123,7 +125,7 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
 
         # ── Production & Harvest rewards (dense) ───────────────────
         # Small reward for holding product
-        prod_r = self.prod_coef * ((self.state[2] * self.state[3]) / (0.2 * self.V_MAX))
+        prod_r = self.prod_coef * ((self.state[2] * self.state[3]) / (0.2 * self.M_CONC_LIMIT))
         # Large reward for draining product out of the tank
         harvest_r = harvested_step * self.harvest_coef
 
@@ -165,13 +167,13 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
                 self.violation_count    += 1
                 self.g2_violation_count += 1
 
-            # g4: Volume overflow (V ≤ V_MAX)
-            v_frac        = self.state[3] / self.V_MAX
+            # g4: Total mass concentration limit (M_total ≤ M_CONC_LIMIT)
+            m_frac        = self.state[3] / self.M_CONC_LIMIT
             overflow_edge = 1.0 - self.OVERFLOW_BUFFER_FRAC
-            if v_frac > overflow_edge:
-                buf_depth = min(1.0, (v_frac - overflow_edge) / self.OVERFLOW_BUFFER_FRAC)
+            if m_frac > overflow_edge:
+                buf_depth = min(1.0, (m_frac - overflow_edge) / self.OVERFLOW_BUFFER_FRAC)
                 p_g4 += self.W_BARRIER * buf_depth ** 2
-            overflow_viol = max(0.0, v_frac - 1.0)
+            overflow_viol = max(0.0, m_frac - 1.0)
             if overflow_viol > 0:
                 p_g4 += self.W_g4_SPIKE * overflow_viol
                 self.violation_count    += 1
@@ -192,11 +194,11 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         if self.current_stage != 3:
             min_time_to_idle = 0.0
             if self.current_stage == 0:
-                min_time_to_idle = (self.stage_credits / 1.968) + (self.BASE_CREDITS[1] / 1.968) + max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
+                min_time_to_idle = (self.stage_credits / 1.968) + (self.BASE_CREDITS[1] / 1.968) + max(0.0, (self.remaining_frac - self.DRAIN_FRAC) / self.FOUT_MAX)
             elif self.current_stage == 1:
-                min_time_to_idle = (self.stage_credits / 1.968) + max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
+                min_time_to_idle = (self.stage_credits / 1.968) + max(0.0, (self.remaining_frac - self.DRAIN_FRAC) / self.FOUT_MAX)
             elif self.current_stage == 2:
-                min_time_to_idle = max(0.0, (self.state[3] - (self.V_DRAIN - 2.0)) / self.FOUT_MAX)
+                min_time_to_idle = max(0.0, (self.remaining_frac - self.DRAIN_FRAC) / self.FOUT_MAX)
         
             g5_buffer = 30.0  # Danger zone width (hours)
             margin = time_remaining - min_time_to_idle
@@ -233,7 +235,7 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
             if self.current_stage != 3:
                 current_idle_hard = self.W_IDLE_HARD
                 p_g5 += current_idle_hard
-                step_reward -= p_g5
+                step_reward -= current_idle_hard
                 self.violation_count    += 1
                 self.g5_violation_count += 1
             else:
@@ -273,7 +275,7 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
             "g4_violation_count":     self.g4_violation_count,
             "g5_violation_count":     self.g5_violation_count,
             "current_stage":          self.current_stage,
-            "volume":                 float(self.state[3]),
+            "mass_conc":              float(self.state[3]),
             "nitrate_supply":         float(self.nitrate_supply),
             "total_cq_harvested":     float(self.total_cq_harvested),
         }

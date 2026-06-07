@@ -114,7 +114,7 @@ class ActorCritic(nn.Module):
                 - masked_std (torch.Tensor): Distribution std (for log-prob reuse).
                 - mask (torch.Tensor): Stage action mask.
         """
-        from env_core import PhycocyaninEnvCore
+        from env_safe import PhycocyaninEnvSafe
 
         if hidden is None:
             hidden = self.init_hidden(batch_size=state.shape[0])
@@ -132,7 +132,7 @@ class ActorCritic(nn.Module):
         std  = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
 
         # Stage mask from observation
-        mask = PhycocyaninEnvCore.get_action_mask(state[..., :self.env_state_dim])
+        mask = PhycocyaninEnvSafe.get_action_mask(state[..., :self.env_state_dim])
 
         # Default intents for masked dims (pre-Tanh values):
         # time_mult → tanh(0) = 0.0 → maps to 1.0 multiplier (neutral)
@@ -219,13 +219,13 @@ class ActorCritic(nn.Module):
         Returns:
             tuple: (log_probs, state_values, dist_entropy)
         """
-        from env_core import PhycocyaninEnvCore
+        from env_safe import PhycocyaninEnvSafe
 
         mean = self.actor(features)
         mean = torch.nan_to_num(mean, nan=0.0)
         std  = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
 
-        mask = PhycocyaninEnvCore.get_action_mask(state[..., :self.env_state_dim])
+        mask = PhycocyaninEnvSafe.get_action_mask(state[..., :self.env_state_dim])
 
         default_intent = torch.full_like(mean, -10.0)
         default_intent[..., 0] = -0.4329
@@ -253,7 +253,7 @@ class ActorCritic(nn.Module):
         Returns:
             tuple: (log_prob, state_value, dist_entropy, hidden_new)
         """
-        from env_core import PhycocyaninEnvCore
+        from env_safe import PhycocyaninEnvSafe
 
         if hidden is None:
             hidden = self.init_hidden(batch_size=state.shape[0])
@@ -265,7 +265,7 @@ class ActorCritic(nn.Module):
         mean = self.actor(features)
         std  = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
 
-        mask = PhycocyaninEnvCore.get_action_mask(state[..., :self.env_state_dim])
+        mask = PhycocyaninEnvSafe.get_action_mask(state[..., :self.env_state_dim])
         default_intent = torch.full_like(mean, -10.0)
         default_intent[..., 0] = -0.4329
         masked_mean = mean * mask + default_intent * (1 - mask)
@@ -359,14 +359,14 @@ class SPRL_Agent:
         Returns:
             torch.Tensor: The projected, safe action (or closest proxy).
         """
-        from env_core import PhycocyaninEnvCore
+        from env_safe import PhycocyaninEnvSafe
 
         a = action.clone().detach()
         state_fixed = state_norm.detach()
         self._proj_calls += 1
 
         # Stage mask for gradient zeroing
-        stage_mask = PhycocyaninEnvCore.get_action_mask(state_fixed)
+        stage_mask = PhycocyaninEnvSafe.get_action_mask(state_fixed)
 
         # Bypass projection in Stage 2 (Harvesting) and Stage 3 (Idle) to avoid phantom gradients
         # lock-in during draining and shutdown.

@@ -32,7 +32,7 @@ Implemented constraints in the environment (`env_core.py`):
 - `G2` (Quality Ratio): `Cq/Cx <= 0.011`
 - `G3` (Terminal Nitrate): `CN <= 150 mg/L` at episode end
 - `G4` (Reactor Overflow): `V <= 50 L`
-- `G5` (Idle Stage Minimum Volume): `V >= 5 L`
+- `G5` (Terminal Stage): Episode must end in Idle stage (stage 3)
 
 *Note: APN pretraining covers instantaneous constraints (G1, G2, G4). Constraints G3 and G5 are handled via Lagrangian multipliers and temporal policy behavior.*
 

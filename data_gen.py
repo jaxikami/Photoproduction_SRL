@@ -1,10 +1,14 @@
 """
 Dataset generation for the Safety Boundary Classifier (Photoproduction).
 
-Generates (state, action, margin) tuples covering 4 instantaneous constraints:
-  G1 — Nitrate path:       cN + Fn*10h  ≤  N_LIMIT_PATH * SAFE_BUFFER
-  G2 — Product ratio:      cq / cx       ≤  RATIO_LIMIT * SAFE_BUFFER
-  G4 — Reactor overflow:   V + dV*10h    ≤  V_MAX * SAFE_BUFFER
+Uses volume-less kinetics: concentrations evolve without dilution terms.
+F_out (well-mixed drain) does not change concentrations.
+
+Generates (state, action, margin) tuples covering 3 instantaneous constraints:
+  G1 — Nitrate path:        cN_next       ≤  N_LIMIT_PATH * SAFE_BUFFER
+  G2 — Product ratio:       cq / cx       ≤  RATIO_LIMIT * SAFE_BUFFER
+  G4 — Mass concentration:  M_total_next  ≤  M_CONC_LIMIT * SAFE_BUFFER
+       where M_total = Cx*1000 + CN + Cq  (mg/L)
 
 Note: G3 (terminal nitrate, cN_final ≤ 150 mg/L) is a temporal constraint
 handled by the GRU's temporal context and the Lagrangian multiplier, not
@@ -17,13 +21,11 @@ import torch
 I_MIN, I_MAX    = 120.0, 400.0
 FN_MAX_GROWTH   = 40.0
 FN_MAX_PROD     = 10.0
-FOUT_MAX        = 2.0
+FOUT_MAX        = 0.05          # h^-1 fractional drain rate (not used in kinetics)
 N_LIMIT_PATH    = 800.0
 RATIO_LIMIT     = 0.011
 
-V_MAX           = 50.0
-V_MIN           = 5.0
-C_N_STOCK       = 50000.0
+M_CONC_LIMIT    = 5000.0        # mg/L total mass concentration limit
 CONTROL_INTERVAL = 10.0
 TOTAL_TIME      = 1000.0
 SAFE_BUFFER     = 0.98
@@ -37,7 +39,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     generating states near the constraint boundaries to train the APN effectively.
 
     State layout (12D, normalized):
-      [cx/6, cN/800, cq/0.2, V/V_MAX, stage_0..3, credit/base, t/500, supply/initial, op_time_left]
+      [cx/6, cN/800, cq/0.2, M_total/M_CONC_LIMIT, stage_0..3, credit/base, t/1000, supply/initial, op_time_left]
 
     Action layout (4D, [-1,1]):
       [time_mult, I_norm, Fn_norm, Fout_norm]
@@ -81,7 +83,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     cx_int = 0.5 + torch.rand(n_interior, device=device) * 5.0
     cN_int = torch.rand(n_interior, device=device) * N_LIMIT_PATH * 0.6
     cq_int = torch.rand(n_interior, device=device) * cx_int * RATIO_LIMIT * 0.5
-    V_int  = 15.0 + torch.rand(n_interior, device=device) * 25.0  # 15-40 L
+
     t_int  = torch.rand(n_interior, device=device) * 0.7
     # Actions: moderate, mostly safe
     a_int  = torch.rand(n_interior, 4, device=device) * 1.4 - 0.7  # [-0.7, 0.7]
@@ -93,7 +95,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # cN from 60% to 105% of limit — straddle the boundary
     cN_g1 = N_LIMIT_PATH * (0.60 + torch.rand(n_g1, device=device) * 0.45)
     cq_g1 = torch.rand(n_g1, device=device) * cx_g1 * RATIO_LIMIT * 0.5
-    V_g1  = 20.0 + torch.rand(n_g1, device=device) * 25.0
+
     t_g1  = torch.rand(n_g1, device=device) * 0.8
     # Actions: sweep Fn from low to high to create boundary crossings
     a_g1  = torch.rand(n_g1, 4, device=device) * 2.0 - 1.0
@@ -109,7 +111,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     cq_g2 = (cx_g2 * ratio_target).clamp(0.0, 0.2)
     # Moderate-to-high cN so biomass growth is active (cx growth dilutes ratio)
     cN_g2 = N_LIMIT_PATH * (0.25 + torch.rand(n_g2, device=device) * 0.50)
-    V_g2  = 20.0 + torch.rand(n_g2, device=device) * 25.0
+
     t_g2  = torch.rand(n_g2, device=device) * 0.8
     a_g2  = torch.rand(n_g2, 4, device=device) * 2.0 - 1.0
     # Full light sweep: at low I, phi_Iq/phi_I ratio is higher → ratio worsens;
@@ -118,16 +120,16 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     a_g2[:, 1] = torch.rand(n_g2, device=device) * 2.0 - 1.0  # full [-1, 1]
 
     # ══════════════════════════════════════════════════════════════════════════
-    # G4 boundary — V near overflow with variable feed
+    # G4 boundary — M_total near mass concentration limit
+    #   M_total = cx*1000 + cN + cq ≈ 5000 mg/L
+    #   High Cx (3-5.5 g/L → 3000-5500 mg/L) + moderate-high CN (300-900 mg/L)
     # ══════════════════════════════════════════════════════════════════════════
-    cx_g4 = 0.5 + torch.rand(n_g4, device=device) * 5.0
-    cN_g4 = torch.rand(n_g4, device=device) * 600.0
+    cx_g4 = 3.0 + torch.rand(n_g4, device=device) * 2.5   # 3.0–5.5 g/L
+    cN_g4 = 300.0 + torch.rand(n_g4, device=device) * 600.0  # 300–900 mg/L
     cq_g4 = torch.rand(n_g4, device=device) * cx_g4 * RATIO_LIMIT * 0.6
-    # V from 75% to 110% of V_MAX
-    V_g4  = V_MAX * (0.75 + torch.rand(n_g4, device=device) * 0.35)
     t_g4  = torch.rand(n_g4, device=device) * 0.6
     a_g4  = torch.rand(n_g4, 4, device=device) * 2.0 - 1.0
-    # Sweep Fn: high feed creates overflow
+    # Sweep Fn: high feed increases mass concentration
     a_g4[:, 2] = torch.rand(n_g4, device=device) * 2.0 - 1.0
 
 
@@ -135,7 +137,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # ══════════════════════════════════════════════════════════════════════════
     # CYCLE-INITIAL samples — pre-cycle AND post-cycle partial-reset states
     # Physical profile mirrors _partial_reset_reactor(): Cx≈1.1, CN≈150,
-    # Cq≈0.01, V≈40.  Split into pre-cycle (t≈0, full supply) and post-cycle
+    # Cq≈0.01.  Split into pre-cycle (t≈0, full supply) and post-cycle
     # (t>0.25, depleted supply) temporal contexts so the APN generalises
     # across the full episode timeline.  65% G1-boundary focus (high Fn sweep
     # → CN accumulation risk) and 35% safe interior.
@@ -147,7 +149,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     cx_pb = 0.8 + torch.rand(n_post_bnd, device=device) * 1.7     # 0.8–2.5
     cN_pb = 100.0 + torch.rand(n_post_bnd, device=device) * 580.0 # 100–680
     cq_pb = torch.rand(n_post_bnd, device=device) * 0.04          # ≈0
-    V_pb  = 35.0 + torch.rand(n_post_bnd, device=device) * 12.0   # 35–47
+
     a_pb  = torch.rand(n_post_bnd, 4, device=device) * 2.0 - 1.0
     a_pb[:, 2] = torch.rand(n_post_bnd, device=device) * 2.0 - 1.0  # full Fn
     # Temporal split: 40% pre-cycle (t≈0), 60% post-cycle (t>0.25)
@@ -160,7 +162,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     cx_pi = 0.8 + torch.rand(n_post_int, device=device) * 1.2     # 0.8–2.0
     cN_pi = 80.0 + torch.rand(n_post_int, device=device) * 200.0  # 80–280
     cq_pi = torch.rand(n_post_int, device=device) * 0.02          # ≈0
-    V_pi  = 35.0 + torch.rand(n_post_int, device=device) * 8.0    # 35–43
+
     a_pi  = torch.rand(n_post_int, 4, device=device) * 1.4 - 0.7  # moderate
     n_pre_int  = int(n_post_int * 0.4)
     t_pi = torch.empty(n_post_int, device=device)
@@ -170,7 +172,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     cx_post = torch.cat([cx_pb, cx_pi])
     cN_post = torch.cat([cN_pb, cN_pi])
     cq_post = torch.cat([cq_pb, cq_pi])
-    V_post  = torch.cat([V_pb, V_pi])
+
     t_post  = torch.cat([t_pb, t_pi])
     a_post  = torch.cat([a_pb, a_pi])
 
@@ -180,7 +182,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     cx = torch.cat([cx_int, cx_g1, cx_g2, cx_g4, cx_post])
     cN = torch.cat([cN_int, cN_g1, cN_g2, cN_g4, cN_post])
     cq = torch.cat([cq_int, cq_g1, cq_g2, cq_g4, cq_post])
-    V  = torch.cat([V_int,  V_g1,  V_g2,  V_g4,  V_post]).clamp(V_MIN * 0.3, V_MAX * 1.3)
+
     t_norm = torch.cat([t_int, t_g1, t_g2, t_g4, t_post])
     actions = torch.cat([a_int, a_g1, a_g2, a_g4, a_post])
 
@@ -223,15 +225,29 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     supply_norm[post_start + n_pre_total:post_start + n_postcycle] = (
         0.15 + torch.rand(n_postcycle - n_pre_total, device=device) * 0.55)  # 0.15–0.70
 
-    # Target extreme overflow boundary with a continuous sweep [-1.0, 1.0]
-    # analogous to Fermentation-PPO handling of the level constraint
-    extreme_overflow_slots = ((V / V_MAX) > 0.85) & (stage_onehot[:, 0].bool() | stage_onehot[:, 1].bool())
-    if extreme_overflow_slots.any():
-        apply_survival_overflow = extreme_overflow_slots & (
+    # Target extreme mass-concentration boundary with a continuous sweep [-1.0, 1.0]
+    M_total_raw = cx * 1000.0 + cN + cq
+    extreme_mass_slots = ((M_total_raw / M_CONC_LIMIT) > 0.85) & (stage_onehot[:, 0].bool() | stage_onehot[:, 1].bool())
+    if extreme_mass_slots.any():
+        apply_survival_mass = extreme_mass_slots & (
             torch.rand(num_samples, device=device) < 0.50)
         # Use full [-1.0, 1.0] sweep to map the boundary smoothly
         safe_sweep_fn = -1.0 + torch.rand(num_samples, device=device) * 2.0
-        actions[:, 2] = torch.where(apply_survival_overflow, safe_sweep_fn, actions[:, 2])
+        actions[:, 2] = torch.where(apply_survival_mass, safe_sweep_fn, actions[:, 2])
+
+    # ── Masking Actions (training distribution alignment) ──────────────────────
+    default_a = torch.tensor([-0.333, -1.0, -1.0, -1.0], device=device).unsqueeze(0)
+    
+    mask_active = (stage_onehot[:, 0] + stage_onehot[:, 1]).unsqueeze(1)
+    mask_fout   = stage_onehot[:, 2].unsqueeze(1)
+    has_supply  = (supply_norm > 0.0).float().unsqueeze(1)
+    mask_fn     = mask_active * has_supply
+    
+    stage_mask_full = torch.cat([
+        mask_active, mask_active, mask_fn, mask_fout
+    ], dim=1)
+    
+    actions = actions * stage_mask_full + default_a * (1.0 - stage_mask_full)
 
     # ── Decode physical actions ───────────────────────────────────────────────
     a_scaled = (actions + 1.0) / 2.0
@@ -256,7 +272,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     KN  = 393.1
     YNX = 504.5
     km  = 0.00016
-    kd  = 0.281
+    kd  = 0.281      # mg/L/h
     ks  = 178.9
     ki  = 447.1
     ksq = 23.51
@@ -273,17 +289,25 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     phi_Iq = I_phys / (I_phys + ksq + (I_phys**2 / kiq))
 
     growth = um * phi_I * cx * phi_N
-    F_in_vol = Fn_phys * V / C_N_STOCK
 
-    # Kinetics
-    dCx = growth - (F_in_vol * cx / V)
-    dCN = -YNX * growth + F_in_vol * (C_N_STOCK - cN) / V
-    dCq = km * phi_Iq * cx - (kd * cq) / (cN + KNp) - (F_in_vol * cq / V)
+    # Forward-simulate with finer Euler steps to match env precision
+    dt_sim = 0.5
+    sim_steps = int(CONTROL_INTERVAL / dt_sim)
+    cx_next, cN_next, cq_next = cx.clone(), cN.clone(), cq.clone()
 
-    cx_next = cx + dCx * CONTROL_INTERVAL
-    cN_next = cN + dCN * CONTROL_INTERVAL
-    cq_next = cq + dCq * CONTROL_INTERVAL
-    V_next = V + (F_in_vol - Fout_phys) * CONTROL_INTERVAL
+    for _ in range(sim_steps):
+        phi_N  = cN_next / (cN_next + KN)
+        growth = um * phi_I * cx_next * phi_N
+
+        dCx = growth
+        dCN = -YNX * growth + Fn_phys
+        dCq = km * phi_Iq * cx_next - (kd * cq_next) / (cN_next + KNp)
+
+        cx_next = cx_next + dCx * dt_sim
+        cN_next = cN_next + dCN * dt_sim
+        cq_next = cq_next + dCq * dt_sim
+
+    M_total_next = cx_next * 1000.0 + cN_next + cq_next
 
     # G1: Nitrate path constraint
     margin_g1 = (N_LIMIT_PATH * SAFE_BUFFER - cN_next) / N_LIMIT_PATH
@@ -292,8 +316,8 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     ratio_next = cq_next / (cx_next + 1e-8)
     margin_g2 = (RATIO_LIMIT * SAFE_BUFFER - ratio_next) / RATIO_LIMIT
 
-    # G4: Reactor overflow
-    margin_g4 = (V_MAX * SAFE_BUFFER - V_next) / V_MAX
+    # G4: Total mass concentration constraint
+    margin_g4 = (M_CONC_LIMIT * SAFE_BUFFER - M_total_next) / M_CONC_LIMIT
 
 
 
@@ -313,7 +337,8 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     near_g1 = (cN / N_LIMIT_PATH) > 0.70
     ratio = cq / (cx + 1e-8)
     near_g2 = ratio > (RATIO_LIMIT * 0.65)
-    near_g4 = (V / V_MAX) > 0.75
+    M_total = cx * 1000.0 + cN + cq
+    near_g4 = (M_total / M_CONC_LIMIT) > 0.75
     near_boundary = near_g1 | near_g2 | near_g4
 
     # ── Assemble normalised states (12D) ──────────────────────────────────────
@@ -322,7 +347,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
         (cx / 6.0).unsqueeze(1),
         (cN / 800.0).unsqueeze(1),
         (cq / 0.2).unsqueeze(1),
-        (V / V_MAX).unsqueeze(1),
+        (M_total / M_CONC_LIMIT).unsqueeze(1),
         stage_onehot,
         credit_norm.unsqueeze(1),
         t_norm.unsqueeze(1),

@@ -1,10 +1,13 @@
 """
 Validation suite for the Photoproduction Safety Boundary Classifier.
 
+Uses volume-less kinetics: concentrations evolve without dilution terms.
+F_out (well-mixed drain) does not change concentrations.
+
 Tests the gradient-ascent projection (APN) against instantaneous constraints:
   - Test 1 (G1): Nitrate path constraint
   - Test 2 (G2): Product/biomass ratio
-  - Test 3 (G4): Reactor overflow
+  - Test 3 (G4): Total mass concentration (M_total = Cx*1000 + CN + Cq ≤ M_CONC_LIMIT)
   - Test 4 (ID): Identity mapping (safe states unmodified)
 
 Note: G3 (terminal nitrate) and G5 (idle stage) are handled by the GRU temporal 
@@ -21,18 +24,16 @@ from env_core import PhycocyaninEnvCore
 I_MIN, I_MAX     = 120.0, 400.0
 FN_MAX_GROWTH    = 40.0
 FN_MAX_PROD      = 10.0
-FOUT_MAX         = 2.0
+FOUT_MAX         = 0.05         # h^-1 fractional drain rate (not used in kinetics)
 N_LIMIT_PATH     = 800.0
 RATIO_LIMIT      = 0.011
 
-V_MAX            = 50.0
-V_MIN            = 5.0
-C_N_STOCK        = 50000.0
+M_CONC_LIMIT     = 5000.0       # mg/L total mass concentration limit
 CONTROL_INTERVAL = 10.0
 TOTAL_TIME       = 1000.0
 SAFE_BUFFER      = 0.98
 THRESHOLD        = 0.711
-MAX_PROJ_STEPS   = 4
+MAX_PROJ_STEPS   = 7
 LR_PROJ          = 0.5
 
 
@@ -55,7 +56,8 @@ def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS, lr=L
         tuple: (projected_action (torch.Tensor), optimization_steps_taken (int))
     """
     state_fixed = state_norm_t.detach()
-    stage_mask = PhycocyaninEnvCore.get_action_mask(state_fixed)
+    from env_safe import PhycocyaninEnvSafe
+    stage_mask = PhycocyaninEnvSafe.get_action_mask(state_fixed)
     default_squashed = torch.tensor([-0.333, -1.0, -1.0, -1.0], device=state_fixed.device)
 
     # SERL checkpoint 2: clamp initial action
@@ -111,14 +113,16 @@ def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS, lr=L
     return best_a, max_steps
 
 
-def _make_state(cx, cN, cq, V, stage_idx, credit_norm, t_norm, supply_norm, device):
+def _make_state(cx, cN, cq, stage_idx, credit_norm, t_norm, supply_norm, device):
     """Packs physical values into a normalized state tensor shape [1, 12].
+
+    M_total (= cx*1000 + cN + cq) is derived from the other concentrations
+    and normalised by M_CONC_LIMIT.
 
     Args:
         cx (float): Biomass concentration (g/L).
         cN (float): Nitrate concentration (mg/L).
         cq (float): Phycocyanin concentration (mg/L).
-        V (float): Reactor volume (L).
         stage_idx (int): Current operational stage index [0-3].
         credit_norm (float): Normalized remaining stage credit.
         t_norm (float): Normalized episode time.
@@ -128,11 +132,12 @@ def _make_state(cx, cN, cq, V, stage_idx, credit_norm, t_norm, supply_norm, devi
     Returns:
         torch.Tensor: Normalized observation tensor.
     """
+    M_total = cx * 1000.0 + cN + cq
     s = torch.zeros(1, 12, dtype=torch.float32, device=device)
     s[0, 0] = cx / 6.0
     s[0, 1] = cN / 800.0
     s[0, 2] = cq / 0.2
-    s[0, 3] = V / V_MAX
+    s[0, 3] = M_total / M_CONC_LIMIT
     s[0, 4 + stage_idx] = 1.0
     s[0, 8] = credit_norm
     s[0, 9] = t_norm
@@ -192,10 +197,9 @@ def run_validation(model=None, num_test_samples: int = 2000):
         cN = float(torch.empty(1).uniform_(N_LIMIT_PATH * 0.85, N_LIMIT_PATH * 1.00))
         cx = float(torch.empty(1).uniform_(0.5, 5.0))
         cq = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.8))
-        V  = float(torch.empty(1).uniform_(30.0, 45.0))
         t  = float(torch.empty(1).uniform_(0.0, 0.6))
 
-        s_t = _make_state(cx, cN, cq, V, stage_idx=0, credit_norm=0.5,
+        s_t = _make_state(cx, cN, cq, stage_idx=0, credit_norm=0.5,
                           t_norm=t, supply_norm=0.5, device=device)
         a_t = torch.ones(1, 4, device=device)  # max intent
 
@@ -211,8 +215,8 @@ def run_validation(model=None, num_test_samples: int = 2000):
         phi_I = I_phys / (I_phys + ks + (I_phys**2 / ki))
         phi_N = cN / (cN + KN)
         growth = um * phi_I * cx * phi_N
-        F_in_vol = Fn_phys * V / C_N_STOCK
-        dCN = -YNX * growth + F_in_vol * (C_N_STOCK - cN) / V
+        # Volume-less kinetics: Fn enters directly, no F_in_vol
+        dCN = -YNX * growth + Fn_phys
         cN_next = cN + dCN * CONTROL_INTERVAL
 
         if cN_next <= N_LIMIT_PATH * SAFE_BUFFER:
@@ -238,10 +242,9 @@ def run_validation(model=None, num_test_samples: int = 2000):
         cx = float(torch.empty(1).uniform_(0.5, 5.0))
         cq = cx * RATIO_LIMIT * float(torch.empty(1).uniform_(0.90, 1.00))
         cN = float(torch.empty(1).uniform_(350.0, 600.0))
-        V  = float(torch.empty(1).uniform_(30.0, 45.0))
         t  = float(torch.empty(1).uniform_(0.0, 0.6))
 
-        s_t = _make_state(cx, cN, cq, V, stage_idx=1, credit_norm=0.5,
+        s_t = _make_state(cx, cN, cq, stage_idx=1, credit_norm=0.5,
                           t_norm=t, supply_norm=0.5, device=device)
         a_t = torch.ones(1, 4, device=device)
 
@@ -261,10 +264,9 @@ def run_validation(model=None, num_test_samples: int = 2000):
         phi_Iq = I_phys / (I_phys + ksq + (I_phys**2 / kiq))
 
         growth = um * phi_I * cx * phi_N
-        F_in_vol = Fn_phys * V / C_N_STOCK
-
-        dCx = growth - (F_in_vol * cx / V)
-        dCq = km * phi_Iq * cx - (kd * cq) / (cN + KNp) - (F_in_vol * cq / V)
+        # Volume-less kinetics: no dilution terms
+        dCx = growth
+        dCq = km * phi_Iq * cx - (kd * cq) / (cN + KNp)
 
         cx_next = cx + dCx * CONTROL_INTERVAL
         cq_next = cq + dCq * CONTROL_INTERVAL
@@ -284,33 +286,51 @@ def run_validation(model=None, num_test_samples: int = 2000):
 
 
 
-    print(f"\n--- [TEST 3] G4: Reactor overflow (V ≤ {V_MAX*SAFE_BUFFER:.0f} L) ---")
+    print(f"\n--- [TEST 3] G4: Mass concentration (M_total ≤ {M_CONC_LIMIT*SAFE_BUFFER:.0f} mg/L) ---")
     g4_passes = 0
     g4_iters  = []
 
     for _ in range(num_test_samples):
-        V  = float(torch.empty(1).uniform_(V_MAX * 0.85, V_MAX * SAFE_BUFFER))
-        cx = float(torch.empty(1).uniform_(0.5, 5.0))
-        cN = float(torch.empty(1).uniform_(0.0, 400.0))
+        cx = float(torch.empty(1).uniform_(3.0, 4.2))
+        cN = float(torch.empty(1).uniform_(200.0, 400.0))
         cq = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.8))
+        
+        M_init = cx * 1000.0 + cN + cq
+        if M_init >= M_CONC_LIMIT * SAFE_BUFFER:
+            continue
+            
         t  = float(torch.empty(1).uniform_(0.0, 0.5))
 
-        s_t = _make_state(cx, cN, cq, V, stage_idx=0, credit_norm=0.5,
+        s_t = _make_state(cx, cN, cq, stage_idx=0, credit_norm=0.5,
                           t_norm=t, supply_norm=0.5, device=device)
-        a_t = torch.ones(1, 4, device=device)  # max feed → max volume increase
+        a_t = torch.ones(1, 4, device=device)  # max feed → max mass increase
 
         a_proj, iters = _project_to_safe(apn, s_t, a_t)
         g4_iters.append(iters)
 
-        # Physics
+        # Physics — volume-less kinetics
         a_scaled = (a_proj[0] + 1.0) / 2.0
+        I_phys = I_MIN + a_scaled[1].item() * (I_MAX - I_MIN)
         Fn_phys = a_scaled[2].item() * FN_MAX_GROWTH
-        Fout_phys = 0.0  # masked in growth
-        
-        F_in_vol = Fn_phys * V / C_N_STOCK
-        V_next = V + (F_in_vol - Fout_phys) * CONTROL_INTERVAL
 
-        if V_next <= V_MAX * SAFE_BUFFER:
+        um = 0.0572; KN = 393.1; YNX = 504.5; km = 0.00016; kd = 0.281
+        ks = 178.9; ki = 447.1; ksq = 23.51; kiq = 800.0; KNp = 16.89
+
+        phi_I = I_phys / (I_phys + ks + (I_phys**2 / ki))
+        phi_N = cN / (cN + KN)
+        phi_Iq = I_phys / (I_phys + ksq + (I_phys**2 / kiq))
+        growth = um * phi_I * cx * phi_N
+
+        dCx = growth
+        dCN = -YNX * growth + Fn_phys
+        dCq = km * phi_Iq * cx - (kd * cq) / (cN + KNp)
+
+        cx_next = cx + dCx * CONTROL_INTERVAL
+        cN_next = cN + dCN * CONTROL_INTERVAL
+        cq_next = cq + dCq * CONTROL_INTERVAL
+        M_total_next = cx_next * 1000.0 + cN_next + cq_next
+
+        if M_total_next <= M_CONC_LIMIT * SAFE_BUFFER:
             g4_passes += 1
 
     g4_rate = g4_passes / num_test_samples
@@ -325,18 +345,27 @@ def run_validation(model=None, num_test_samples: int = 2000):
     print(f"\n--- [TEST 4] Identity mapping: safe states unmodified (diff ≤ 2%) ---")
     id_passes = 0
     for _ in range(num_test_samples):
-        cx     = float(torch.empty(1).uniform_(0.5, 5.0))
+        cx     = float(torch.empty(1).uniform_(0.5, 4.0))   # cap at 4.0
         cN     = float(torch.empty(1).uniform_(0.0, N_LIMIT_PATH * 0.50))
         cq     = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.60))
-        V      = float(torch.empty(1).uniform_(20.0, 40.0))
+        
+        # G4 pre-screen: ensure state + minimum growth stays under limit
+        M_init = cx * 1000.0 + cN + cq
+        phi_I_min = I_MIN / (I_MIN + 178.9 + I_MIN**2 / 447.1)
+        phi_N_val = cN / (cN + 393.1) if cN > 0 else 0.0
+        dM_min = (1000.0 - 504.5) * 0.0572 * phi_I_min * cx * phi_N_val * CONTROL_INTERVAL
+        if M_init + dM_min >= M_CONC_LIMIT * SAFE_BUFFER:
+            continue
+            
         t_norm = float(torch.empty(1).uniform_(0.0, 0.50))
 
-        s_t = _make_state(cx, cN, cq, V, stage_idx=0, credit_norm=0.7,
+        s_t = _make_state(cx, cN, cq, stage_idx=0, credit_norm=0.7,
                           t_norm=t_norm, supply_norm=0.7, device=device)
         a_t = -0.5 + torch.rand(1, 4, device=device)  # moderate safe intent
         
         # Pre-mask a_t so we don't unfairly penalize the default clamp
-        stage_mask = PhycocyaninEnvCore.get_action_mask(s_t)
+        from env_safe import PhycocyaninEnvSafe
+        stage_mask = PhycocyaninEnvSafe.get_action_mask(s_t)
         default_squashed = torch.tensor([-0.333, -1.0, -1.0, -1.0], device=device)
         a_t_masked = a_t * stage_mask + default_squashed * (1 - stage_mask)
 

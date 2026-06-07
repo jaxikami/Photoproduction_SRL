@@ -38,11 +38,11 @@ LR_CRITIC = 1e-4
 MIN_LR = 1e-5
 INITIAL_ENTROPY = 0.05
 MIN_ENTROPY = 1e-5
-EVALUATE_ONLY = False  # True → skip training and run evaluation only; False → run full train + eval
-RUN_BENCHMARK = True   # True → run Standard RL (bench) only; False → run Safe RL only
+EVALUATE_ONLY = True  # True → skip training and run evaluation only; False → run full train + eval
+RUN_BENCHMARK = False       # True → run Standard RL (bench) only; False → run Safe RL only
 RESUME_TRAINING = True # True → load existing weights before training
 NOISE_STD = 0.05
-ACTION_NOISE = True
+ACTION_NOISE = False
 STATE_NOISE = False
 
 class Memory:
@@ -242,11 +242,27 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
         agent (object): The instantiated RL agent object.
         logger (DataLogger): The logging utility for evaluation metrics.
         eval_episodes (int, optional): Number of episodes to run. Defaults to 1000.
-        noise_std (float, optional): Standard deviation of Gaussian noise. Defaults to 0.05.
-        action_noise (bool, optional): Whether to inject noise into the agent's actions. Defaults to True.
-        state_noise (bool, optional): Whether to inject noise into the environment state observations. Defaults to True.
+        noise_std (float, optional): Relative Gaussian noise level. E.g., 0.05 means 5% noise.
+        action_noise (bool, optional): Whether to inject noise into the agent's actions. Defaults to False.
+        state_noise (bool, optional): Whether to inject noise into the environment state observations. Defaults to False.
     """
-    print(f"\n--- Evaluating: {agent_name} with N(0, {noise_std}) noise ---")
+    if noise_std <= 0 or (not state_noise and not action_noise):
+        noise_mode = "no noise"
+        effective_pct = 0.0
+    elif state_noise and action_noise:
+        noise_mode = "state + action noise"
+        effective_pct = noise_std * 100.0
+    elif state_noise:
+        noise_mode = "state noise"
+        effective_pct = noise_std * 100.0
+    else:
+        noise_mode = "action noise"
+        effective_pct = noise_std * 100.0
+
+    print(
+        f"\n--- Evaluating: {agent_name} with {noise_mode} "
+        f"(relative +- {effective_pct:.1f}%, configured {noise_std * 100:.1f}%) ---"
+    )
 
     load_path = os.path.join("policy", f"{agent_name}_final_weights.pth")
     if os.path.exists(load_path):
@@ -260,7 +276,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
     all_nitrate_trajectories    = []
     all_production_trajectories = []
     all_ratio_trajectories      = []
-    all_volume_trajectories     = []
+    all_mass_conc_trajectories  = []
     all_harvested_trajectories  = []
 
     for _ in tqdm(range(eval_episodes), desc=f"Evaluating {agent_name}"):
@@ -271,8 +287,8 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
 
         while True:
             if state_noise and noise_std > 0:
-                s_noise = np.random.normal(0, noise_std, size=state.shape)
-                noisy_state = state + s_noise
+                rel_noise = np.random.normal(0.0, noise_std, size=state.shape)
+                noisy_state = state * (1.0 + rel_noise)
             else:
                 noisy_state = state
 
@@ -286,8 +302,8 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
                 intent = z.cpu().numpy().flatten()
 
             if action_noise and noise_std > 0:
-                noise = np.random.normal(0, noise_std, size=intent.shape)
-                noisy_intent = np.clip(intent + noise, -1.0, 1.0)
+                rel_noise = np.random.normal(0.0, noise_std, size=intent.shape)
+                noisy_intent = np.clip(intent * (1.0 + rel_noise), -1.0, 1.0)
             else:
                 noisy_intent = intent
 
@@ -295,7 +311,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
                 if agent_name == "safe_RL agent":
                     noisy_t = torch.FloatTensor(noisy_intent).to(state_t.device).unsqueeze(0)
                     # For Safe RL, apply the projection filter
-                    from env_core import PhycocyaninEnvCore as _Env
+                    from env_safe import PhycocyaninEnvSafe as _Env
                     mask = _Env.get_action_mask(state_t)
                     default_sq = torch.tensor([-0.333, -1.0, -1.0, -1.0], device=state_t.device)
                     noisy_t = noisy_t * mask + default_sq * (1 - mask)
@@ -322,7 +338,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
         all_production_trajectories.append([s[2] for s in ep_states])
         all_ratio_trajectories.append(
             [(s[2] * 0.2) / (s[0] * 6.0 + 1e-8) for s in ep_states])
-        all_volume_trajectories.append([s[3] for s in ep_states])
+        all_mass_conc_trajectories.append([s[3] for s in ep_states])
         # Track cumulative harvested mass (starts at 0.0, prepended)
         all_harvested_trajectories.append([0.0] + [info.get("total_cq_harvested", 0.0) for info in ep_infos])
 
@@ -355,7 +371,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
     all_nitrate = np.array(all_nitrate_trajectories)
     all_prod    = np.array(all_production_trajectories)
     all_ratio   = np.array(all_ratio_trajectories)
-    all_vol     = np.array(all_volume_trajectories)
+    all_mass_conc = np.array(all_mass_conc_trajectories)
     all_harv    = np.array(all_harvested_trajectories)
 
     agg_data = {
@@ -366,9 +382,9 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
         "ratio_max":      np.max(all_ratio, axis=0),
         "ratio_avg":      np.mean(all_ratio, axis=0),
         "ratio_std":      np.std(all_ratio, axis=0),
-        "volume_min":     np.min(all_vol, axis=0),
-        "volume_max":     np.max(all_vol, axis=0),
-        "volume_avg":     np.mean(all_vol, axis=0),
+        "mass_conc_min":  np.min(all_mass_conc, axis=0),
+        "mass_conc_max":  np.max(all_mass_conc, axis=0),
+        "mass_conc_avg":  np.mean(all_mass_conc, axis=0),
         "harvested_avg":  np.mean(all_harv, axis=0),
     }
 

@@ -113,7 +113,7 @@ class ActionProjectionNetwork(nn.Module):
         film1 = self.film1(h_s)
         film2 = self.film2(h_s)
         film3 = self.film3(h_s)
-        return h_s, film1, film2, film3
+        return film1, film2, film3
 
     def _apply_film(self, x, film_params):
         """Applies FiLM: x * (1 + γ) + β."""
@@ -151,7 +151,7 @@ class ActionProjectionNetwork(nn.Module):
         Returns:
             torch.Tensor: Continuous margin score.
         """
-        _, film1, film2, film3 = self._encode_state(state_norm)
+        film1, film2, film3 = self._encode_state(state_norm)
         h = self._action_trunk(action_norm, film1, film2, film3)
         margin = self.margin_head(h).squeeze(-1)
         return margin
@@ -166,7 +166,7 @@ class ActionProjectionNetwork(nn.Module):
         Returns:
             tuple: (margin, g1_margin, g2_margin, g4_margin)
         """
-        _, film1, film2, film3 = self._encode_state(state_norm)
+        film1, film2, film3 = self._encode_state(state_norm)
         h = self._action_trunk(action_norm, film1, film2, film3)
         margin = self.margin_head(h).squeeze(-1)
         g1 = self.g1_head(h).squeeze(-1)
@@ -312,10 +312,10 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
     # Anti-stall plateau tracking
     best_moving_avg = float('inf')
     plateau_counter = 0
-    patience = 3000
+    patience = 2000
     window_size = 200
     improvement_threshold = 1e-4
-    min_training = 10000
+    min_training = 5000
 
     pbar = tqdm(range(epochs), desc="Training Safety Classifier")
 
@@ -426,7 +426,7 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
 
                 # 1. Focal BCE component
                 l_bce = F.binary_cross_entropy_with_logits(
-                    margin_pred, sign_target, weight=combined_weight)
+                    margin_pred, b_y, weight=combined_weight)
 
                 # 2. Scaled regression
                 l_reg = F.smooth_l1_loss(margin_pred, b_m * MARGIN_SCALE)

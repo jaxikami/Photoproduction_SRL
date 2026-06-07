@@ -87,7 +87,7 @@ class DataLogger:
             g2_count (int, optional): Product/biomass ratio violations. Defaults to 0.
             g3_count (int, optional): Terminal nitrate violations. Defaults to 0.
             g4_count (int, optional): Reactor overflow violations. Defaults to 0.
-            g5_count (int, optional): Idle stage bounds violations. Defaults to 0.
+            g5_count (int, optional): Terminal stage constraint violations. Defaults to 0.
         """
         self.eval_violations[agent_name].append(violation_count)
         self.eval_violations_details[agent_name]["g1"].append(g1_count)
@@ -174,7 +174,7 @@ class Plotter:
 
         Produces plots for nitrate trajectory, constraint violation breakdowns,
         phycocyanin production, light intensity control, nitrate feed control,
-        reactor volume, and the product/biomass ratio.
+        total mass concentration, and the product/biomass ratio.
 
         Args:
             logger (DataLogger): The logging instance containing the metrics.
@@ -200,8 +200,7 @@ class Plotter:
         N_LIMIT_PATH  = 800.0
         N_LIMIT_TERM  = 150.0
         RATIO_LIMIT   = 0.011
-        V_MAX         = 50.0
-        V_MIN         = 5.0
+        M_CONC_LIMIT  = 5000.0
         
         os.makedirs("plot", exist_ok=True)
 
@@ -246,7 +245,7 @@ class Plotter:
             if "harvested_avg" in agg:
                 mass_mg = agg["harvested_avg"]
             else:
-                mass_mg = c_q * (agg["volume_avg"] * V_MAX) * 1000.0
+                mass_mg = c_q * (agg["mass_conc_avg"] * M_CONC_LIMIT) * 1000.0
             
             fig, ax1 = plt.subplots(figsize=(8, 5))
             ax1.plot(time_hours, c_q, label="Concentration (g/L)", color=color)
@@ -281,10 +280,20 @@ class Plotter:
 
         # 5. Nitrate feed control plot for the best episode
         plt.figure(figsize=(8, 5))
-        best_Fn = ((data["actions"][:, 2] + 1.0) / 2.0) * FN_MAX_GROWTH
+        
+        # Calculate actual physical delivery
+        stages = data["states"][:, 4:8]  # 0:Inoculation, 1:Growth, 2:Harvesting, 3:Idle
+        fn_maxes = stages[:, 0] * FN_MAX_GROWTH + stages[:, 1] * FN_MAX_PROD
+        a_scaled = (np.clip(data["actions"][:, 2], -1.0, 1.0) + 1.0) / 2.0
+        best_Fn = a_scaled * fn_maxes
+        
+        # Mask to 0 if nitrate reservoir is empty
+        nitrate_supplies = data["states"][:, 10]
+        best_Fn = np.where(nitrate_supplies <= 0.0, 0.0, best_Fn)
+        
         t_act = np.arange(len(best_Fn) + 1) * CONTROL_INTERVAL
-        plt.step(t_act, np.append(best_Fn, best_Fn[-1]), where='post', label="Best Run", color=color)
-        plt.title(f"Nitrate Feed ($F_N$) — {agent_name}")
+        plt.step(t_act, np.append(best_Fn, best_Fn[-1]), where='post', label="Actual Delivery", color=color)
+        plt.title(f"Actual Nitrate Delivery ($F_N$) — {agent_name}")
         plt.ylabel("mg/L/h")
         plt.xlabel("Time (hours)")
         plt.grid(True, alpha=0.2)
@@ -292,21 +301,20 @@ class Plotter:
         plt.savefig(os.path.join("plot", f"plot_nitrate_feed{suffix}.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
-        # 6. Reactor volume with min and max shadow area
+        # 6. Total mass concentration with min and max shadow area
         plt.figure(figsize=(8, 5))
-        v_best = data["states"][:, 3] * V_MAX
-        plt.plot(time_hours, v_best, label="Best Run", color=color)
-        if agg and "volume_min" in agg:
-            plt.fill_between(time_hours, agg["volume_min"] * V_MAX, agg["volume_max"] * V_MAX,
+        m_best = data["states"][:, 3] * M_CONC_LIMIT
+        plt.plot(time_hours, m_best, label="Best Run", color=color)
+        if agg and "mass_conc_min" in agg:
+            plt.fill_between(time_hours, agg["mass_conc_min"] * M_CONC_LIMIT, agg["mass_conc_max"] * M_CONC_LIMIT,
                              color=color, alpha=0.2, label="Min/Max")
-        plt.axhline(y=V_MAX, color='r', linestyle='--', alpha=0.5, label="$g_4$")
-        plt.axhline(y=V_MIN, color='darkred', linestyle='--', alpha=0.5, label="$g_5$")
-        plt.title(f"Reactor Volume — {agent_name}")
-        plt.ylabel("L")
+        plt.axhline(y=M_CONC_LIMIT, color='r', linestyle='--', alpha=0.5, label="$g_4$")
+        plt.title(f"Total Mass Concentration — {agent_name}")
+        plt.ylabel("mg/L")
         plt.xlabel("Time (hours)")
         plt.grid(True, alpha=0.2)
         plt.legend(fontsize=9)
-        plt.savefig(os.path.join("plot", f"plot_volume{suffix}.png"), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join("plot", f"plot_mass_conc{suffix}.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
         # 7. Cq/Cx with min and max shadow area
