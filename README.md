@@ -1,6 +1,6 @@
 # Safe Policy Reinforcement Learning (SPRL) for Bioreactor Control
 
-This repository implements a Safe Reinforcement Learning pipeline for phycocyanin production control in a continuous multi-stage photobioreactor. It compares:
+This repository implements a Safe Reinforcement Learning pipeline for phycocyanin production control in a multi-stage photobioreactor. It compares:
 
 - `Standard RL`: A baseline Proximal Policy Optimization (PPO) agent using a Lagrangian multiplier approach (reward penalties) for constraint handling.
 - `safe_RL agent`: A PPO agent equipped with a learned Action Projection Network (APN) that projects unsafe action intents onto a safe action manifold.

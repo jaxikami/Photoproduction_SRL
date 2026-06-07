@@ -2,7 +2,7 @@
 Main Training and Evaluation Script for Photoproduction RL.
 
 This script coordinates the training and evaluation of either the Benchmark (Standard)
-PPO agent or the Safe (SPRL) agent within the continuous photobioreactor environment.
+PPO agent or the Safe (SPRL) agent within the multi-stage photobioreactor environment.
 It handles hyperparameter configuration, trajectory collection, early stopping,
 and invoking the DataLogger and Plotter for visualization.
 """
@@ -242,7 +242,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
         agent (object): The instantiated RL agent object.
         logger (DataLogger): The logging utility for evaluation metrics.
         eval_episodes (int, optional): Number of episodes to run. Defaults to 1000.
-        noise_std (float, optional): Relative Gaussian noise level. E.g., 0.05 means 5% noise.
+        noise_std (float, optional): Relative uniform noise level. E.g., 0.05 means +-5% noise.
         action_noise (bool, optional): Whether to inject noise into the agent's actions. Defaults to False.
         state_noise (bool, optional): Whether to inject noise into the environment state observations. Defaults to False.
     """
@@ -287,7 +287,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
 
         while True:
             if state_noise and noise_std > 0:
-                rel_noise = np.random.normal(0.0, noise_std, size=state.shape)
+                rel_noise = np.random.uniform(-noise_std, noise_std, size=state.shape)
                 noisy_state = state * (1.0 + rel_noise)
             else:
                 noisy_state = state
@@ -302,7 +302,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
                 intent = z.cpu().numpy().flatten()
 
             if action_noise and noise_std > 0:
-                rel_noise = np.random.normal(0.0, noise_std, size=intent.shape)
+                rel_noise = np.random.uniform(-noise_std, noise_std, size=intent.shape)
                 noisy_intent = np.clip(intent * (1.0 + rel_noise), -1.0, 1.0)
             else:
                 noisy_intent = intent

@@ -203,7 +203,7 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         
             g5_buffer = 30.0  # Danger zone width (hours)
             margin = time_remaining - min_time_to_idle
-            if margin < g5_buffer:
+            if margin < g5_buffer and not done:
                 severity = max(0.0, (g5_buffer - margin) / g5_buffer)
                 
                 a_scaled = (np.clip(action, -1.0, 1.0) + 1.0) / 2.0
