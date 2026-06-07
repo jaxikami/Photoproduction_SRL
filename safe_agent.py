@@ -368,7 +368,7 @@ class SPRL_Agent:
         # Stage mask for gradient zeroing
         stage_mask = PhycocyaninEnvSafe.get_action_mask(state_fixed)
 
-        # Bypass projection in Stage 2 (Harvesting) and Stage 3 (Idle) to avoid phantom gradients
+        # Bypass projection in Stage 2 (Cleanup) and Stage 3 (Idle) to avoid phantom gradients
         # lock-in during draining and shutdown.
         is_stage_2_or_3 = (state_fixed[..., 6] > 0.5) | (state_fixed[..., 7] > 0.5)
         if is_stage_2_or_3.any():
