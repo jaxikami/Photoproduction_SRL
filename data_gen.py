@@ -245,6 +245,10 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
                              torch.tensor(0.0, device=device)))
     Fn_phys = a_scaled[:, 2] * fn_max
 
+    # Mask Fn if supply is depleted
+    supply_available = (supply_norm > 0.0).float()
+    Fn_phys = Fn_phys * supply_available
+
     # Outstream: only active in Harvesting
     # Outstream: only active in Harvesting
     Fout_phys = torch.where(is_cleanup, a_scaled[:, 3] * FOUT_MAX,

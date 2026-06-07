@@ -315,7 +315,7 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
     patience = 3000
     window_size = 200
     improvement_threshold = 1e-4
-    min_training = 10000
+    min_training = 3000
 
     pbar = tqdm(range(epochs), desc="Training Safety Classifier")
 
@@ -378,7 +378,7 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
 
         indices = torch.randperm(buffer_size, device=device)
 
-        for i in range(0, buffer_size, batch_size):
+        for batch_idx_num, i in enumerate(range(0, buffer_size, batch_size)):
             batch_idx = indices[i: i + batch_size]
             b_s = b_s_raw[batch_idx]
             b_a = b_a_raw[batch_idx]
@@ -465,7 +465,7 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
-            scheduler.step(epoch + i / steps_per_epoch)
+            scheduler.step(epoch + batch_idx_num / steps_per_epoch)
 
             epoch_loss += loss.item()
             epoch_correct += correct
