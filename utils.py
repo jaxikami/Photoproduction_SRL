@@ -238,15 +238,15 @@ class Plotter:
         plt.savefig(os.path.join("plot", f"plot_violations{suffix}.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
-        # 3. Final phycocyanin produced in concentration as well as mg
+        # 3. Final phycocyanin produced in concentration as well as g
         plt.figure(figsize=(8, 5))
         if agg:
             c_q = agg["production_avg"] * 0.2
             # Use cumulative harvested mass from aggregation metrics
             if "harvested_avg" in agg:
-                mass_mg = agg["harvested_avg"]
+                mass_g = agg["harvested_avg"]
             else:
-                mass_mg = c_q * (agg["volume_avg"] * V_MAX) * 1000.0
+                mass_g = c_q * (agg["volume_avg"] * V_MAX)
             
             fig, ax1 = plt.subplots(figsize=(8, 5))
             ax1.plot(time_hours, c_q, label="Concentration (g/L)", color=color)
@@ -255,8 +255,8 @@ class Plotter:
             ax1.set_xlabel("Time (hours)")
             
             ax2 = ax1.twinx()
-            ax2.plot(time_hours, mass_mg, label="Total Mass (mg)", color='tab:green', linestyle='--')
-            ax2.set_ylabel("Total Mass (mg)", color='tab:green')
+            ax2.plot(time_hours, mass_g, label="Total Mass (g)", color='tab:green', linestyle='--')
+            ax2.set_ylabel("Total Mass (g)", color='tab:green')
             ax2.tick_params(axis='y', labelcolor='tab:green')
             
             plt.title(f"Average Phycocyanin Production — {agent_name}")

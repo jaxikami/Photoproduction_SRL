@@ -303,8 +303,9 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             # Enforced via large fixed base spike + adaptive λ_g5
             if self.current_stage != 3:
                 current_idle_spike = self.IDLE_BASE_SPIKE
-                p_g5 += self.lam_g5 + current_idle_spike
-                step_reward -= p_g5
+                extra_p_g5 = self.lam_g5 + current_idle_spike
+                p_g5 += extra_p_g5
+                step_reward -= extra_p_g5
                 self.lam_g5 = min(self.lag_max_g5, self.lam_g5 + self.lag_lr * 5.0)
                 self.violation_count    += 1
                 self.g5_violation_count += 1

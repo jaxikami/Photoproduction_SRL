@@ -38,12 +38,12 @@ LR_CRITIC = 1e-4
 MIN_LR = 1e-5
 INITIAL_ENTROPY = 0.05
 MIN_ENTROPY = 1e-5
-EVALUATE_ONLY = False  # True → skip training and run evaluation only; False → run full train + eval
-RUN_BENCHMARK = True   # True → run Standard RL (bench) only; False → run Safe RL only
+EVALUATE_ONLY = True  # True → skip training and run evaluation only; False → run full train + eval
+RUN_BENCHMARK = False   # True → run Standard RL (bench) only; False → run Safe RL only
 RESUME_TRAINING = True # True → load existing weights before training
 NOISE_STD = 0.05
 ACTION_NOISE = True
-STATE_NOISE = False
+STATE_NOISE = True
 
 class Memory:
     """Buffer for storing environment trajectories during rollouts.
@@ -242,11 +242,27 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
         agent (object): The instantiated RL agent object.
         logger (DataLogger): The logging utility for evaluation metrics.
         eval_episodes (int, optional): Number of episodes to run. Defaults to 1000.
-        noise_std (float, optional): Standard deviation of Gaussian noise. Defaults to 0.05.
-        action_noise (bool, optional): Whether to inject noise into the agent's actions. Defaults to True.
-        state_noise (bool, optional): Whether to inject noise into the environment state observations. Defaults to True.
+        noise_std (float, optional): Relative Gaussian noise level. E.g., 0.05 means 5% noise.
+        action_noise (bool, optional): Whether to inject noise into the agent's actions. Defaults to False.
+        state_noise (bool, optional): Whether to inject noise into the environment state observations. Defaults to False.
     """
-    print(f"\n--- Evaluating: {agent_name} with N(0, {noise_std}) noise ---")
+    if noise_std <= 0 or (not state_noise and not action_noise):
+        noise_mode = "no noise"
+        effective_pct = 0.0
+    elif state_noise and action_noise:
+        noise_mode = "state + action noise"
+        effective_pct = noise_std * 100.0
+    elif state_noise:
+        noise_mode = "state noise"
+        effective_pct = noise_std * 100.0
+    else:
+        noise_mode = "action noise"
+        effective_pct = noise_std * 100.0
+
+    print(
+        f"\n--- Evaluating: {agent_name} with {noise_mode} "
+        f"(relative +- {effective_pct:.1f}%, configured {noise_std * 100:.1f}%) ---"
+    )
 
     load_path = os.path.join("policy", f"{agent_name}_final_weights.pth")
     if os.path.exists(load_path):
@@ -271,8 +287,8 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
 
         while True:
             if state_noise and noise_std > 0:
-                s_noise = np.random.normal(0, noise_std, size=state.shape)
-                noisy_state = state + s_noise
+                s_noise = state * np.random.normal(0, noise_std, size=state.shape)
+                noisy_state = np.clip(state + s_noise, 0.0, 1.0)
             else:
                 noisy_state = state
 
@@ -286,7 +302,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
                 intent = z.cpu().numpy().flatten()
 
             if action_noise and noise_std > 0:
-                noise = np.random.normal(0, noise_std, size=intent.shape)
+                noise = intent * np.random.normal(0, noise_std, size=intent.shape)
                 noisy_intent = np.clip(intent + noise, -1.0, 1.0)
             else:
                 noisy_intent = intent

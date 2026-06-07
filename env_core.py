@@ -4,13 +4,13 @@ Core Environment Module for the Photoproduction Bioreactor.
 This module provides the physics simulation engine and the base environment
 class `PhycocyaninEnvCore` which handles the mass balance equations,
 Runge-Kutta integration, and stage transitions of the Continuous Stirred-Tank
-Reactor (CSTR) for phycocyanin production.
+Reactor (Photobioreactor) for phycocyanin production.
 """
 import numpy as np
 from numba import njit
 
 # =============================================================================
-# KINETIC ENGINE (Photoproduction CSTR with Volume Tracking)
+# KINETIC ENGINE (Photobioreactor with Volume Tracking)
 # =============================================================================
 
 # Feed stock concentration (mg/L) — concentrated nitrate solution
@@ -20,7 +20,7 @@ C_N_STOCK = 50000.0
 def calculate_rates_numba(state, I, Fn, F_out):
     """Computes instantaneous kinetic rates for the bioreactor state.
 
-    The CSTR formulation accounts for dilution effects from feed inflow
+    The formulation accounts for dilution effects from feed inflow
     and product removal via outstream. This function is compiled with Numba
     for fast execution during simulation.
 
@@ -68,7 +68,7 @@ def calculate_rates_numba(state, I, Fn, F_out):
     R = np.zeros(4)
     # dCx/dt: growth – death – dilution from inflow (no biomass in feed)
     R[0] = growth - ud * Cx - F_in_vol * Cx / V
-    # dCN/dt: consumption + CSTR feed term
+    # dCN/dt: consumption + feed term
     R[1] = -YNX * growth + F_in_vol * (C_N_STOCK - CN) / V
     # dCq/dt: synthesis – degradation – dilution from inflow
     R[2] = km * phi_Iq * Cx - (kd * Cq) / (CN + KNp) - F_in_vol * Cq / V
@@ -80,7 +80,7 @@ def calculate_rates_numba(state, I, Fn, F_out):
 
 @njit
 def integrate_rk4(state_init, I, Fn, F_out, dt, n_steps):
-    """Executes a 4th-order Runge-Kutta integration step for the CSTR system.
+    """Executes a 4th-order Runge-Kutta integration step for the bioreactor system.
 
     Advances the physical state of the bioreactor [Cx, CN, Cq, V] over a given
     time period using the defined instantaneous rates.
@@ -157,7 +157,7 @@ class PhycocyaninEnvCore:
         self.V_DRAIN   = 10.0    # L — cleanup→idle trigger
 
         # --- Global Nutrient Pool ---
-        self.INITIAL_NITRATE_SUPPLY = 250_000.0  # mg total
+        self.INITIAL_NITRATE_SUPPLY = 150_000.0  # 150g total budget
 
         # --- Constraint Limits ---
         self.N_LIMIT_PATH  = 800.0    # g1: Max path nitrate (mg/L)
@@ -303,11 +303,12 @@ class PhycocyaninEnvCore:
         stage_0 = state_tensor[..., 4]   # Inoculation
         stage_1 = state_tensor[..., 5]   # Growth
         stage_2 = state_tensor[..., 6]   # Harvesting
-        # stage_3 = state_tensor[..., 7]  # Idle — all masked
+
+        supply_available = (state_tensor[..., 10] > 0.0).float()
 
         mask_time = stage_0 + stage_1
         mask_I    = stage_0 + stage_1
-        mask_Fn   = stage_0 + stage_1
+        mask_Fn   = (stage_0 + stage_1) * supply_available
         mask_Fout = stage_2
 
         return torch.stack([mask_time, mask_I, mask_Fn, mask_Fout], dim=-1)
@@ -337,7 +338,6 @@ class PhycocyaninEnvCore:
         while resetting the physical concentrations, volume, and nutrient supply.
         """
         self.state = np.array([1.1, 150.0, 0.005, self.V_INITIAL], dtype=np.float64)
-        self.nitrate_supply = self.INITIAL_NITRATE_SUPPLY
         self.prev_action = np.zeros(4)
 
 
@@ -454,7 +454,7 @@ class PhycocyaninEnvCore:
                         self.stage_credits = 0.0
 
 
-        # ── CSTR Integration ─────────────────────────────────────────
+        # ── Bioreactor Integration ─────────────────────────────────────────
         self.state = integrate_rk4(
             self.state, I_phys, Fn_phys, F_out,
             self.dt, self.n_inner_steps)
