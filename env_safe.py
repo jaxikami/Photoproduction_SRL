@@ -27,7 +27,6 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             Stage 1→2 (Growth→Harvesting) transition
         g4 (path):     Reactor volume <= V_MAX                      — λ_g4, buffer + spike
         g5 (terminal): Episode MUST end in Idle stage (stage 3)     — λ_g5, HARD terminal spike
-
     Note:
         g3 λ is updated every time a violation is detected at a Stage 1→2
         transition.  This is the sole enforcement point; g3 is no longer
@@ -134,6 +133,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         else:
             # Per-episode decay to prevent death spiral from early exploration
             self.lam_g2 *= self.lag_ep_decay_g2
+        self.g6_violation_count = 0
         return state
 
     # ------------------------------------------------------------------
@@ -177,6 +177,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
 
         # ── Per-constraint Lagrangian penalties ────────────────────
         p_g1 = p_g2 = p_g3 = p_g4 = p_g5 = 0.0
+        force_idle_signal = 0.0
 
         # Only apply instantaneous path constraints (g1, g2, g4) during Stages 0-1
         # (Inoculation / Growth) where the agent controls I and Fn.
@@ -239,6 +240,10 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             else:
                 self.lam_g4 *= (1.0 - self.lag_decay)
 
+        # Restriction 2: If nitrate supply is exhausted, force idle via penalty
+        if self.nitrate_supply <= 0 and self.current_stage != 3:
+            force_idle_signal = 100.0
+
         constraint_penalty = p_g1 + p_g2 + p_g4
 
         # ── Smoothing penalty ──────────────────────────────────────
@@ -278,7 +283,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
                 p_g5 += guiding_p
 
         # ── Aggregate step reward ──────────────────────────────────
-        step_reward = prod_r + harvest_r - constraint_penalty - smooth_p - raw_mat_p - p_g5 - self.time_penalty
+        step_reward = prod_r + harvest_r - constraint_penalty - smooth_p - raw_mat_p - p_g5 - force_idle_signal - self.time_penalty
 
         # ── Terminal checks ────────────────────────────────────────
 
@@ -326,6 +331,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         self.ep_g3_penalties.append(p_g3)
         self.ep_g4_penalties.append(p_g4)
         self.ep_g5_penalties.append(p_g5)
+        self.ep_g6_penalties.append(0.0)
 
         info = {
             "avg_reward":             float(np.mean(self.ep_rewards)),

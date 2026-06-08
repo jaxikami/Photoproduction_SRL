@@ -23,7 +23,6 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
             Stage 1→2 (Growth→Harvesting) transition
         g4 (path):     Reactor volume <= V_MAX                      — barrier + spike
         g5 (terminal): Episode MUST end in Idle stage (stage 3)     — HARD spike
-
     Reward structure (per step):
         reward = prod_reward
                - constraint_penalty
@@ -87,7 +86,10 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         ratio = self.state[2] / (self.state[0] + 1e-8)
         if ratio > self.RATIO_LIMIT * 0.7:
             self.state[2] = self.state[0] * self.RATIO_LIMIT * 0.7
-        
+        self.g6_violation_count = 0
+        self.nitrate_exhausted = False
+        self.force_idle_signal = 0.0
+
         return self.get_state_norm()
 
     # ------------------------------------------------------------------
@@ -129,6 +131,7 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
 
         # ── Fixed-weight barrier + spike constraint penalties ──────
         p_g1 = p_g2 = p_g3 = p_g4 = p_g5 = 0.0
+        force_idle_signal = 0.0
 
         # Only apply instantaneous path constraints (g1, g2, g4) during Stages 0-1
         # (Inoculation / Growth) where the agent controls I and Fn.
@@ -177,7 +180,9 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
                 self.violation_count    += 1
                 self.g4_violation_count += 1
 
-        constraint_penalty = p_g1 + p_g2 + p_g4
+        # Restriction 2: force idle if nitrate supply is exhausted in any active stage
+        if self.nitrate_supply <= 0 and self.current_stage != 3:
+            force_idle_signal = 100.0
 
         # ── Smoothing penalty ──────────────────────────────────────
         smooth_p = self.smooth_coef * float(
@@ -213,8 +218,10 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
                 guiding_p = (1.0 + severity * 2.0) * action_subopt * 10.0
                 p_g5 += guiding_p
 
-        # ── Aggregate step reward ──────────────────────────────────
-        step_reward = prod_r + harvest_r - constraint_penalty - smooth_p - raw_mat_p - p_g5 - self.time_penalty
+        # ── Aggregate step reward ───────────────────────────────
+        # p_g3 and terminal p_g5 are handled separately below
+        constraint_penalty = p_g1 + p_g2 + p_g4 + force_idle_signal
+        step_reward = prod_r + harvest_r - constraint_penalty - smooth_p - raw_mat_p - self.time_penalty
 
         # ── Terminal checks ────────────────────────────────────────
 
@@ -252,6 +259,7 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         self.ep_g3_penalties.append(p_g3)
         self.ep_g4_penalties.append(p_g4)
         self.ep_g5_penalties.append(p_g5)
+        self.ep_g6_penalties.append(0.0)
 
         info = {
             "avg_reward":             float(np.mean(self.ep_rewards)),

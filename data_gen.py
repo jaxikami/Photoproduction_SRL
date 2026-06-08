@@ -23,6 +23,7 @@ RATIO_LIMIT     = 0.011
 
 V_MAX           = 50.0
 V_MIN           = 5.0
+V_RESET         = 0.10 * V_MAX   # 5.0 L — post-harvest partial reset (10% V_MAX)
 C_N_STOCK       = 50000.0
 CONTROL_INTERVAL = 10.0
 TOTAL_TIME      = 1000.0
@@ -148,10 +149,12 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # ══════════════════════════════════════════════════════════════════════════
     # CYCLE-INITIAL samples — pre-cycle AND post-cycle partial-reset states
     # Physical profile mirrors _partial_reset_reactor(): Cx≈1.1, CN≈150,
-    # Cq≈0.01, V≈40.  Split into pre-cycle (t≈0, full supply) and post-cycle
-    # (t>0.25, depleted supply) temporal contexts so the APN generalises
-    # across the full episode timeline.  65% G1-boundary focus (high Fn sweep
-    # → CN accumulation risk) and 35% safe interior.
+    # Cq≈0.01, V≈V_RESET (5 L).  The reactor is refilled from V_RESET after each
+    # harvest, so the starting volume for a new inoculation batch is low.
+    # Split into pre-cycle (t≈0, full supply) and post-cycle (t>0.25, depleted
+    # supply) temporal contexts so the APN generalises across the full episode
+    # timeline.  65% G1-boundary focus (high Fn sweep → CN accumulation risk)
+    # and 35% safe interior.
     # ══════════════════════════════════════════════════════════════════════════
     n_post_bnd = int(n_postcycle * 0.65)
     n_post_int = n_postcycle - n_post_bnd
@@ -160,7 +163,8 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     cx_pb = 0.8 + torch.rand(n_post_bnd, device=device) * 1.7     # 0.8–2.5
     cN_pb = 100.0 + torch.rand(n_post_bnd, device=device) * 580.0 # 100–680
     cq_pb = torch.rand(n_post_bnd, device=device) * 0.04          # ≈0
-    V_pb  = 35.0 + torch.rand(n_post_bnd, device=device) * 12.0   # 35–47
+    # Volume starts near V_RESET (5 L) and may have grown a little via feed
+    V_pb  = V_RESET + torch.rand(n_post_bnd, device=device) * 15.0  # 5–20 L
     a_pb  = torch.rand(n_post_bnd, 4, device=device) * 2.0 - 1.0
     a_pb[:, 2] = torch.rand(n_post_bnd, device=device) * 2.0 - 1.0  # full Fn
     # Temporal split: 40% pre-cycle (t≈0), 60% post-cycle (t>0.25)
@@ -173,7 +177,8 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     cx_pi = 0.8 + torch.rand(n_post_int, device=device) * 1.2     # 0.8–2.0
     cN_pi = 80.0 + torch.rand(n_post_int, device=device) * 200.0  # 80–280
     cq_pi = torch.rand(n_post_int, device=device) * 0.02          # ≈0
-    V_pi  = 35.0 + torch.rand(n_post_int, device=device) * 8.0    # 35–43
+    # Volume starts near V_RESET (5 L)
+    V_pi  = V_RESET + torch.rand(n_post_int, device=device) * 10.0  # 5–15 L
     a_pi  = torch.rand(n_post_int, 4, device=device) * 1.4 - 0.7  # moderate
     n_pre_int  = int(n_post_int * 0.4)
     t_pi = torch.empty(n_post_int, device=device)
@@ -269,7 +274,6 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     supply_available = (supply_norm > 0.0).float()
     Fn_phys = Fn_phys * supply_available
 
-    # Outstream: only active in Harvesting
     # Outstream: only active in Harvesting
     Fout_phys = torch.where(is_cleanup, a_scaled[:, 3] * FOUT_MAX,
                              torch.zeros(num_samples, device=device))

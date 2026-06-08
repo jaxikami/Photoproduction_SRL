@@ -151,13 +151,14 @@ class PhycocyaninEnvCore:
         self.FOUT_MAX      = 2.0   # L/h max outstream
 
         # --- Reactor Volume Specs ---
-        self.V_MAX     = 50.0    # L — reactor capacity
-        self.V_MIN     = 5.0     # L — dry floor
-        self.V_INITIAL = 40.0    # L — initial fill (80%)
-        self.V_DRAIN   = 10.0    # L — cleanup→idle trigger
+        self.V_MAX        = 50.0    # L — reactor capacity
+        self.V_MIN        = 5.0     # L — dry floor
+        self.V_INITIAL    = 0.10 * self.V_MAX    # L — initial fill (10%)
+        self.V_DRAIN      = 10.0    # L — cleanup→idle trigger
+        self.V_RESET      = 0.10 * self.V_MAX   # L — post-harvest reset volume (10% of V_MAX = 5.0 L)
 
         # --- Global Nutrient Pool ---
-        self.INITIAL_NITRATE_SUPPLY = 150_000.0  # 150g total budget
+        self.INITIAL_NITRATE_SUPPLY = 250_000.0  # 250g total budget
 
         # --- Constraint Limits ---
         self.N_LIMIT_PATH  = 800.0    # g1: Max path nitrate (mg/L)
@@ -207,7 +208,7 @@ class PhycocyaninEnvCore:
             # Slight volume randomization
             self.state[3] = np.clip(
                 self.state[3] * np.random.normal(1.0, 0.05),
-                self.V_MIN + 5.0, self.V_MAX - 5.0
+                self.V_MIN, self.V_MAX - 5.0
             )
 
         # Global nutrient pool
@@ -223,6 +224,7 @@ class PhycocyaninEnvCore:
         self.g3_violation_count = 0
         self.g4_violation_count = 0
         self.g5_violation_count = 0
+        self.g6_violation_count = 0
 
         # Metric tracking
         self.ep_total_reward = 0.0
@@ -237,6 +239,7 @@ class PhycocyaninEnvCore:
         self.ep_g3_penalties = []
         self.ep_g4_penalties = []
         self.ep_g5_penalties = []
+        self.ep_g6_penalties = []
 
         # Phycocyanin harvested during cleanup (mass in mg)
         self.total_cq_harvested = 0.0
@@ -295,10 +298,12 @@ class PhycocyaninEnvCore:
                 active action dimension and 0.0 indicates a masked dimension.
                 - dim 0 (time multiplier): Active in Inoculation/Growth.
                 - dim 1 (light intensity): Active in Inoculation/Growth.
-                - dim 2 (nitrate feed): Active in Inoculation/Growth.
+                - dim 2 (nitrate feed): Active in Inoculation/Growth, and only
+                  when nitrate supply > 0.
                 - dim 3 (outstream flow): Active in Harvesting only.
         """
         import torch
+
         # Stage one-hot at indices 4:8
         stage_0 = state_tensor[..., 4]   # Inoculation
         stage_1 = state_tensor[..., 5]   # Growth
@@ -309,6 +314,7 @@ class PhycocyaninEnvCore:
         mask_time = stage_0 + stage_1
         mask_I    = stage_0 + stage_1
         mask_Fn   = (stage_0 + stage_1) * supply_available
+        # F_out active whenever in Harvesting stage
         mask_Fout = stage_2
 
         return torch.stack([mask_time, mask_I, mask_Fn, mask_Fout], dim=-1)
@@ -336,8 +342,12 @@ class PhycocyaninEnvCore:
         and there is enough episode time left to run another batch cycle.
         It preserves the episode's time, step count, and cumulative rewards/penalties
         while resetting the physical concentrations, volume, and nutrient supply.
+
+        Restriction 3: The reactor resets at 10% of V_MAX (V_RESET = 5.0 L)
+        rather than the full V_INITIAL (40 L), reflecting the residual inoculum
+        left in the vessel after the underflow-floor harvest.
         """
-        self.state = np.array([1.1, 150.0, 0.005, self.V_INITIAL], dtype=np.float64)
+        self.state = np.array([1.1, 150.0, 0.005, self.V_RESET], dtype=np.float64)
         self.prev_action = np.zeros(4)
 
 
@@ -422,10 +432,22 @@ class PhycocyaninEnvCore:
             self.stage_credits -= dt_hours  # fixed rate in cleanup
 
         # ── Stage Transition Logic ────────────────────────────────────
-        if self.current_stage in (0, 1) and self.stage_credits <= 0:
-            self.current_stage += 1
-            self.stage_credits = float(self.BASE_CREDITS[self.current_stage])
-            self._cleanup_latch = False
+
+        # Restriction 2 (force-idle on nitrate exhaustion):
+        # If at the END of a Inoculation or Growth step the global nitrate
+        # supply is depleted, the reactor is force-transitioned to Idle
+        # immediately.  This prevents any further bio-production steps from
+        # running without nutrient supply.
+        if self.current_stage in (0, 1):
+            if self.nitrate_supply <= 0:
+                # Force idle regardless of remaining credits
+                self.current_stage = 3
+                self.stage_credits  = 0.0
+                self._cleanup_latch = False
+            elif self.stage_credits <= 0:
+                self.current_stage += 1
+                self.stage_credits = float(self.BASE_CREDITS[self.current_stage])
+                self._cleanup_latch = False
 
         elif self.current_stage == 2:
             # Immediate transition bypass if harvest is complete
@@ -441,15 +463,17 @@ class PhycocyaninEnvCore:
                     # End of stage 2 reached!
                     min_time_for_cycle = 192.0
                     time_remaining = self.total_time - self.time
-                    
-                    if time_remaining >= min_time_for_cycle:
+
+                    if time_remaining >= min_time_for_cycle and self.nitrate_supply > 0:
                         # Backtrack to Inoculation (stage 0) to start a new batch
+                        # Only restart if there is still nitrate supply (Restriction 2)
                         self._partial_reset_reactor()
                         self.current_stage = 0
                         self.stage_credits = float(self.BASE_CREDITS[0])
                         self._cleanup_latch = False
                     else:
                         # Transition to Idle (stage 3)
+                        # (either time expired or nitrate supply exhausted)
                         self.current_stage = 3
                         self.stage_credits = 0.0
 
