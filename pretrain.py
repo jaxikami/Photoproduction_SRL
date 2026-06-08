@@ -440,7 +440,7 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
                 l_aux_g2 = F.binary_cross_entropy_with_logits(aux_g2, target_g2)
                 l_aux_g4 = F.binary_cross_entropy_with_logits(aux_g4, target_g4)
 
-                l_aux = (1.5 * l_aux_g1 + 2.0 * l_aux_g2 + 1.5 * l_aux_g4) / 5.0
+                l_aux = (2.5 * l_aux_g1 + 2.0 * l_aux_g2 + 1.5 * l_aux_g4) / 6.0
 
                 loss = 0.4 * l_bce + 0.25 * l_reg + 0.35 * l_aux
 

@@ -90,8 +90,8 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # G1 boundary — high cN with variable Fn feed
     # ══════════════════════════════════════════════════════════════════════════
     cx_g1 = 0.5 + torch.rand(n_g1, device=device) * 5.0
-    # cN from 60% to 105% of limit — straddle the boundary
-    cN_g1 = N_LIMIT_PATH * (0.60 + torch.rand(n_g1, device=device) * 0.45)
+    # cN from 75% to 110% of limit — tighter focus on the dangerous upper tail
+    cN_g1 = N_LIMIT_PATH * (0.75 + torch.rand(n_g1, device=device) * 0.35)
     cq_g1 = torch.rand(n_g1, device=device) * cx_g1 * RATIO_LIMIT * 0.5
     V_g1  = 20.0 + torch.rand(n_g1, device=device) * 25.0
     t_g1  = torch.rand(n_g1, device=device) * 0.8
@@ -99,6 +99,19 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     a_g1  = torch.rand(n_g1, 4, device=device) * 2.0 - 1.0
     # Override Fn channel: full sweep [-1, 1]
     a_g1[:, 2] = torch.rand(n_g1, device=device) * 2.0 - 1.0
+
+    # ── G1 EXTREME sub-group: cN at 90-110% with max Fn pressure ──────────────
+    # Mirrors the exact validation scenario (cN 85-100%, a_t=ones) so the APN
+    # learns to project aggressively in this hardest corner of the constraint.
+    n_g1_extreme = n_g1 // 3
+    cx_g1e = 0.5 + torch.rand(n_g1_extreme, device=device) * 5.0
+    cN_g1e = N_LIMIT_PATH * (0.90 + torch.rand(n_g1_extreme, device=device) * 0.20)
+    cq_g1e = torch.rand(n_g1_extreme, device=device) * cx_g1e * RATIO_LIMIT * 0.5
+    V_g1e  = 20.0 + torch.rand(n_g1_extreme, device=device) * 25.0
+    t_g1e  = torch.rand(n_g1_extreme, device=device) * 0.8
+    # Max-pressure actions: Fn forced near maximum, other dims random
+    a_g1e  = torch.rand(n_g1_extreme, 4, device=device) * 2.0 - 1.0
+    a_g1e[:, 2] = 0.5 + torch.rand(n_g1_extreme, device=device) * 0.5  # Fn in [0.5, 1.0]
 
     # ══════════════════════════════════════════════════════════════════════════
     # G2 boundary — cq/cx near ratio limit
@@ -177,31 +190,38 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # ══════════════════════════════════════════════════════════════════════════
     # Concatenate all samples
     # ══════════════════════════════════════════════════════════════════════════
-    cx = torch.cat([cx_int, cx_g1, cx_g2, cx_g4, cx_post])
-    cN = torch.cat([cN_int, cN_g1, cN_g2, cN_g4, cN_post])
-    cq = torch.cat([cq_int, cq_g1, cq_g2, cq_g4, cq_post])
-    V  = torch.cat([V_int,  V_g1,  V_g2,  V_g4,  V_post]).clamp(V_MIN * 0.3, V_MAX * 1.3)
-    t_norm = torch.cat([t_int, t_g1, t_g2, t_g4, t_post])
-    actions = torch.cat([a_int, a_g1, a_g2, a_g4, a_post])
+    cx = torch.cat([cx_int, cx_g1, cx_g1e, cx_g2, cx_g4, cx_post])
+    cN = torch.cat([cN_int, cN_g1, cN_g1e, cN_g2, cN_g4, cN_post])
+    cq = torch.cat([cq_int, cq_g1, cq_g1e, cq_g2, cq_g4, cq_post])
+    V  = torch.cat([V_int,  V_g1,  V_g1e,  V_g2,  V_g4,  V_post]).clamp(V_MIN * 0.3, V_MAX * 1.3)
+    t_norm = torch.cat([t_int, t_g1, t_g1e, t_g2, t_g4, t_post])
+    actions = torch.cat([a_int, a_g1, a_g1e, a_g2, a_g4, a_post])
+
+    num_samples = cx.shape[0]
 
     # ── Stage assignment ──────────────────────────────────────────────────────
     stage_idx = torch.randint(0, 4, (num_samples,), device=device)
+    # G1 main samples: Inoculation (stage 0) — nitrate feed is at FN_MAX_GROWTH
+    stage_idx[n_interior : n_interior + n_g1] = 0
+    # G1 extreme sub-group: also Inoculation
+    g1e_start = n_interior + n_g1
+    stage_idx[g1e_start : g1e_start + n_g1_extreme] = 0
     # Mix some G4 samples into growth stage (stage 0) where feed is active
-    g4_start = n_interior + n_g1 + n_g2
+    g4_start = n_interior + n_g1 + n_g1_extreme + n_g2
     stage_idx[g4_start:g4_start + n_g4] = torch.where(
         torch.rand(n_g4, device=device) > 0.3,
         torch.tensor(0, device=device),
         stage_idx[g4_start:g4_start + n_g4]
     )
     # G2 samples: mostly production stage (stage 1)
-    g2_start = n_interior + n_g1
+    g2_start = n_interior + n_g1 + n_g1_extreme
     stage_idx[g2_start:g2_start + n_g2] = torch.where(
         torch.rand(n_g2, device=device) > 0.3,
         torch.tensor(1, device=device),
         stage_idx[g2_start:g2_start + n_g2]
     )
     # Cycle-initial samples: always Inoculation stage (just started / backtracked)
-    post_start = n_interior + n_g1 + n_g2 + n_g4
+    post_start = n_interior + n_g1 + n_g1_extreme + n_g2 + n_g4
     stage_idx[post_start:post_start + n_postcycle] = 0
 
     stage_onehot = torch.zeros(num_samples, 4, device=device)
