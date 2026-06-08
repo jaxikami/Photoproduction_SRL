@@ -41,20 +41,20 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         # ── Fixed constraint penalty weights ───────────────────────
         # Scale: harvest_r peaks ~13/step. Spikes should dominate reward
         # at hard violations, but not be so large they prevent learning.
-        self.W_BARRIER   = 5.0     # Default quadratic buffer-zone scaling coefficient
-        self.W_g1_BARRIER = 40.0  # G1-specific pre-limit pressure (stronger than default barrier)
-        self.W_g1_SPIKE  = 250.0  # G1: very strong linear spike to suppress nitrate-limit reward hacking
-        self.W_g1_QUAD   = 900.0  # Extra superlinear term once over limit
-        self.W_g2_BARRIER = 40.0  # G2-specific pre-limit pressure (matched to g1)
-        self.W_g2_SPIKE  = 250.0  # G2: very strong linear spike (matched to g1)
-        self.W_g2_QUAD   = 900.0  # Extra superlinear term once over limit (matched to g1)
-        self.W_g3_SPIKE  = 200.0  # G3: terminal, so higher
-        self.W_g4_SPIKE  = 15.0   # G4: volume overflow
-        self.W_IDLE_HARD = 500.0  # G5: ~40× one harvest step — hard terminal
+        self.W_BARRIER   = 50.0     # Default quadratic buffer-zone scaling coefficient
+        self.W_g1_BARRIER = 100.0  # G1-specific pre-limit pressure (stronger than default barrier)
+        self.W_g1_SPIKE  = 3000.0  # G1: very strong linear spike to suppress nitrate-limit reward hacking
+        self.W_g1_QUAD   = 100000.0 # Extra superlinear term once over limit
+        self.W_g2_BARRIER = 100.0  # G2-specific pre-limit pressure (matched to g1)
+        self.W_g2_SPIKE  = 3000.0  # G2: very strong linear spike (matched to g1)
+        self.W_g2_QUAD   = 100000.0 # Extra superlinear term once over limit (matched to g1)
+        self.W_g3_SPIKE  = 2400.0  # G3: terminal, so higher
+        self.W_g4_SPIKE  = 150.0   # G4: volume overflow
+        self.W_IDLE_HARD = 5000.0  # G5: ~40× one harvest step — hard terminal
 
         # ── Reward shaping coefficients ────────────────────────────
-        self.prod_coef    = 0.2    # Gentle stockpile nudge
-        self.harvest_coef = 200.0  # Massive payout for physical harvesting
+        self.prod_coef    = 0.4    # Gentle stockpile nudge
+        self.harvest_coef = 400.0  # Massive payout for physical harvesting
         self.time_penalty = 0.05   # Small operational cost
         self.smooth_coef  = 0.05   # Action-smoothing penalty coefficient
         self.raw_mat_coef = 0.1    # Nitrate feed penalty (reduced)
@@ -215,13 +215,13 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
                 elif self.current_stage == 2:
                     action_subopt = 1.0 - a_scaled[3]
         
-                guiding_p = (1.0 + severity * 2.0) * action_subopt * 10.0
+                guiding_p = (1.0 + severity * 2.0) * action_subopt * 30.0
                 p_g5 += guiding_p
 
         # ── Aggregate step reward ───────────────────────────────
         # p_g3 and terminal p_g5 are handled separately below
         constraint_penalty = p_g1 + p_g2 + p_g4 + force_idle_signal
-        step_reward = prod_r + harvest_r - constraint_penalty - smooth_p - raw_mat_p - self.time_penalty
+        step_reward = prod_r + harvest_r - constraint_penalty - smooth_p - raw_mat_p - self.time_penalty - p_g5
 
         # ── Terminal checks ────────────────────────────────────────
 
@@ -240,7 +240,7 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
             if self.current_stage != 3:
                 current_idle_hard = self.W_IDLE_HARD
                 p_g5 += current_idle_hard
-                step_reward -= p_g5
+                step_reward -= current_idle_hard
                 self.violation_count    += 1
                 self.g5_violation_count += 1
             else:

@@ -76,18 +76,18 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
 
         # ── Barrier + base spike params ────────────────────────────
         # BASE_SPIKE fires even at λ=0; must be painful but not catastrophic.
-        self.BASE_SPIKE           = 0.5   # Reduced from 2.0 to match Fermentation dynamics closer
-        self.BUFFER_COEF          = 15.0  # Matches env_bench W_BARRIER (was 0.5)
+        self.BASE_SPIKE           = 3.0   # Reduced from 2.0 to match Fermentation dynamics closer (scaled up)
+        self.BUFFER_COEF          = 50.0  # Matches env_bench W_BARRIER (scaled up)
         self.OVERFLOW_BUFFER_FRAC = 0.10  # buffer activates at 90% V_MAX
-        self.IDLE_BASE_SPIKE      = 500.0 # Hard idle spike: ~40× one harvest step
+        self.IDLE_BASE_SPIKE      = 5000.0 # Hard idle spike: ~40× one harvest step (scaled up)
 
         # ── Buffer zone activation thresholds ─────────────────────
         self.G1_BUFFER_START = 0.95
         self.G2_BUFFER_START = 0.95  # Barrier penalty starts at 95% of the ratio limit
 
         # ── Reward shaping coefficients ────────────────────────────
-        self.prod_coef    = 0.2    # Gentle stockpile nudge
-        self.harvest_coef = 200.0  # Massive payout for physical harvesting
+        self.prod_coef    = 0.4    # Gentle stockpile nudge
+        self.harvest_coef = 400.0  # Massive payout for physical harvesting
         self.time_penalty = 0.05   # Small operational cost (was 0.2, too aggressive)
         self.smooth_coef  = 0.05   # Action-smoothing penalty coefficient
         self.raw_mat_coef = 0.1    # Nitrate feed penalty (was 0.5; conflicted with g2 avoidance)
@@ -279,7 +279,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
                 elif self.current_stage == 2:
                     action_subopt = 1.0 - a_scaled[3]
         
-                guiding_p = (1.0 + severity * 2.0) * action_subopt * 10.0
+                guiding_p = (1.0 + severity * 2.0) * action_subopt * 30.0
                 p_g5 += guiding_p
 
         # ── Aggregate step reward ──────────────────────────────────

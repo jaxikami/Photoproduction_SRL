@@ -3,8 +3,8 @@ Core Environment Module for the Photoproduction Bioreactor.
 
 This module provides the physics simulation engine and the base environment
 class `PhycocyaninEnvCore` which handles the mass balance equations,
-Runge-Kutta integration, and stage transitions of the Continuous Stirred-Tank
-Reactor (Photobioreactor) for phycocyanin production.
+Runge-Kutta integration, and stage transitions of the Photobioreactor
+for phycocyanin production.
 """
 import numpy as np
 from numba import njit
@@ -14,7 +14,7 @@ from numba import njit
 # =============================================================================
 
 # Feed stock concentration (mg/L) — concentrated nitrate solution
-C_N_STOCK = 50000.0
+C_N_STOCK = 3000.0
 
 @njit
 def calculate_rates_numba(state, I, Fn, F_out):
@@ -151,14 +151,14 @@ class PhycocyaninEnvCore:
         self.FOUT_MAX      = 2.0   # L/h max outstream
 
         # --- Reactor Volume Specs ---
-        self.V_MAX        = 50.0    # L — reactor capacity
-        self.V_MIN        = 5.0     # L — dry floor
+        self.V_MAX        = 20.0    # L — reactor capacity
+        self.V_MIN        = self.V_MAX * 0.05     # L — dry floor
         self.V_INITIAL    = 0.10 * self.V_MAX    # L — initial fill (10%)
-        self.V_DRAIN      = 10.0    # L — cleanup→idle trigger
-        self.V_RESET      = 0.10 * self.V_MAX   # L — post-harvest reset volume (10% of V_MAX = 5.0 L)
+        self.V_DRAIN      = 4.0    # L — cleanup→idle trigger
+        self.V_RESET      = 0.10 * self.V_MAX   # L — post-harvest reset volume (10% of V_MAX = 2.0 L)
 
         # --- Global Nutrient Pool ---
-        self.INITIAL_NITRATE_SUPPLY = 250_000.0  # 250g total budget
+        self.INITIAL_NITRATE_SUPPLY = 100000.0  # nitrate total budget
 
         # --- Constraint Limits ---
         self.N_LIMIT_PATH  = 800.0    # g1: Max path nitrate (mg/L)
@@ -416,13 +416,10 @@ class PhycocyaninEnvCore:
                 self._cleanup_latch = True
 
             if self._cleanup_latch:
-                # Sigmoid soft-switch: blend towards idle as V drops
-                blend = self._sigmoid_switch(
-                    self.V_DRAIN - self.state[3], center=0.0, width=2.0)
-                # Blend actions toward idle defaults
-                I_phys  = I_phys * (1.0 - blend) + self.I_MIN * blend
-                Fn_phys = Fn_phys * (1.0 - blend)
-                F_out   = F_out * (1.0 - blend)
+                # We reached the drain threshold.
+                # Do NOT blend F_out to 0, otherwise the agent can never empty the reactor.
+                # (I_phys and Fn_phys are already at baseline during stage 2)
+                pass
 
         # ── Time Credit Update ────────────────────────────────────────
         dt_hours = self.control_freq   # effective step duration
@@ -430,6 +427,15 @@ class PhycocyaninEnvCore:
             self.stage_credits -= multiplier * dt_hours
         elif self.current_stage == 2:
             self.stage_credits -= dt_hours  # fixed rate in cleanup
+
+        # ── Bioreactor Integration ─────────────────────────────────────────
+        self.state = integrate_rk4(
+            self.state, I_phys, Fn_phys, F_out,
+            self.dt, self.n_inner_steps)
+
+        # Track harvested phycocyanin mass during cleanup outflow
+        if F_out > 0:
+            self.total_cq_harvested += self.state[2] * F_out * self.control_freq
 
         # ── Stage Transition Logic ────────────────────────────────────
 
@@ -450,14 +456,17 @@ class PhycocyaninEnvCore:
                 self._cleanup_latch = False
 
         elif self.current_stage == 2:
+            # Check if volume has reached the target drain level
+            harvest_complete = self.state[3] <= self.V_RESET + 0.1
+
             # Immediate transition bypass if harvest is complete
-            if self._cleanup_latch and blend >= 0.95:
+            if self._cleanup_latch and harvest_complete:
                 self.stage_credits = 0.0
 
-            # End of stage 2 is reached when stage_credits <= 0 AND harvest is complete (blend >= 0.95)
+            # End of stage 2 is reached when stage_credits <= 0 AND harvest is complete
             # If credits expire but harvest is not complete, hold stage 2 (like fermentation env)
             if self.stage_credits <= 0:
-                if not (self._cleanup_latch and blend >= 0.95):
+                if not (self._cleanup_latch and harvest_complete):
                     self.stage_credits = 0.0
                 else:
                     # End of stage 2 reached!
@@ -476,16 +485,6 @@ class PhycocyaninEnvCore:
                         # (either time expired or nitrate supply exhausted)
                         self.current_stage = 3
                         self.stage_credits = 0.0
-
-
-        # ── Bioreactor Integration ─────────────────────────────────────────
-        self.state = integrate_rk4(
-            self.state, I_phys, Fn_phys, F_out,
-            self.dt, self.n_inner_steps)
-
-        # Track harvested phycocyanin mass during cleanup outflow
-        if F_out > 0:
-            self.total_cq_harvested += self.state[2] * F_out * self.control_freq
 
         self.time += self.control_freq
         self.time_step_count += 1

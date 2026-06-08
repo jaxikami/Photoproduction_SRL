@@ -38,12 +38,12 @@ LR_CRITIC = 1e-4
 MIN_LR = 1e-5
 INITIAL_ENTROPY = 0.05
 MIN_ENTROPY = 1e-5
-EVALUATE_ONLY = False  # True → skip training and run evaluation only; False → run full train + eval
-RUN_BENCHMARK = False   # True → run Standard RL (bench) only; False → run Safe RL only
+EVALUATE_ONLY = True  # True → skip training and run evaluation only; False → run full train + eval
+RUN_BENCHMARK = True # True → run Standard RL (bench) only; False → run Safe RL only
 RESUME_TRAINING = False # True → load existing weights before training
 NOISE_STD = 0.05
-ACTION_NOISE = True
-STATE_NOISE = True
+ACTION_NOISE = False
+STATE_NOISE = False
 
 class Memory:
     """Buffer for storing environment trajectories during rollouts.
@@ -210,7 +210,6 @@ def train_agent(agent_name, agent, logger):
                 ] if c > 0
             ) or "-"
             pbar.set_postfix({
-                "TotR": f"{info['total_reward'] / 300.0:.3f}",
                 "AvgR": f"{info['avg_reward']:.3f}",
                 "VioID": vio_id_str,
                 "ProdR": f"{info['avg_prod_reward']:.2f}",

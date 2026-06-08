@@ -113,6 +113,13 @@ class Plotter:
         if len(rewards) < 50:
             return
 
+        # Divide by max reward so the plot goes up to 1
+        max_reward = max(rewards)
+        if max_reward <= 0:
+            max_reward = 1.0  # fallback
+            
+        rewards = [r / max_reward for r in rewards]
+
         plt.figure(figsize=(10, 6))
         
         # Plot raw rewards with light transparency
@@ -133,14 +140,13 @@ class Plotter:
             valid_mv_avg = mv_avg_large.dropna()
 
         if len(valid_mv_avg) > 0:
-            y_max = valid_mv_avg.max()
-            y_min = -2.0
-            y_range = y_max - y_min
-            plt.ylim(y_min, y_max + 0.1 * y_range)
+            y_max = 1.0
+            y_min = max(-0.2, valid_mv_avg.min() - 0.1) # Clip bottom to avoid squishing the positive convergence
+            plt.ylim(y_min, 1.1)
 
         plt.title(f"Training Convergence: {agent_name}")
         plt.xlabel("Episodes")
-        plt.ylabel("Cumulative Reward")
+        plt.ylabel("Cumulative Reward (Normalized)")
         plt.legend()
         plt.grid(True, alpha=0.3)
         os.makedirs("plot", exist_ok=True)
@@ -200,8 +206,8 @@ class Plotter:
         N_LIMIT_PATH  = 800.0
         N_LIMIT_TERM  = 150.0
         RATIO_LIMIT   = 0.011
-        V_MAX         = 50.0
-        V_MIN         = 5.0
+        V_MAX         = 20.0
+        V_MIN         = 2.0
         
         os.makedirs("plot", exist_ok=True)
 
@@ -268,7 +274,39 @@ class Plotter:
 
         # 4. Light intensity control plot for the best episode
         plt.figure(figsize=(8, 5))
-        best_I = I_MIN + ((data["actions"][:, 1] + 1.0) / 2.0) * (I_MAX - I_MIN)
+        
+        stages = data["metrics"]["current_stage"].values
+        nitrate_supplies = data["metrics"]["nitrate_supply"].values
+        
+        best_I = []
+        best_Fn = []
+        for idx in range(len(data["actions"])):
+            action = data["actions"][idx]
+            stage = stages[idx]
+            n_supply = nitrate_supplies[idx]
+            
+            a_scaled = (np.clip(action, -1.0, 1.0) + 1.0) / 2.0
+            
+            if stage in (0, 1):
+                I_val = I_MIN + a_scaled[1] * (I_MAX - I_MIN)
+                fn_max = FN_MAX_GROWTH if stage == 0 else FN_MAX_PROD
+                Fn_val = a_scaled[2] * fn_max
+            elif stage == 2:
+                I_val = I_MIN
+                Fn_val = 0.0
+            else:
+                I_val = I_MIN
+                Fn_val = 0.0
+                
+            if n_supply <= 0:
+                Fn_val = 0.0
+                
+            best_I.append(I_val)
+            best_Fn.append(Fn_val)
+            
+        best_I = np.array(best_I)
+        best_Fn = np.array(best_Fn)
+
         t_act = np.arange(len(best_I) + 1) * CONTROL_INTERVAL
         plt.step(t_act, np.append(best_I, best_I[-1]), where='post', label="Best Run", color=color)
         plt.title(f"Light Intensity ($I$) — {agent_name}")
@@ -281,7 +319,6 @@ class Plotter:
 
         # 5. Nitrate feed control plot for the best episode
         plt.figure(figsize=(8, 5))
-        best_Fn = ((data["actions"][:, 2] + 1.0) / 2.0) * FN_MAX_GROWTH
         t_act = np.arange(len(best_Fn) + 1) * CONTROL_INTERVAL
         plt.step(t_act, np.append(best_Fn, best_Fn[-1]), where='post', label="Best Run", color=color)
         plt.title(f"Nitrate Feed ($F_N$) — {agent_name}")

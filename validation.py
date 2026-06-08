@@ -25,9 +25,9 @@ FOUT_MAX         = 2.0
 N_LIMIT_PATH     = 800.0
 RATIO_LIMIT      = 0.011
 
-V_MAX            = 50.0
-V_MIN            = 5.0
-C_N_STOCK        = 50000.0
+V_MAX            = 20.0
+V_MIN            = 2.0
+C_N_STOCK        = 3000.0
 CONTROL_INTERVAL = 10.0
 TOTAL_TIME       = 1000.0
 SAFE_BUFFER      = 0.98
@@ -67,43 +67,61 @@ def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS, lr=L
         return a, 0
 
     with torch.no_grad():
-        p = apn.classify(state_fixed, a)
+        _, g1, g2, g4 = apn.forward_aux(state_fixed, a)
+        p_g1 = torch.sigmoid(g1)
+        p_g2 = torch.sigmoid(g2)
+        p_g4 = torch.sigmoid(g4)
+        p = torch.min(torch.stack([p_g1, p_g2, p_g4], dim=0), dim=0)[0]
         if p.item() >= threshold:
             return a, 0
 
     best_a      = a.clone()
-    best_margin = apn(state_fixed, a).item()
+    with torch.no_grad():
+        _, g1, g2, g4 = apn.forward_aux(state_fixed, a)
+        smooth_tau = 0.25
+        stacked = torch.stack([g1, g2, g4], dim=-1)
+        best_margin = (-smooth_tau * torch.logsumexp(-stacked / smooth_tau, dim=-1)).item()
 
     with torch.enable_grad():
         for step in range(max_steps):
             a_var  = a.clone().requires_grad_(True)
-            margin = apn(state_fixed, a_var)
+            _, g1, g2, g4 = apn.forward_aux(state_fixed, a_var)
+            
+            smooth_tau = 0.25
+            stacked = torch.stack([g1, g2, g4], dim=-1)
+            margin_combined = -smooth_tau * torch.logsumexp(-stacked / smooth_tau, dim=-1)
 
-            p = torch.sigmoid(margin)
-            if p.item() >= threshold:
+            p_val = torch.sigmoid(margin_combined)
+            if p_val.item() >= threshold:
                 a_final = a_var.detach()
                 return a_final * stage_mask + default_squashed * (1 - stage_mask), step
 
             # Track best iterate seen
-            m_val = margin.item()
+            m_val = margin_combined.item()
             if m_val > best_margin:
                 best_margin = m_val
                 best_a      = a_var.detach().clone()
 
-            grad = torch.autograd.grad(margin.sum(), a_var)[0]
+            grad = torch.autograd.grad(margin_combined.sum(), a_var)[0]
 
             with torch.no_grad():
                 grad = grad.clone()
                 # Zero gradient for masked dimensions
                 grad = grad * stage_mask
                 
-                at_lower = (a_var.data <= -0.9999) & (grad < 0)
-                at_upper = (a_var.data >=  0.9999) & (grad > 0)
+                at_lower = (a_var.data <= -1.01) & (grad < 0)
+                at_upper = (a_var.data >=  1.01) & (grad > 0)
                 grad[at_lower | at_upper] = 0.0
 
                 # Constant step size with mild decay — avoids premature stall
                 step_size = lr / (1.0 + step * 0.03)
-                a = a + step_size * grad.sign()
+                
+                # Boost step size for Fn (index 2) when volume is high to quickly avoid overflow
+                lr_mult = torch.ones_like(grad)
+                is_high_vol = state_fixed[..., 3] > 0.75
+                lr_mult[..., 2] = torch.where(is_high_vol, torch.tensor(3.0, device=grad.device), torch.tensor(1.0, device=grad.device))
+                
+                a = a + step_size * grad.sign() * lr_mult
                 a = a.clamp(-1.0, 1.0)
 
     # SERL checkpoint 3
@@ -192,7 +210,7 @@ def run_validation(model=None, num_test_samples: int = 2000):
         cN = float(torch.empty(1).uniform_(N_LIMIT_PATH * 0.85, N_LIMIT_PATH * 1.00))
         cx = float(torch.empty(1).uniform_(0.5, 5.0))
         cq = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.8))
-        V  = float(torch.empty(1).uniform_(30.0, 45.0))
+        V  = float(torch.empty(1).uniform_(V_MAX * 0.60, V_MAX * 0.90))
         t  = float(torch.empty(1).uniform_(0.0, 0.6))
 
         s_t = _make_state(cx, cN, cq, V, stage_idx=0, credit_norm=0.5,
@@ -238,7 +256,7 @@ def run_validation(model=None, num_test_samples: int = 2000):
         cx = float(torch.empty(1).uniform_(0.5, 5.0))
         cq = cx * RATIO_LIMIT * float(torch.empty(1).uniform_(0.90, 1.00))
         cN = float(torch.empty(1).uniform_(350.0, 600.0))
-        V  = float(torch.empty(1).uniform_(30.0, 45.0))
+        V  = float(torch.empty(1).uniform_(V_MAX * 0.60, V_MAX * 0.90))
         t  = float(torch.empty(1).uniform_(0.0, 0.6))
 
         s_t = _make_state(cx, cN, cq, V, stage_idx=1, credit_norm=0.5,
@@ -295,7 +313,8 @@ def run_validation(model=None, num_test_samples: int = 2000):
         cq = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.8))
         t  = float(torch.empty(1).uniform_(0.0, 0.5))
 
-        s_t = _make_state(cx, cN, cq, V, stage_idx=0, credit_norm=0.5,
+        stage = 0 if torch.rand(1).item() > 0.5 else 1
+        s_t = _make_state(cx, cN, cq, V, stage_idx=stage, credit_norm=0.5,
                           t_norm=t, supply_norm=0.5, device=device)
         a_t = torch.ones(1, 4, device=device)  # max feed → max volume increase
 
@@ -304,8 +323,9 @@ def run_validation(model=None, num_test_samples: int = 2000):
 
         # Physics
         a_scaled = (a_proj[0] + 1.0) / 2.0
-        Fn_phys = a_scaled[2].item() * FN_MAX_GROWTH
-        Fout_phys = 0.0  # masked in growth
+        fn_max = FN_MAX_GROWTH if stage == 0 else FN_MAX_PROD
+        Fn_phys = a_scaled[2].item() * fn_max
+        Fout_phys = 0.0  # masked in growth or inoculation
         
         F_in_vol = Fn_phys * V / C_N_STOCK
         V_next = V + (F_in_vol - Fout_phys) * CONTROL_INTERVAL
@@ -328,7 +348,7 @@ def run_validation(model=None, num_test_samples: int = 2000):
         cx     = float(torch.empty(1).uniform_(0.5, 5.0))
         cN     = float(torch.empty(1).uniform_(0.0, N_LIMIT_PATH * 0.50))
         cq     = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.60))
-        V      = float(torch.empty(1).uniform_(20.0, 40.0))
+        V      = float(torch.empty(1).uniform_(V_MAX * 0.40, V_MAX * 0.80))
         t_norm = float(torch.empty(1).uniform_(0.0, 0.50))
 
         s_t = _make_state(cx, cN, cq, V, stage_idx=0, credit_norm=0.7,

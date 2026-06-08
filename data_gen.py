@@ -21,10 +21,10 @@ FOUT_MAX        = 2.0
 N_LIMIT_PATH    = 800.0
 RATIO_LIMIT     = 0.011
 
-V_MAX           = 50.0
-V_MIN           = 5.0
-V_RESET         = 0.10 * V_MAX   # 5.0 L — post-harvest partial reset (10% V_MAX)
-C_N_STOCK       = 50000.0
+V_MAX           = 20.0
+V_MIN           = 2.0
+V_RESET         = 0.10 * V_MAX   # 2.0 L — post-harvest partial reset (10% V_MAX)
+C_N_STOCK       = 3000.0
 CONTROL_INTERVAL = 10.0
 TOTAL_TIME      = 1000.0
 SAFE_BUFFER     = 0.98
@@ -82,7 +82,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     cx_int = 0.5 + torch.rand(n_interior, device=device) * 5.0
     cN_int = torch.rand(n_interior, device=device) * N_LIMIT_PATH * 0.6
     cq_int = torch.rand(n_interior, device=device) * cx_int * RATIO_LIMIT * 0.5
-    V_int  = 15.0 + torch.rand(n_interior, device=device) * 25.0  # 15-40 L
+    V_int  = V_MAX * (0.10 + torch.rand(n_interior, device=device) * 0.75)
     t_int  = torch.rand(n_interior, device=device) * 0.7
     # Actions: moderate, mostly safe
     a_int  = torch.rand(n_interior, 4, device=device) * 1.4 - 0.7  # [-0.7, 0.7]
@@ -91,24 +91,24 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # G1 boundary — high cN with variable Fn feed
     # ══════════════════════════════════════════════════════════════════════════
     cx_g1 = 0.5 + torch.rand(n_g1, device=device) * 5.0
-    # cN from 75% to 110% of limit — tighter focus on the dangerous upper tail
-    cN_g1 = N_LIMIT_PATH * (0.75 + torch.rand(n_g1, device=device) * 0.35)
+    # cN from 75% to 100% of limit
+    cN_g1 = N_LIMIT_PATH * (0.75 + torch.rand(n_g1, device=device) * 0.25)
     cq_g1 = torch.rand(n_g1, device=device) * cx_g1 * RATIO_LIMIT * 0.5
-    V_g1  = 20.0 + torch.rand(n_g1, device=device) * 25.0
+    V_g1  = V_MAX * (0.40 + torch.rand(n_g1, device=device) * 0.50)
     t_g1  = torch.rand(n_g1, device=device) * 0.8
     # Actions: sweep Fn from low to high to create boundary crossings
     a_g1  = torch.rand(n_g1, 4, device=device) * 2.0 - 1.0
     # Override Fn channel: full sweep [-1, 1]
     a_g1[:, 2] = torch.rand(n_g1, device=device) * 2.0 - 1.0
 
-    # ── G1 EXTREME sub-group: cN at 90-110% with max Fn pressure ──────────────
-    # Mirrors the exact validation scenario (cN 85-100%, a_t=ones) so the APN
+    # ── G1 EXTREME sub-group: cN at 85-100% with max Fn pressure ──────────────
+    # Mirrors the exact validation scenario so the APN
     # learns to project aggressively in this hardest corner of the constraint.
     n_g1_extreme = n_g1 // 3
     cx_g1e = 0.5 + torch.rand(n_g1_extreme, device=device) * 5.0
-    cN_g1e = N_LIMIT_PATH * (0.90 + torch.rand(n_g1_extreme, device=device) * 0.20)
+    cN_g1e = N_LIMIT_PATH * (0.85 + torch.rand(n_g1_extreme, device=device) * 0.15)
     cq_g1e = torch.rand(n_g1_extreme, device=device) * cx_g1e * RATIO_LIMIT * 0.5
-    V_g1e  = 20.0 + torch.rand(n_g1_extreme, device=device) * 25.0
+    V_g1e  = V_MAX * (0.40 + torch.rand(n_g1_extreme, device=device) * 0.50)
     t_g1e  = torch.rand(n_g1_extreme, device=device) * 0.8
     # Max-pressure actions: Fn forced near maximum, other dims random
     a_g1e  = torch.rand(n_g1_extreme, 4, device=device) * 2.0 - 1.0
@@ -118,12 +118,12 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # G2 boundary — cq/cx near ratio limit
     # ══════════════════════════════════════════════════════════════════════════
     cx_g2 = 0.3 + torch.rand(n_g2, device=device) * 5.0
-    # Product ratio from 80% to 120% of limit (tight boundary focus)
-    ratio_target = RATIO_LIMIT * (0.80 + torch.rand(n_g2, device=device) * 0.40)
+    # Product ratio from 80% to 100% of limit (tight boundary focus)
+    ratio_target = RATIO_LIMIT * (0.80 + torch.rand(n_g2, device=device) * 0.20)
     cq_g2 = (cx_g2 * ratio_target).clamp(0.0, 0.2)
     # Moderate-to-high cN so biomass growth is active (cx growth dilutes ratio)
     cN_g2 = N_LIMIT_PATH * (0.25 + torch.rand(n_g2, device=device) * 0.50)
-    V_g2  = 20.0 + torch.rand(n_g2, device=device) * 25.0
+    V_g2  = V_MAX * (0.40 + torch.rand(n_g2, device=device) * 0.50)
     t_g2  = torch.rand(n_g2, device=device) * 0.8
     a_g2  = torch.rand(n_g2, 4, device=device) * 2.0 - 1.0
     # Full light sweep: at low I, phi_Iq/phi_I ratio is higher → ratio worsens;
@@ -137,12 +137,22 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     cx_g4 = 0.5 + torch.rand(n_g4, device=device) * 5.0
     cN_g4 = torch.rand(n_g4, device=device) * 600.0
     cq_g4 = torch.rand(n_g4, device=device) * cx_g4 * RATIO_LIMIT * 0.6
-    # V from 75% to 110% of V_MAX
-    V_g4  = V_MAX * (0.75 + torch.rand(n_g4, device=device) * 0.35)
+    # V from 75% to SAFE_BUFFER of V_MAX
+    V_g4  = V_MAX * (0.75 + torch.rand(n_g4, device=device) * (SAFE_BUFFER - 0.75))
     t_g4  = torch.rand(n_g4, device=device) * 0.6
     a_g4  = torch.rand(n_g4, 4, device=device) * 2.0 - 1.0
     # Sweep Fn: high feed creates overflow
     a_g4[:, 2] = torch.rand(n_g4, device=device) * 2.0 - 1.0
+
+    # ── G4 EXTREME sub-group: V at 85-SAFE_BUFFER% with max Fn pressure ──────
+    n_g4_extreme = n_g4 // 3
+    cx_g4e = 0.5 + torch.rand(n_g4_extreme, device=device) * 5.0
+    cN_g4e = torch.rand(n_g4_extreme, device=device) * 600.0
+    cq_g4e = torch.rand(n_g4_extreme, device=device) * cx_g4e * RATIO_LIMIT * 0.6
+    V_g4e  = V_MAX * (0.85 + torch.rand(n_g4_extreme, device=device) * (SAFE_BUFFER - 0.85))
+    t_g4e  = torch.rand(n_g4_extreme, device=device) * 0.6
+    a_g4e  = torch.rand(n_g4_extreme, 4, device=device) * 2.0 - 1.0
+    a_g4e[:, 2] = 0.5 + torch.rand(n_g4_extreme, device=device) * 0.5  # Fn in [0.5, 1.0]
 
 
 
@@ -163,8 +173,8 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     cx_pb = 0.8 + torch.rand(n_post_bnd, device=device) * 1.7     # 0.8–2.5
     cN_pb = 100.0 + torch.rand(n_post_bnd, device=device) * 580.0 # 100–680
     cq_pb = torch.rand(n_post_bnd, device=device) * 0.04          # ≈0
-    # Volume starts near V_RESET (5 L) and may have grown a little via feed
-    V_pb  = V_RESET + torch.rand(n_post_bnd, device=device) * 15.0  # 5–20 L
+    # Volume starts near V_RESET and may have grown a little via feed
+    V_pb  = V_RESET + torch.rand(n_post_bnd, device=device) * (V_MAX * 0.3)
     a_pb  = torch.rand(n_post_bnd, 4, device=device) * 2.0 - 1.0
     a_pb[:, 2] = torch.rand(n_post_bnd, device=device) * 2.0 - 1.0  # full Fn
     # Temporal split: 40% pre-cycle (t≈0), 60% post-cycle (t>0.25)
@@ -177,8 +187,8 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     cx_pi = 0.8 + torch.rand(n_post_int, device=device) * 1.2     # 0.8–2.0
     cN_pi = 80.0 + torch.rand(n_post_int, device=device) * 200.0  # 80–280
     cq_pi = torch.rand(n_post_int, device=device) * 0.02          # ≈0
-    # Volume starts near V_RESET (5 L)
-    V_pi  = V_RESET + torch.rand(n_post_int, device=device) * 10.0  # 5–15 L
+    # Volume starts near V_RESET
+    V_pi  = V_RESET + torch.rand(n_post_int, device=device) * (V_MAX * 0.2)
     a_pi  = torch.rand(n_post_int, 4, device=device) * 1.4 - 0.7  # moderate
     n_pre_int  = int(n_post_int * 0.4)
     t_pi = torch.empty(n_post_int, device=device)
@@ -195,12 +205,12 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # ══════════════════════════════════════════════════════════════════════════
     # Concatenate all samples
     # ══════════════════════════════════════════════════════════════════════════
-    cx = torch.cat([cx_int, cx_g1, cx_g1e, cx_g2, cx_g4, cx_post])
-    cN = torch.cat([cN_int, cN_g1, cN_g1e, cN_g2, cN_g4, cN_post])
-    cq = torch.cat([cq_int, cq_g1, cq_g1e, cq_g2, cq_g4, cq_post])
-    V  = torch.cat([V_int,  V_g1,  V_g1e,  V_g2,  V_g4,  V_post]).clamp(V_MIN * 0.3, V_MAX * 1.3)
-    t_norm = torch.cat([t_int, t_g1, t_g1e, t_g2, t_g4, t_post])
-    actions = torch.cat([a_int, a_g1, a_g1e, a_g2, a_g4, a_post])
+    cx = torch.cat([cx_int, cx_g1, cx_g1e, cx_g2, cx_g4, cx_g4e, cx_post])
+    cN = torch.cat([cN_int, cN_g1, cN_g1e, cN_g2, cN_g4, cN_g4e, cN_post])
+    cq = torch.cat([cq_int, cq_g1, cq_g1e, cq_g2, cq_g4, cq_g4e, cq_post])
+    V  = torch.cat([V_int,  V_g1,  V_g1e,  V_g2,  V_g4,  V_g4e,  V_post]).clamp(V_MIN * 0.3, V_MAX * 1.3)
+    t_norm = torch.cat([t_int, t_g1, t_g1e, t_g2, t_g4, t_g4e, t_post])
+    actions = torch.cat([a_int, a_g1, a_g1e, a_g2, a_g4, a_g4e, a_post])
 
     num_samples = cx.shape[0]
 
@@ -211,13 +221,12 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # G1 extreme sub-group: also Inoculation
     g1e_start = n_interior + n_g1
     stage_idx[g1e_start : g1e_start + n_g1_extreme] = 0
-    # Mix some G4 samples into growth stage (stage 0) where feed is active
+    # Force G4 samples only into active feed stages (Stage 0 or Stage 1) where Fn is active
     g4_start = n_interior + n_g1 + n_g1_extreme + n_g2
-    stage_idx[g4_start:g4_start + n_g4] = torch.where(
-        torch.rand(n_g4, device=device) > 0.3,
-        torch.tensor(0, device=device),
-        stage_idx[g4_start:g4_start + n_g4]
-    )
+    stage_idx[g4_start:g4_start + n_g4] = torch.randint(0, 2, (n_g4,), device=device)
+    # G4 extreme sub-group: also active feed stages
+    g4e_start = g4_start + n_g4
+    stage_idx[g4e_start:g4e_start + n_g4_extreme] = torch.randint(0, 2, (n_g4_extreme,), device=device)
     # G2 samples: mostly production stage (stage 1)
     g2_start = n_interior + n_g1 + n_g1_extreme
     stage_idx[g2_start:g2_start + n_g2] = torch.where(
@@ -226,7 +235,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
         stage_idx[g2_start:g2_start + n_g2]
     )
     # Cycle-initial samples: always Inoculation stage (just started / backtracked)
-    post_start = n_interior + n_g1 + n_g1_extreme + n_g2 + n_g4
+    post_start = n_interior + n_g1 + n_g1_extreme + n_g2 + n_g4 + n_g4_extreme
     stage_idx[post_start:post_start + n_postcycle] = 0
 
     stage_onehot = torch.zeros(num_samples, 4, device=device)
@@ -235,8 +244,8 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # Credit remaining
     credit_norm = torch.rand(num_samples, device=device)
 
-    # Supply remaining
-    supply_norm = torch.rand(num_samples, device=device)
+    # Supply remaining (ensure some nitrate supply is always remaining, >= 0.05)
+    supply_norm = 0.05 + torch.rand(num_samples, device=device) * 0.95
 
     # Cycle-initial overrides: fresh Inoculation credits, supply split pre/post
     n_pre_total = int(n_postcycle * 0.4)
@@ -251,12 +260,27 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # Target extreme overflow boundary with a continuous sweep [-1.0, 1.0]
     # analogous to Fermentation-PPO handling of the level constraint
     extreme_overflow_slots = ((V / V_MAX) > 0.85) & (stage_onehot[:, 0].bool() | stage_onehot[:, 1].bool())
+    
+    # Do not override the manually forced G4 extreme samples
+    g4e_mask = torch.zeros(num_samples, dtype=torch.bool, device=device)
+    g4e_mask[g4e_start:g4e_start + n_g4_extreme] = True
+    extreme_overflow_slots = extreme_overflow_slots & ~g4e_mask
+    
     if extreme_overflow_slots.any():
         apply_survival_overflow = extreme_overflow_slots & (
             torch.rand(num_samples, device=device) < 0.50)
         # Use full [-1.0, 1.0] sweep to map the boundary smoothly
         safe_sweep_fn = -1.0 + torch.rand(num_samples, device=device) * 2.0
         actions[:, 2] = torch.where(apply_survival_overflow, safe_sweep_fn, actions[:, 2])
+
+    # ── Mask actions to match env's stage-aware and supply-aware action masking ──────
+    default_squashed = torch.tensor([-0.333, -1.0, -1.0, -1.0], device=device)
+    mask_time = stage_onehot[:, 0] + stage_onehot[:, 1]
+    mask_I    = stage_onehot[:, 0] + stage_onehot[:, 1]
+    mask_Fn   = (stage_onehot[:, 0] + stage_onehot[:, 1]) * (supply_norm > 0.0).float()
+    mask_Fout = stage_onehot[:, 2]
+    stage_mask = torch.stack([mask_time, mask_I, mask_Fn, mask_Fout], dim=1)
+    actions = actions * stage_mask + default_squashed * (1 - stage_mask)
 
     # ── Decode physical actions ───────────────────────────────────────────────
     a_scaled = (actions + 1.0) / 2.0
@@ -327,7 +351,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
 
     # ── Smooth-min across all constraints ─────────────────────────────────────
     all_margins = torch.stack([margin_g1, margin_g2, margin_g4], dim=1)
-    smooth_tau  = 0.15
+    smooth_tau  = 0.25
     min_margin  = -smooth_tau * torch.logsumexp(-all_margins / smooth_tau, dim=1)
 
     # ── Binary labels ─────────────────────────────────────────────────────────
@@ -341,7 +365,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     near_g1 = (cN / N_LIMIT_PATH) > 0.70
     ratio = cq / (cx + 1e-8)
     near_g2 = ratio > (RATIO_LIMIT * 0.65)
-    near_g4 = (V / V_MAX) > 0.75
+    near_g4 = (V / V_MAX) > 0.70
     near_boundary = near_g1 | near_g2 | near_g4
 
     # ── Assemble normalised states (12D) ──────────────────────────────────────

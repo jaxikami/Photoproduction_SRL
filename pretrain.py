@@ -226,7 +226,7 @@ def load_compatible_checkpoint(model: nn.Module, checkpoint_path: str, device: t
     return len(compatible), skipped
 
 
-def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
+def run_pretraining(epochs=10000, batch_size=32768, buffer_size=1000000,
                     refresh_interval=100, load=False):
     """Trains the safety boundary classifier APN on generated offline datasets.
 
@@ -303,19 +303,10 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
     loss_history = []
     accuracy_history = []
 
-    # Stopping thresholds: accuracy here = fraction of samples where the predicted
-    # margin sign matches the ground-truth margin sign (safe vs unsafe agreement).
-    early_stop_threshold = 0.993    # Target 99.3% sign-accuracy
-    required_success_per_buffer = 3000     # For 3000 consecutive epochs
-    buffer_success_count = 0
-
-    # Anti-stall plateau tracking
-    best_moving_avg = float('inf')
-    plateau_counter = 0
-    patience = 3000
+    # Validation / training configuration
+    min_training = 5000
+    validation_interval = 1000
     window_size = 200
-    improvement_threshold = 1e-4
-    min_training = 3000
 
     pbar = tqdm(range(epochs), desc="Training Safety Classifier")
 
@@ -440,7 +431,23 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
                 l_aux_g2 = F.binary_cross_entropy_with_logits(aux_g2, target_g2)
                 l_aux_g4 = F.binary_cross_entropy_with_logits(aux_g4, target_g4)
 
-                l_aux = (2.5 * l_aux_g1 + 2.0 * l_aux_g2 + 1.5 * l_aux_g4) / 6.0
+                # Dynamically weight auxiliary losses based on latest validation pass rates
+                if latest_pass_rates is not None:
+                    err_g1 = max(0.0, 1.0 - latest_pass_rates.get("G1", 1.0))
+                    err_g2 = max(0.0, 1.0 - latest_pass_rates.get("G2", 1.0))
+                    err_g4 = max(0.0, 1.0 - latest_pass_rates.get("G4", 1.0))
+                    total_err = err_g1 + err_g2 + err_g4
+                    if total_err > 1e-8:
+                        # Sum of default coefficients is 6.0 (2.0 + 2.0 + 2.0)
+                        c_g1 = 6.0 * (0.2 * (2.0/6.0) + 0.8 * (err_g1 / total_err))
+                        c_g2 = 6.0 * (0.2 * (2.0/6.0) + 0.8 * (err_g2 / total_err))
+                        c_g4 = 6.0 * (0.2 * (2.0/6.0) + 0.8 * (err_g4 / total_err))
+                    else:
+                        c_g1, c_g2, c_g4 = 2.0, 2.0, 2.0
+                else:
+                    c_g1, c_g2, c_g4 = 2.0, 2.0, 2.0
+
+                l_aux = (c_g1 * l_aux_g1 + c_g2 * l_aux_g2 + c_g4 * l_aux_g4) / 6.0
 
                 loss = 0.4 * l_bce + 0.25 * l_reg + 0.35 * l_aux
 
@@ -477,69 +484,28 @@ def run_pretraining(epochs=100000, batch_size=32768, buffer_size=1000000,
         loss_history.append(avg_loss)
         accuracy_history.append(accuracy)
 
-        # Plateau Logic: Only check after minimum warmup phase
-        if len(loss_history) >= window_size and epoch >= min_training:
-            current_moving_avg = np.mean(loss_history[-window_size:])
-
-            if current_moving_avg < best_moving_avg * (1 - improvement_threshold):
-                best_moving_avg = current_moving_avg
-                plateau_counter = 0
-            else:
-                plateau_counter += 1
-
-        # Convergence check (sustained high accuracy)
-        if epoch >= min_training and accuracy >= early_stop_threshold:
-            buffer_success_count += 1
-        else:
-            buffer_success_count = 0
-
+        # Finalize epoch metrics and update status
         pbar.set_postfix({
             'Loss': f'{avg_loss:.4f}',
             'Acc':  f'{accuracy:.4f}',
-            'Patience': f'{plateau_counter}/{patience}',
         })
 
-        if buffer_success_count >= required_success_per_buffer:
-            print(
-                f"\n[Success] Safety Classifier reached accuracy threshold. Running full validation suite...")
+        # Periodic evaluation: after min_training warmup, reevaluate every validation_interval epochs
+        if epoch >= min_training and (epoch - min_training) % validation_interval == 0:
+            print(f"\n[Validation] Re-evaluating validation suite at epoch {epoch}...")
             model.eval()
             from validation import run_validation
             all_passed, latest_pass_rates = run_validation(model)
 
-            # Unfreeze for potential further training
+            # Unfreeze parameters for further training
             for p in model.parameters():
                 p.requires_grad_(True)
 
             if all_passed:
-                print(
-                    f"\n[Success] All validation tests passed at epoch {epoch}! Terminating training.")
+                print(f"\n[Success] All validation tests passed at epoch {epoch}! Terminating training.")
                 break
             else:
-                print(f"\n[Validation] Tests failed. Continuing training...")
-                buffer_success_count = 0
-
-        # Also periodically run validation to catch successes even if accuracy threshold isn't fully met
-        elif epoch > min_training and epoch % 1000 == 0:
-            print(
-                f"\n[Validation] Periodic validation check at epoch {epoch}...")
-            model.eval()
-            from validation import run_validation
-            all_passed, latest_pass_rates = run_validation(model, num_test_samples=500)
-
-            for p in model.parameters():
-                p.requires_grad_(True)
-
-            if all_passed:
-                print(
-                    f"\n[Success] All validation tests passed at epoch {epoch}! Terminating training.")
-                break
-            else:
-                print(f"\n[Validation] Tests failed. Continuing training...")
-
-        if epoch >= min_training and plateau_counter >= patience:
-            print(
-                f"\n[Plateau] No 0.1% improvement for {patience} epochs. Terminating.")
-            break
+                print(f"[Validation] Some tests failed: {latest_pass_rates}. Dynamic weights updated.")
 
     os.makedirs("policy", exist_ok=True)
     torch.save(model.state_dict(), policy_path)
