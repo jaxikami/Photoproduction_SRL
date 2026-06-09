@@ -23,15 +23,33 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
             Stage 1→2 (Growth→Harvesting) transition
         g4 (path):     Reactor volume <= V_MAX                      — barrier + spike
         g5 (terminal): Episode MUST end in Idle stage (stage 3)     — HARD spike
-    Reward structure (per step):
-        reward = prod_reward
-               - constraint_penalty
-               - smoothing_penalty
-               - raw_material_penalty
+
+    Attributes:
+        episode_count (int): Count of elapsed training episodes.
+        lagrange_updates_enabled (bool): Flag indicating if monolithic Lagrangian updates are enabled.
+        W_BARRIER (float): Default quadratic buffer-zone scaling coefficient.
+        W_g1_BARRIER (float): G1-specific pre-limit barrier scaling coefficient.
+        W_g1_SPIKE (float): G1 linear penalty spike coefficient.
+        W_g1_QUAD (float): G1 quadratic penalty spike coefficient.
+        W_g2_BARRIER (float): G2-specific pre-limit barrier scaling coefficient.
+        W_g2_SPIKE (float): G2 linear penalty spike coefficient.
+        W_g2_QUAD (float): G2 quadratic penalty spike coefficient.
+        W_g3_SPIKE (float): G3 terminal penalty spike coefficient.
+        W_g4_SPIKE (float): G4 volume overflow penalty spike coefficient.
+        W_IDLE_HARD (float): G5 fixed hard terminal penalty spike coefficient.
+        prod_coef (float): Weight coefficient for the phycocyanin production reward.
+        harvest_coef (float): Weight coefficient for the harvested phycocyanin mass reward.
+        time_penalty (float): Small operational cost penalty per step.
+        smooth_coef (float): Weight coefficient for the action smoothing penalty.
+        raw_mat_coef (float): Weight coefficient for the nitrate feed raw material usage penalty.
+        G1_BUFFER_START (float): Threshold fraction of constraint limit where g1 buffer penalty starts.
+        G2_BUFFER_START (float): Threshold fraction of constraint limit where g2 buffer penalty starts.
+        nitrate_exhausted (bool): Flag indicating if nitrate supply is exhausted.
+        force_idle_signal (float): Penalty signal to force transition to idle.
     """
 
     def __init__(self):
-        """Initializes the benchmark environment with fixed penalty weights."""
+        """Initializes the benchmark environment and stationary penalty parameters."""
         self.episode_count = 0
         super().__init__()
 

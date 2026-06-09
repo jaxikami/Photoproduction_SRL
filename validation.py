@@ -52,7 +52,9 @@ def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS, lr=L
         threshold (float, optional): Target safety probability. Defaults to THRESHOLD.
 
     Returns:
-        tuple: (projected_action (torch.Tensor), optimization_steps_taken (int))
+        tuple: A tuple containing:
+            - projected_action (torch.Tensor): The projected, safe action tensor.
+            - optimization_steps_taken (int): The number of gradient steps taken.
     """
     state_fixed = state_norm_t.detach()
     stage_mask = PhycocyaninEnvCore.get_action_mask(state_fixed)
@@ -207,11 +209,20 @@ def run_validation(model=None, num_test_samples: int = 2000):
     g1_iters  = []
 
     for _ in range(num_test_samples):
-        cN = float(torch.empty(1).uniform_(N_LIMIT_PATH * 0.85, N_LIMIT_PATH * 1.00))
-        cx = float(torch.empty(1).uniform_(0.5, 5.0))
-        cq = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.8))
-        V  = float(torch.empty(1).uniform_(V_MAX * 0.60, V_MAX * 0.90))
-        t  = float(torch.empty(1).uniform_(0.0, 0.6))
+        if _ % 2 == 0:
+            # Edge case: high nitrate, normal volume
+            cN = float(torch.empty(1).uniform_(N_LIMIT_PATH * 0.85, N_LIMIT_PATH * 1.00))
+            cx = float(torch.empty(1).uniform_(0.5, 5.0))
+            cq = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.8))
+            V  = float(torch.empty(1).uniform_(V_MAX * 0.60, V_MAX * 0.90))
+            t  = float(torch.empty(1).uniform_(0.0, 0.6))
+        else:
+            # Broad case: full valid spectrum
+            cN = float(torch.empty(1).uniform_(0.0, N_LIMIT_PATH * 1.00))
+            cx = float(torch.empty(1).uniform_(0.1, 6.0))
+            cq = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.9))
+            V  = float(torch.empty(1).uniform_(V_MIN, V_MAX * 0.95))
+            t  = float(torch.empty(1).uniform_(0.0, 0.9))
 
         s_t = _make_state(cx, cN, cq, V, stage_idx=0, credit_norm=0.5,
                           t_norm=t, supply_norm=0.5, device=device)
@@ -253,11 +264,20 @@ def run_validation(model=None, num_test_samples: int = 2000):
     g2_iters  = []
 
     for _ in range(num_test_samples):
-        cx = float(torch.empty(1).uniform_(0.5, 5.0))
-        cq = cx * RATIO_LIMIT * float(torch.empty(1).uniform_(0.90, 1.00))
-        cN = float(torch.empty(1).uniform_(350.0, 600.0))
-        V  = float(torch.empty(1).uniform_(V_MAX * 0.60, V_MAX * 0.90))
-        t  = float(torch.empty(1).uniform_(0.0, 0.6))
+        if _ % 2 == 0:
+            # Edge case: ratio near limit
+            cx = float(torch.empty(1).uniform_(0.5, 5.0))
+            cq = cx * RATIO_LIMIT * float(torch.empty(1).uniform_(0.90, 1.00))
+            cN = float(torch.empty(1).uniform_(350.0, 600.0))
+            V  = float(torch.empty(1).uniform_(V_MAX * 0.60, V_MAX * 0.90))
+            t  = float(torch.empty(1).uniform_(0.0, 0.6))
+        else:
+            # Broad case: full valid spectrum
+            cx = float(torch.empty(1).uniform_(0.1, 6.0))
+            cq = cx * RATIO_LIMIT * float(torch.empty(1).uniform_(0.0, 1.00))
+            cN = float(torch.empty(1).uniform_(0.0, 800.0))
+            V  = float(torch.empty(1).uniform_(V_MIN, V_MAX * 0.95))
+            t  = float(torch.empty(1).uniform_(0.0, 0.9))
 
         s_t = _make_state(cx, cN, cq, V, stage_idx=1, credit_norm=0.5,
                           t_norm=t, supply_norm=0.5, device=device)
@@ -307,11 +327,20 @@ def run_validation(model=None, num_test_samples: int = 2000):
     g4_iters  = []
 
     for _ in range(num_test_samples):
-        V  = float(torch.empty(1).uniform_(V_MAX * 0.85, V_MAX * SAFE_BUFFER))
-        cx = float(torch.empty(1).uniform_(0.5, 5.0))
-        cN = float(torch.empty(1).uniform_(0.0, 400.0))
-        cq = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.8))
-        t  = float(torch.empty(1).uniform_(0.0, 0.5))
+        if _ % 2 == 0:
+            # Edge case: volume near limit
+            V  = float(torch.empty(1).uniform_(V_MAX * 0.85, V_MAX * SAFE_BUFFER))
+            cx = float(torch.empty(1).uniform_(0.5, 5.0))
+            cN = float(torch.empty(1).uniform_(0.0, 400.0))
+            cq = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.8))
+            t  = float(torch.empty(1).uniform_(0.0, 0.5))
+        else:
+            # Broad case: full valid spectrum
+            V  = float(torch.empty(1).uniform_(V_MIN, V_MAX * SAFE_BUFFER))
+            cx = float(torch.empty(1).uniform_(0.1, 6.0))
+            cN = float(torch.empty(1).uniform_(0.0, 800.0))
+            cq = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.8))
+            t  = float(torch.empty(1).uniform_(0.0, 0.9))
 
         stage = 0 if torch.rand(1).item() > 0.5 else 1
         s_t = _make_state(cx, cN, cq, V, stage_idx=stage, credit_norm=0.5,
@@ -345,11 +374,20 @@ def run_validation(model=None, num_test_samples: int = 2000):
     print(f"\n--- [TEST 4] Identity mapping: safe states unmodified (diff ≤ 2%) ---")
     id_passes = 0
     for _ in range(num_test_samples):
-        cx     = float(torch.empty(1).uniform_(0.5, 5.0))
-        cN     = float(torch.empty(1).uniform_(0.0, N_LIMIT_PATH * 0.50))
-        cq     = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.60))
-        V      = float(torch.empty(1).uniform_(V_MAX * 0.40, V_MAX * 0.80))
-        t_norm = float(torch.empty(1).uniform_(0.0, 0.50))
+        if _ % 2 == 0:
+            # Typical operation states
+            cx     = float(torch.empty(1).uniform_(0.5, 5.0))
+            cN     = float(torch.empty(1).uniform_(0.0, N_LIMIT_PATH * 0.50))
+            cq     = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.60))
+            V      = float(torch.empty(1).uniform_(V_MAX * 0.40, V_MAX * 0.80))
+            t_norm = float(torch.empty(1).uniform_(0.0, 0.50))
+        else:
+            # Broad safe spectrum
+            cx     = float(torch.empty(1).uniform_(0.1, 6.0))
+            cN     = float(torch.empty(1).uniform_(0.0, N_LIMIT_PATH * 0.80))
+            cq     = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.80))
+            V      = float(torch.empty(1).uniform_(V_MIN, V_MAX * 0.90))
+            t_norm = float(torch.empty(1).uniform_(0.0, 0.90))
 
         s_t = _make_state(cx, cN, cq, V, stage_idx=0, credit_norm=0.7,
                           t_norm=t_norm, supply_norm=0.7, device=device)

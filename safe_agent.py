@@ -25,7 +25,16 @@ if hasattr(torch.backends, 'miopen'):
 
 @njit(cache=True)
 def _discount_rewards(raw_rewards, terminals, gamma):
-    """Numba-accelerated GAE-style reward discounting."""
+    """Numba-accelerated GAE-style reward discounting.
+
+    Args:
+        raw_rewards (np.ndarray): Array of step rewards.
+        terminals (np.ndarray): Binary array indicating episode termination.
+        gamma (float): Discount factor.
+
+    Returns:
+        np.ndarray: Array of discounted cumulative rewards.
+    """
     n = len(raw_rewards)
     discounted = np.zeros(n, dtype=np.float32)
     running = 0.0
@@ -52,6 +61,16 @@ class ActorCritic(nn.Module):
         - Masked dims get a fixed default intent (pre-Tanh)
         - Masked dims get near-zero std to suppress exploration
         - Log-probs exclude masked dims
+
+    Attributes:
+        LOG_STD_MIN (float): Minimum log standard deviation clamp.
+        LOG_STD_MAX (float): Maximum log standard deviation clamp.
+        env_state_dim (int): Observation dimension.
+        hidden_dim (int): GRU hidden state dimension.
+        gru (nn.GRU): GRU temporal encoder network.
+        actor (nn.Sequential): Policy actor MLP.
+        log_std (nn.Parameter): Standard deviation parameter for action log-probabilities.
+        critic (nn.Sequential): Value function critic MLP.
     """
     def __init__(self, state_dim=12, action_dim=4, hidden_dim=128):
         """Initializes the GRU encoder and Actor/Critic heads.
@@ -168,8 +187,10 @@ class ActorCritic(nn.Module):
         Returns:
             tuple: (log_probs, state_values, dist_entropy)
         """
+        from env_core import PhycocyaninEnvCore
         features = self.compute_features(state, is_terminals)
-        return self.evaluate_from_features(features, state, z_raw)
+        mask = PhycocyaninEnvCore.get_action_mask(state[..., :self.env_state_dim])
+        return self.evaluate_from_features(features, mask, z_raw)
 
     def compute_features(self, state, is_terminals=None):
         """Runs the GRU over full sequences to produce temporal features.
@@ -208,24 +229,20 @@ class ActorCritic(nn.Module):
         features = torch.nan_to_num(features, nan=0.0)
         return features
 
-    def evaluate_from_features(self, features, state, z_raw):
+    def evaluate_from_features(self, features, mask, z_raw):
         """Evaluates log-probs, values, entropy from pre-computed GRU features.
 
         Args:
             features (torch.Tensor): (T, hidden_dim + state_dim) from compute_features.
-            state (torch.Tensor): Batch of state tensors (T, state_dim) for masking.
+            mask (torch.Tensor): Batch of precomputed masks (T, action_dim).
             z_raw (torch.Tensor): Batch of unbounded actions (T, action_dim).
 
         Returns:
             tuple: (log_probs, state_values, dist_entropy)
         """
-        from env_core import PhycocyaninEnvCore
-
         mean = self.actor(features)
         mean = torch.nan_to_num(mean, nan=0.0)
         std  = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
-
-        mask = PhycocyaninEnvCore.get_action_mask(state[..., :self.env_state_dim])
 
         default_intent = torch.full_like(mean, -10.0)
         default_intent[..., 0] = -0.4329
@@ -279,8 +296,39 @@ class ActorCritic(nn.Module):
 
 
 class SPRL_Agent:
-    """Safe PPO agent combining a GRU ActorCritic, stage masking, and APN projection."""
+    """Safe PPO agent combining a GRU ActorCritic, stage masking, and APN projection.
+
+    Attributes:
+        gamma (float): Discount factor for reward accumulation.
+        eps_clip (float): PPO clipping factor.
+        K_epochs (int): Number of update epochs per learn cycle.
+        entropy_coeff (float): Coefficient scaling the policy entropy bonus.
+        _hidden (torch.Tensor or None): Persistent hidden state tensor for GRU.
+        policy (ActorCritic): Current actor-critic network instance.
+        policy_old (ActorCritic): Previous actor-critic network instance.
+        optimizer (torch.optim.Optimizer): Optimizer for policy parameters.
+        safeguard (ActionProjectionNetwork): Action Projection Network instance.
+        _proj_calls (int): Counter for action projection attempts.
+        _proj_noop (int): Counter for action projections resulting in a no-op.
+        _proj_iters (int): Counter for total projection gradient steps.
+        _default_squashed (torch.Tensor): Tensor representing default action pre-allocations.
+        _state_buffer (torch.Tensor): Pre-allocated placeholder tensor for state inputs.
+        MseLoss (nn.Module): Mean squared error loss evaluator.
+    """
+
     def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, entropy_coeff):
+        """Initializes the safe agent, setting up policy and projection networks.
+
+        Args:
+            state_dim (int): Observation space size.
+            action_dim (int): Action space size.
+            lr_actor (float): Learning rate for the actor policy head and GRU.
+            lr_critic (float): Learning rate for the critic value head.
+            gamma (float): Discount factor.
+            K_epochs (int): Epochs of policy optimization per update.
+            eps_clip (float): Clipping boundary parameter.
+            entropy_coeff (float): Factor scaling the entropy regularization.
+        """
         self.gamma          = gamma
         self.eps_clip       = eps_clip
         self.K_epochs       = K_epochs
@@ -333,6 +381,15 @@ class SPRL_Agent:
         self._hidden = None
 
     def get_and_reset_proj_stats(self):
+        """Returns action projection statistics and resets internal counters.
+
+        Returns:
+            dict: A dictionary containing:
+                - calls (int): Total number of projection attempts.
+                - noop (int): Total number of bypasses (action already safe).
+                - iters (int): Total gradient optimization steps.
+                - avg_it (float): Average optimization iterations per non-noop call.
+        """
         calls  = self._proj_calls
         noop   = self._proj_noop
         iters  = self._proj_iters
@@ -507,30 +564,29 @@ class SPRL_Agent:
             advantages = rewards - old_state_values.squeeze()
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+            from env_core import PhycocyaninEnvCore
+            mask_all = PhycocyaninEnvCore.get_action_mask(old_states[..., :self.policy.env_state_dim])
+            
+            features_all = self.policy.compute_features(
+                old_states, is_terminals=is_terminals)
+
         batch_size     = old_states.size(0)
         mini_batch_size = 256
 
         for _ in range(self.K_epochs):
-            # GRU features computed once per epoch then detached — temporal context
-            # is preserved but actor/critic get fresh forward passes per mini-batch
-            # (matching the fermentation PPO update mechanism exactly).
-            with torch.no_grad():
-                features_all = self.policy.compute_features(
-                    old_states, is_terminals=is_terminals)
-
             permutation = torch.randperm(batch_size)
             for start_idx in range(0, batch_size, mini_batch_size):
                 batch_indices = permutation[start_idx : start_idx + mini_batch_size]
 
                 b_features = features_all[batch_indices]
-                b_states   = old_states[batch_indices]
+                b_masks    = mask_all[batch_indices]
                 b_z_raw    = old_z_raw[batch_indices]
                 b_old_lp   = old_logprobs[batch_indices]
                 b_rewards  = rewards[batch_indices]
                 b_adv      = advantages[batch_indices]
 
                 logprobs, state_values, dist_entropy = self.policy.evaluate_from_features(
-                    b_features, b_states, b_z_raw)
+                    b_features, b_masks, b_z_raw)
 
                 ratios = torch.exp(logprobs - b_old_lp)
                 surr1  = ratios * b_adv
@@ -541,19 +597,14 @@ class SPRL_Agent:
                         + 0.5  * self.MseLoss(state_values.squeeze(), b_rewards)
                         - self.entropy_coeff * dist_entropy.mean())
 
-                if torch.isnan(loss) or torch.isinf(loss):
-                    self.policy.load_state_dict(self.policy_old.state_dict())
-                    self.policy_old.load_state_dict(self.policy.state_dict())
-                    return
-
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
                 self.optimizer.step()
 
-                if any(torch.isnan(p).any() for p in self.policy.parameters()):
-                    self.policy.load_state_dict(self.policy_old.state_dict())
-                    self.policy_old.load_state_dict(self.policy.state_dict())
-                    return
+            if any(torch.isnan(p).any() for p in self.policy.parameters()):
+                self.policy.load_state_dict(self.policy_old.state_dict())
+                self.policy_old.load_state_dict(self.policy.state_dict())
+                return
 
         self.policy_old.load_state_dict(self.policy.state_dict())

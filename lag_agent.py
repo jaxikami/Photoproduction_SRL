@@ -17,7 +17,16 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 @njit(cache=True)
 def _discount_rewards(raw_rewards, terminals, gamma):
-    """Numba-accelerated reward discounting."""
+    """Numba-accelerated reward discounting.
+
+    Args:
+        raw_rewards (np.ndarray): Array of step rewards.
+        terminals (np.ndarray): Binary array indicating episode termination.
+        gamma (float): Discount factor.
+
+    Returns:
+        np.ndarray: Array of discounted cumulative rewards.
+    """
     n = len(raw_rewards)
     discounted = np.zeros(n, dtype=np.float32)
     running = 0.0
@@ -44,6 +53,13 @@ class ActorCriticStandardRL(nn.Module):
     Action space (4D):
         [time_multiplier, light_intensity, nitrate_feed, outstream_flow].
         The outputs are squashed to [-1, 1] using tanh.
+
+    Attributes:
+        LOG_STD_MIN (float): Minimum log standard deviation clamp.
+        LOG_STD_MAX (float): Maximum log standard deviation clamp.
+        actor (nn.Sequential): Policy actor network.
+        log_std (nn.Parameter): Trainable log standard deviation vector.
+        critic (nn.Sequential): Value critic network.
     """
     def __init__(self, state_dim=12, action_dim=4):
         """Initializes the Actor and Critic neural networks.
@@ -131,6 +147,16 @@ class StandardRL_Agent:
     
     This class handles trajectory collection, reward discounting, advantage
     normalization, and the core PPO surrogate loss optimization loop.
+
+    Attributes:
+        gamma (float): Discount factor for future rewards.
+        eps_clip (float): PPO clipping parameter for surrogate objective.
+        K_epochs (int): Number of optimization epochs per policy update.
+        entropy_coeff (float): Coefficient for action distribution entropy regularization.
+        policy (ActorCriticStandardRL): Current policy network.
+        policy_old (ActorCriticStandardRL): Old behavior policy network.
+        optimizer (torch.optim.Optimizer): Optimization parameter group.
+        MseLoss (nn.Module): Mean squared error loss evaluator.
     """
     def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, entropy_coeff):
         """Initializes the PPO agent, networks, and optimizers.

@@ -50,9 +50,17 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
             adjust boundary sub-sampling priorities. Defaults to None.
 
     Returns:
-        tuple: (states, actions, is_safe, smooth_min_margin, margin_g1, margin_g2, margin_g4, near_boundary_mask)
+        tuple: A tuple containing:
+            - states (torch.Tensor): 12D normalized states.
+            - actions (torch.Tensor): 4D actions in range [-1, 1].
+            - is_safe (torch.Tensor): Binary safety labels (1.0 for safe, 0.0 for unsafe).
+            - smooth_min_margin (torch.Tensor): Smoothed minimum margin across constraints.
+            - margin_g1 (torch.Tensor): Margin for G1 constraint.
+            - margin_g2 (torch.Tensor): Margin for G2 constraint.
+            - margin_g4 (torch.Tensor): Margin for G4 constraint.
+            - near_boundary (torch.Tensor): Boolean mask indicating boundary proximity.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")   # always generate on CPU; training loop does the H2D move
 
     n_postcycle = int(num_samples * 0.12)
     n_interior = int(num_samples * (1.0 - bias))
@@ -299,7 +307,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
         actions[:, 2] = torch.where(apply_survival_overflow, safe_sweep_fn, actions[:, 2])
 
     # ── Mask actions to match env's stage-aware and supply-aware action masking ──────
-    default_squashed = torch.tensor([-0.333, -1.0, -1.0, -1.0], device=device)
+    default_squashed = torch.tensor([-0.407, -1.0, -1.0, -1.0], device=device)
     mask_time = stage_onehot[:, 0] + stage_onehot[:, 1]
     mask_I    = stage_onehot[:, 0] + stage_onehot[:, 1]
     mask_Fn   = (stage_onehot[:, 0] + stage_onehot[:, 1]) * (supply_norm > 0.0).float()
@@ -425,7 +433,14 @@ def get_fresh_batch_dataset(num_samples: int = 500000, bias: float = 0.7, pass_r
         pass_rates (dict, optional): Passed to the raw batch generator. Defaults to None.
 
     Returns:
-        tuple: Permuted balanced tensors (states, actions, labels, min_margin, margin_g1, margin_g2, margin_g4).
+        tuple: A tuple of balanced tensors containing:
+            - states (torch.Tensor): 12D normalized states.
+            - actions (torch.Tensor): 4D actions in range [-1, 1].
+            - labels (torch.Tensor): Binary safety labels (0.95 for safe, 0.05 for unsafe).
+            - margins (torch.Tensor): Smoothed minimum margins.
+            - margins_g1 (torch.Tensor): Margins for G1 constraint.
+            - margins_g2 (torch.Tensor): Margins for G2 constraint.
+            - margins_g4 (torch.Tensor): Margins for G4 constraint.
     """
     target_safe_reg = num_samples * 15 // 100
     target_safe_bnd = num_samples * 25 // 100

@@ -108,7 +108,18 @@ class ActionProjectionNetwork(nn.Module):
         self.g4_head = nn.Linear(latent_dim, 1)
 
     def _encode_state(self, state_norm):
-        """Encodes state into FiLM conditioning parameters."""
+        """Encodes the state into FiLM conditioning parameter tensors.
+
+        Args:
+            state_norm (torch.Tensor): The normalized observation vector.
+
+        Returns:
+            tuple: A tuple containing:
+                - h_s (torch.Tensor): The state encoder embedding tensor.
+                - film1 (torch.Tensor): Conditioning parameter tensor for block 1.
+                - film2 (torch.Tensor): Conditioning parameter tensor for block 2.
+                - film3 (torch.Tensor): Conditioning parameter tensor for block 3.
+        """
         h_s = self.state_encoder(state_norm)
         film1 = self.film1(h_s)
         film2 = self.film2(h_s)
@@ -116,12 +127,30 @@ class ActionProjectionNetwork(nn.Module):
         return h_s, film1, film2, film3
 
     def _apply_film(self, x, film_params):
-        """Applies FiLM: x * (1 + γ) + β."""
+        """Applies FiLM modulation: x * (1 + gamma) + beta.
+
+        Args:
+            x (torch.Tensor): Input activation tensor.
+            film_params (torch.Tensor): Split conditioning parameters.
+
+        Returns:
+            torch.Tensor: The modulated activation tensor.
+        """
         gamma, beta = film_params.chunk(2, dim=-1)
         return x * (1.0 + gamma) + beta
 
     def _action_trunk(self, action_norm, film1, film2, film3):
-        """Processes action through FiLM-modulated trunk."""
+        """Processes action tensor through the FiLM-modulated trunk.
+
+        Args:
+            action_norm (torch.Tensor): Normalized action vector.
+            film1 (torch.Tensor): Modulation parameters for the first layer.
+            film2 (torch.Tensor): Modulation parameters for the second layer.
+            film3 (torch.Tensor): Modulation parameters for the third layer.
+
+        Returns:
+            torch.Tensor: The processed action representation tensor.
+        """
         h = self.act(self.action_lift(action_norm))
 
         h = self.trunk_fc1(h)
@@ -217,6 +246,18 @@ class ActionProjectionNetwork(nn.Module):
 # Keep as a module-level alias so existing call sites in validation/safe_agent
 # that import load_compatible_checkpoint still work without changes.
 def load_compatible_checkpoint(model: nn.Module, checkpoint_path: str, device: torch.device):
+    """Loads compatible weights from checkpoint_path into model, skipping mismatched shapes.
+
+    Args:
+        model (nn.Module): Target network model instance.
+        checkpoint_path (str): File path to saved state dictionary.
+        device (torch.device): Device configuration.
+
+    Returns:
+        tuple: A tuple containing:
+            - num_loaded (int): Count of successfully loaded weight tensors.
+            - num_skipped (int): Count of skipped weight tensors due to shape mismatch.
+    """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     current = model.state_dict()
     compatible = {k: v for k, v in ckpt.items()
@@ -242,8 +283,27 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=1000000,
         refresh_interval (int, optional): Epochs between dataset refreshes. Defaults to 100.
         load (bool, optional): Whether to resume from an existing checkpoint. Defaults to False.
     """
+    # TF32 and CuDNN benchmark can cause HIPBLAS_STATUS_NOT_SUPPORTED errors on some Windows/ROCm setups
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.benchmark = False
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    def _to_device(t, dev):
+        """Moves a tensor to the specified device, pinning memory if CUDA.
+
+        Args:
+            t (torch.Tensor): The tensor to move.
+            dev (torch.device): The target device.
+
+        Returns:
+            torch.Tensor: The moved tensor.
+        """
+        if dev.type == 'cuda':
+            return t.pin_memory().to(dev, non_blocking=True)
+        return t.to(dev)
 
     model = ActionProjectionNetwork(state_dim=12, action_dim=4).to(device)
 
@@ -252,12 +312,15 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=1000000,
         model = ActionProjectionNetwork.from_checkpoint(
             policy_path, device, state_dim=12, action_dim=4)
 
+    _fwd_aux = model.forward_aux
+
     # Optimizer settings tuned for long (~20k epoch) runs:
     # lower start LR, gentler decay envelope, and stronger L2 regularization.
     initial_lr = 5e-4
     weight_decay = 1e-4
-    optimizer = optim.Adam(model.parameters(), lr=initial_lr,
-                           weight_decay=weight_decay)
+    optimizer = optim.Adam(
+        model.parameters(), lr=initial_lr, weight_decay=weight_decay
+    )
 
     # ── Loss function design ────────────────────────────────────────────────
     # Physical margins from data_gen are normalised to the constraint limit.
@@ -324,13 +387,13 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=1000000,
     # Initial explicit dataset spawn
     b_s_raw, b_a_raw, b_labels, b_margins, b_mg1, b_mg2, b_mg4 = \
         get_fresh_batch_dataset(buffer_size, bias=0.7, pass_rates=latest_pass_rates)
-    b_s_raw = b_s_raw.to(device)
-    b_a_raw = b_a_raw.to(device)
-    b_labels = b_labels.to(device)
-    b_margins = b_margins.to(device)
-    b_mg1 = b_mg1.to(device)
-    b_mg2 = b_mg2.to(device)
-    b_mg4 = b_mg4.to(device)
+    b_s_raw     = _to_device(b_s_raw, device)
+    b_a_raw     = _to_device(b_a_raw, device)
+    b_labels    = _to_device(b_labels, device)
+    b_margins   = _to_device(b_margins, device)
+    b_mg1       = _to_device(b_mg1, device)
+    b_mg2       = _to_device(b_mg2, device)
+    b_mg4       = _to_device(b_mg4, device)
 
     # Print class balance diagnostics for the initial dataset
     safe_ratio = b_labels.mean().item()
@@ -347,13 +410,13 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=1000000,
             if epoch > 0 and future_dataset is not None:
                 b_s_raw, b_a_raw, b_labels, b_margins, b_mg1, b_mg2, b_mg4 = \
                     future_dataset.result()
-                b_s_raw = b_s_raw.to(device)
-                b_a_raw = b_a_raw.to(device)
-                b_labels = b_labels.to(device)
-                b_margins = b_margins.to(device)
-                b_mg1 = b_mg1.to(device)
-                b_mg2 = b_mg2.to(device)
-                b_mg4 = b_mg4.to(device)
+                b_s_raw     = _to_device(b_s_raw, device)
+                b_a_raw     = _to_device(b_a_raw, device)
+                b_labels    = _to_device(b_labels, device)
+                b_margins   = _to_device(b_margins, device)
+                b_mg1       = _to_device(b_mg1, device)
+                b_mg2       = _to_device(b_mg2, device)
+                b_mg4       = _to_device(b_mg4, device)
                 safe_ratio = b_labels.mean().item()
                 print(
                     f"\n[Data] Refreshed class balance at epoch {epoch}: {safe_ratio:.2%} safe, {1-safe_ratio:.2%} unsafe")
@@ -383,20 +446,18 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=1000000,
             optimizer.zero_grad()
 
             def calculate_loss():
+                """Computes the composite boundary-learning loss for pretraining.
+
+                Combines BCE focal loss on safety logits, scaled SmoothL1 regression
+                to ground margins, and auxiliary per-constraint classifiers.
+
+                Returns:
+                    tuple: A tuple containing:
+                        - loss (torch.Tensor): The scalar loss tensor.
+                        - correct (int): Number of correct safety classifications.
+                        - total (int): Total number of samples evaluated in the batch.
                 """
-                Composite boundary-learning loss with three components:
-
-                1. BCE with focal modulation (boundary signal, primary):
-                   Uses margin_pred as a logit against the hard safe/unsafe class.
-                   Focal weighting concentrates on hard-to-classify boundary samples.
-
-                2. Scaled regression (magnitude calibration):
-                   SmoothL1(margin_pred, b_m * MARGIN_SCALE).
-
-                3. Per-constraint auxiliary BCE (G2/G5 upweighted 1.5×):
-                   Each aux head gets direct gradient from its own constraint.
-                """
-                margin_pred, aux_g1, aux_g2, aux_g4 = model.forward_aux(b_s, b_a)
+                margin_pred, aux_g1, aux_g2, aux_g4 = _fwd_aux(b_s, b_a)
 
                 # Hard class target from physical margin sign
                 sign_target = (b_m >= 0.0).float()
@@ -525,6 +586,15 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=1000000,
     ax2 = ax1.twinx()
 
     def moving_average(values, window):
+        """Computes a fast moving average over a sliding window.
+
+        Args:
+            values (list or np.ndarray): Raw data values.
+            window (int): The width of the sliding window.
+
+        Returns:
+            np.ndarray: The smoothed array of moving averages.
+        """
         values_np = np.asarray(values, dtype=np.float64)
         cumulative = np.cumsum(values_np)
         smoothed = np.empty_like(values_np)

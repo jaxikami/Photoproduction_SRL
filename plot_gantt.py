@@ -8,6 +8,13 @@ import matplotlib.patches as mpatches
 import os
 
 def generate_gantt():
+    """Generates a Gantt chart comparing stage schedules of Safe vs Standard RL.
+
+    Loads the evaluation trajectory logs for both the Standard RL and the Safe RL
+    agents from saved numpy binaries under the policy directory, parses the active
+    operational stages over time, and outputs a horizontal bar plot comparing their
+    timelines.
+    """
     # Load evaluation npz files
     safe_path = os.path.join("policy", "eval_data_safe.npz")
     std_path = os.path.join("policy", "eval_data_standard.npz")
@@ -46,6 +53,16 @@ def generate_gantt():
 
     # Helper function to plot stage blocks for an agent
     def plot_agent_timeline(y_pos, stages, agent_label):
+        """Plots contiguous stage intervals as horizontal blocks for an agent.
+
+        Groups sequential time steps having the same active stage index into
+        single horizontal bars to create a clean Gantt-style timeline.
+
+        Args:
+            y_pos (int): The vertical position (y-coordinate) on the chart.
+            stages (np.ndarray): Sequence of active stage indices over the episode.
+            agent_label (str): Name or description of the agent being plotted.
+        """
         # We find contiguous stage segments to plot them as single bars
         start_idx = 0
         current_stage = stages[0]

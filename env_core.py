@@ -116,8 +116,7 @@ def integrate_rk4(state_init, I, Fn, F_out, dt, n_steps):
 # =============================================================================
 
 class PhycocyaninEnvCore:
-    """
-    Multi-stage photobioreactor RL environment core.
+    """Multi-stage photobioreactor RL environment core.
 
     Stages:
         0 — Inoculation: Rapid biomass accumulation (I: 120-400, Fn: 0-40)
@@ -131,9 +130,42 @@ class PhycocyaninEnvCore:
         1 — Light intensity  (120–400 μmol/m²/s, active in Inoculation/Growth)
         2 — Nitrate feed     (0–40 or 0–10 mg/L/h, active in Inoculation/Growth)
         3 — Outstream flow   (0–Fout_max L/h, active in Harvesting only)
+
+    Attributes:
+        total_time (float): Maximum simulation duration in hours (1000.0).
+        control_freq (float): Duration of each control action step in hours (10.0).
+        max_steps (int): Maximum number of control steps per episode.
+        n_stage (int): Number of operational stages (4).
+        BASE_CREDITS (np.ndarray): Base time credits assigned to each stage.
+        I_MIN (float): Minimum light intensity.
+        I_MAX (float): Maximum light intensity.
+        FN_MAX_GROWTH (float): Maximum nitrate feed rate during growth stage 0.
+        FN_MAX_PROD (float): Maximum nitrate feed rate during growth stage 1.
+        FOUT_MAX (float): Maximum outstream volumetric flow rate.
+        V_MAX (float): Maximum reactor capacity volume.
+        V_MIN (float): Minimum allowable reactor volume.
+        V_INITIAL (float): Initial fill volume of the reactor.
+        V_DRAIN (float): Volume threshold to trigger the cleanup/idle transition.
+        V_RESET (float): Post-harvest reset volume.
+        INITIAL_NITRATE_SUPPLY (float): Initial total nitrate budget.
+        N_LIMIT_PATH (float): Constraint threshold for max path nitrate.
+        RATIO_LIMIT (float): Constraint threshold for max cq/cx ratio.
+        N_LIMIT_TERM (float): Constraint threshold for terminal nitrate.
+        OVERFLOW_BUFFER_FRAC (float): Buffer fraction at which the overflow constraint activates.
+        dt (float): Inner integration step duration.
+        n_inner_steps (int): Number of integration steps per control step.
+        time (float): Current time in the simulation.
+        time_step_count (int): Current step index in the episode.
+        current_stage (int): The currently active operational stage index.
+        stage_credits (float): Remaining time credits for the active stage.
+        state (np.ndarray): The physical state [Biomass, Nitrate, Phycocyanin, Volume].
+        nitrate_supply (float): Remaining global nitrate supply.
+        prev_action (np.ndarray): The action executed in the previous step.
+        violation_count (int): Total number of safety violations in the episode.
     """
 
     def __init__(self):
+        """Initializes the environment settings, physical boundaries, and parameters."""
         # --- Simulation Config ---
         self.total_time = 1000.0
         self.control_freq = 10.0

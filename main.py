@@ -51,9 +51,25 @@ class Memory:
     Holds pre-allocated numpy arrays for states, actions, rewards, log-probabilities,
     and terminal flags to be consumed by the PPO optimization step.
     Avoids per-step tensor allocation overhead.
+
+    Attributes:
+        capacity (int): Pre-allocated capacity of the memory buffer.
+        _states (np.ndarray): Buffer array storing state observations.
+        _actions (np.ndarray): Buffer array storing executed actions.
+        _raw_actions (np.ndarray): Buffer array storing pre-squashed actions.
+        _logprobs (np.ndarray): Buffer array storing action log-probabilities.
+        _rewards (np.ndarray): Buffer array storing step rewards.
+        _is_terminals (np.ndarray): Buffer array storing terminal flags.
+        _ptr (int): Current write pointer index for the buffer arrays.
     """
     def __init__(self, capacity=UPDATE_TIMESTEP + 200, state_dim=STATE_DIM, action_dim=ACTION_DIM):
-        """Initializes pre-allocated numpy trajectory arrays."""
+        """Initializes pre-allocated numpy trajectory arrays.
+
+        Args:
+            capacity (int, optional): Buffer capacity. Defaults to UPDATE_TIMESTEP + 200.
+            state_dim (int, optional): Dimension of state observations. Defaults to STATE_DIM.
+            action_dim (int, optional): Dimension of actions. Defaults to ACTION_DIM.
+        """
         self.capacity = capacity
         self._states = np.zeros((capacity, state_dim), dtype=np.float32)
         self._actions = np.zeros((capacity, action_dim), dtype=np.float32)
@@ -64,7 +80,16 @@ class Memory:
         self._ptr = 0
 
     def push(self, state, action, raw_action, logprob, reward, is_terminal):
-        """Stores one transition into pre-allocated arrays."""
+        """Stores one transition into pre-allocated arrays.
+
+        Args:
+            state (np.ndarray): State observation array.
+            action (np.ndarray): Executed action array.
+            raw_action (np.ndarray): Pre-squashed action array.
+            logprob (float): Log probability of the action.
+            reward (float): Step reward received.
+            is_terminal (bool): Done flag.
+        """
         i = self._ptr
         self._states[i] = state
         self._actions[i] = action
@@ -76,30 +101,48 @@ class Memory:
 
     @property
     def states(self):
+        """Returns a list of state tensors currently stored in the buffer."""
         return [torch.from_numpy(self._states[i]) for i in range(self._ptr)]
 
     @property
     def actions(self):
+        """Returns a list of action tensors currently stored in the buffer."""
         return [torch.from_numpy(self._actions[i]) for i in range(self._ptr)]
 
     @property
     def raw_actions(self):
+        """Returns a list of raw action tensors currently stored in the buffer."""
         return [torch.from_numpy(self._raw_actions[i]) for i in range(self._ptr)]
 
     @property
     def logprobs(self):
+        """Returns a list of log-probability tensors currently stored in the buffer."""
         return [torch.tensor(self._logprobs[i]) for i in range(self._ptr)]
 
     @property
     def rewards(self):
+        """Returns a list of rewards currently stored in the buffer."""
         return self._rewards[:self._ptr].tolist()
 
     @property
     def is_terminals(self):
+        """Returns a list of terminal flags currently stored in the buffer."""
         return self._is_terminals[:self._ptr].tolist()
 
     def get_tensors(self, device):
-        """Returns all data as pre-stacked tensors on the given device (fast path)."""
+        """Returns all data as pre-stacked tensors on the given device (fast path).
+
+        Args:
+            device (torch.device): Target device for the output tensors.
+
+        Returns:
+            tuple: A tuple containing:
+                - states (torch.Tensor): Stacked states.
+                - actions (torch.Tensor): Stacked actions.
+                - raw_actions (torch.Tensor): Stacked pre-squashed actions.
+                - logprobs (torch.Tensor): Stacked log probabilities.
+                - is_terminals (torch.Tensor): Stacked done flags.
+        """
         n = self._ptr
         states = torch.from_numpy(self._states[:n]).to(device)
         actions = torch.from_numpy(self._actions[:n]).to(device)
@@ -141,7 +184,7 @@ def train_agent(agent_name, agent, logger):
     WINDOW_SIZE = 200
     EARLY_STOP_WARMUP = 8000
     EARLY_STOP_PATIENCE = 2000
-    min_improvement = 1e-3 
+    min_improvement = 1e-3
     rewards_window = deque(maxlen=WINDOW_SIZE)
     best_avg_reward = -float('inf')
     no_improve_count = 0

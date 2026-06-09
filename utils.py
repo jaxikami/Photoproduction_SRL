@@ -30,6 +30,15 @@ class DataLogger:
     
     Tracks rewards, trajectories, g1-g4 constraint violations, and idle-stage
     compliance (g5) during both training and evaluation.
+
+    Attributes:
+        training_log (dict): Map from agent names to lists of total rewards.
+        training_violations (dict): Map from agent names to lists of total violations.
+        eval_data (dict): Map from agent names to nested dictionaries containing detailed
+            evaluation rollout results (states, actions, rewards, metrics, etc.).
+        eval_violations (dict): Map from agent names to lists of total evaluation violations.
+        eval_violations_details (dict): Map from agent names to dictionaries containing lists of
+            specific constraint violation counts (g1, g2, g3, g4, g5).
     """
 
     def __init__(self):
@@ -98,7 +107,11 @@ class DataLogger:
 
 
 class Plotter:
-    """Static utility class for generating matplotlib visualizations."""
+    """Static utility class for generating matplotlib visualizations.
+
+    Provides functions to visualize agent rewards convergence, aggregate training
+    violations, and plot detailed state and control profiles across evaluation runs.
+    """
 
     @staticmethod
     def plot_training_results(training_log, agent_name, window=500):

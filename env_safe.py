@@ -27,24 +27,44 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             Stage 1→2 (Growth→Harvesting) transition
         g4 (path):     Reactor volume <= V_MAX                      — λ_g4, buffer + spike
         g5 (terminal): Episode MUST end in Idle stage (stage 3)     — λ_g5, HARD terminal spike
-    Note:
-        g3 λ is updated every time a violation is detected at a Stage 1→2
-        transition.  This is the sole enforcement point; g3 is no longer
-        re-checked at episode termination.
-        g5 is enforced as a hard constraint by using a large fixed IDLE_BASE_SPIKE
-        in addition to the adaptive λ_g5, making it expensive regardless of λ warmup.
-        By default λ values persist across episodes to accumulate knowledge of
-        constraint tightness. Set `reset_lambdas_per_episode=True` for evaluation.
 
-    Reward structure (per step):
-        reward = prod_reward
-               - constraint_penalty          (Lagrangian + buffer)
-               - smoothing_penalty
-               - raw_material_penalty
+    Attributes:
+        reset_lambdas_per_episode (bool): Whether to reset Lagrangian multipliers at the beginning
+            of each episode. Defaults to False.
+        episode_count (int): Count of elapsed training episodes.
+        lam_g1 (float): Lagrangian multiplier for the g1 (path nitrate) constraint.
+        lam_g2 (float): Lagrangian multiplier for the g2 (product ratio) constraint.
+        lam_g3 (float): Lagrangian multiplier for the g3 (terminal nitrate) constraint.
+        lam_g4 (float): Lagrangian multiplier for the g4 (volume overflow) constraint.
+        lam_g5 (float): Lagrangian multiplier for the g5 (terminal idle) constraint.
+        prev_Cx (float): Biomass concentration at the previous control step.
+        lag_lr (float): Default learning rate for Lagrangian multiplier updates.
+        lag_lr_g1 (float): Learning rate for g1 multiplier updates.
+        lag_lr_g2 (float): Learning rate for g2 multiplier updates.
+        lag_lr_g3 (float): Learning rate for g3 multiplier updates.
+        lag_decay (float): Default decay rate for multipliers under satisfied constraints.
+        lag_decay_g2 (float): Decay rate specifically for the g2 multiplier.
+        lag_ep_decay_g2 (float): Multiplicative decay for g2 multiplier applied per episode.
+        lag_max (float): Default maximum cap for Lagrangian multipliers.
+        lag_max_g1 (float): Maximum cap for the g1 multiplier.
+        lag_max_g2 (float): Maximum cap for the g2 multiplier.
+        lag_max_g3 (float): Maximum cap for the g3 multiplier.
+        lag_max_g5 (float): Maximum cap for the g5 multiplier.
+        BASE_SPIKE (float): Base penalty spike applied on constraint violations.
+        BUFFER_COEF (float): Coefficient scaling the barrier buffer penalties.
+        IDLE_BASE_SPIKE (float): Fixed base penalty spike for failing the terminal idle constraint.
+        G1_BUFFER_START (float): Threshold fraction of constraint limit where g1 buffer penalty starts.
+        G2_BUFFER_START (float): Threshold fraction of constraint limit where g2 buffer penalty starts.
+        prod_coef (float): Weight coefficient for the phycocyanin production reward.
+        harvest_coef (float): Weight coefficient for the harvested phycocyanin mass reward.
+        time_penalty (float): Small operational cost penalty per step.
+        smooth_coef (float): Weight coefficient for the action smoothing penalty.
+        raw_mat_coef (float): Weight coefficient for the nitrate feed raw material usage penalty.
+        lagrange_updates_enabled (bool): Flag indicating if monolithic Lagrangian updates are enabled.
     """
 
     def __init__(self):
-        """Initializes the safe environment and all Lagrangian hyperparameters."""
+        """Initializes the safe environment settings and Lagrangian hyperparameters."""
         # ── Initialise attributes used by reset() BEFORE super().__init__() ──
         # super().__init__() calls self.reset(), so these must exist first.
         self.reset_lambdas_per_episode = False
@@ -90,8 +110,8 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         self.prod_coef    = 0.4    # Gentle stockpile nudge
         self.harvest_coef = 400.0  # Massive payout for physical harvesting
         self.time_penalty = 0.05   # Small operational cost (was 0.2, too aggressive)
-        self.smooth_coef  = 5.0    # 100x scale-up to heavily penalize jittery controls
-        self.raw_mat_coef = 5.0    # 50x scale-up to strongly discourage wasteful nitrate feed
+        self.smooth_coef  = 0.5    # 100x scale-up to heavily penalize jittery controls
+        self.raw_mat_coef = 0.5    # 50x scale-up to strongly discourage wasteful nitrate feed
 
         # Disable inherited monolithic Lagrangian attributes to avoid confusion
         self.lagrange_updates_enabled = False
@@ -225,6 +245,8 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
                 self.g2_violation_count += 1
             else:
                 self.lam_g2 *= (1.0 - self.lag_decay_g2)
+
+            p_g2 *= 5.0
 
             # g4: Volume overflow (V ≤ V_MAX)
             v_frac        = self.state[3] / self.V_MAX
