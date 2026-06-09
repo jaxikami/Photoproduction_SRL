@@ -83,16 +83,16 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         # Scale: harvest_r peaks ~13/step. Penalties should dominate only
         # at severe/persistent violations, not on first contact.
         self.lag_lr     = 0.5          # Slow growth so λ ramps gradually
-        self.lag_lr_g1  = 100000.0     # Scaled up for G1 (path nitrate) — 50x
+        self.lag_lr_g1  = 10000.0      # Reduced to prevent reward instability
         self.lag_lr_g2  = 500.0        # Gentle ramp — g2 is borderline-feasible, agent needs time to learn
-        self.lag_lr_g3  = 50.0         # 100× default lag_lr — matches the 100× penalty scale-up
+        self.lag_lr_g3  = 1000.0       # Increased for stronger G3 signal
         self.lag_decay  = 1.0 / 600.0  # Faster decay to recover production signal after compliance
         self.lag_decay_g2 = 2.0 / 600.0  # Meaningful per-step decay (was 0.3/600)
         self.lag_ep_decay_g2 = 0.90    # Per-EPISODE multiplicative decay to prevent death spiral
         self.lag_max    = 15.0         # Default matches env_bench W_g4_SPIKE
-        self.lag_max_g1 = 750000.0     # Dedicated high cap for G1 (retains G1 > G2 priority) — 50x
+        self.lag_max_g1 = 100000.0     # Reduced max cap to decouple from G3
         self.lag_max_g2 = 500.0        # Hard cap prevents reward signal death
-        self.lag_max_g3 = 20000.0       # 100× scale-up to match the 100× G3 penalty multiplier
+        self.lag_max_g3 = 200000.0     # Increased to match G1 penalty capacity
         self.lag_max_g5 = 100.0        # G5 cap (hard constraint)
 
         # ── Barrier + base spike params ────────────────────────────
@@ -103,7 +103,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         self.IDLE_BASE_SPIKE      = 5000.0 # Hard idle spike: ~40× one harvest step (scaled up)
 
         # ── Buffer zone activation thresholds ─────────────────────
-        self.G1_BUFFER_START = 0.95
+        self.G1_BUFFER_START = 0.90
         self.G2_BUFFER_START = 0.95  # Barrier penalty starts at 95% of the ratio limit
 
         # ── Reward shaping coefficients ────────────────────────────
@@ -213,15 +213,21 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             if n_ratio > self.G1_BUFFER_START:
                 buf_depth = min(1.0, (n_ratio - self.G1_BUFFER_START) /
                                (1.0 - self.G1_BUFFER_START))
-                p_g1 += self.BUFFER_COEF * buf_depth ** 2
+                p_g1 += (self.BUFFER_COEF * 0.4) * buf_depth ** 2
             if n_ratio > 1.0:
                 viol = n_ratio - 1.0
-                p_g1 += 50.0 * (self.lam_g1 * viol + self.BASE_SPIKE * (1.0 + viol))
+                raw_p_g1 = 50.0 * (self.lam_g1 * viol + self.BASE_SPIKE * (1.0 + viol))
+                p_g1 += min(raw_p_g1, 2000000.0) # Cap G1 to decouple from G3
                 self.lam_g1 = min(self.lag_max_g1, self.lam_g1 + self.lag_lr_g1 * viol)
                 self.violation_count    += 1
                 self.g1_violation_count += 1
             else:
                 self.lam_g1 *= (1.0 - self.lag_decay)
+
+            # G3 Anticipation Penalty (Dense signal during Stage 1)
+            if self.current_stage == 1 and self.state[1] > 200.0 and self.stage_credits < 30.0:
+                viol_g3 = (self.state[1] - 200.0) / 200.0
+                p_g3 += 20.0 * viol_g3
 
             # g2: Product ratio (Cq/Cx ≤ 0.011) — PROXIMITY-BASED SHAPING
             ratio   = self.state[2] / (self.state[0] + 1e-8)

@@ -398,7 +398,7 @@ class SPRL_Agent:
         self._proj_calls = self._proj_noop = self._proj_iters = 0
         return {'calls': calls, 'noop': noop, 'iters': iters, 'avg_it': avg_it}
 
-    def _project_to_safe(self, state_norm, action, lr=0.3, max_steps=5, threshold=0.711):
+    def _project_to_safe(self, state_norm, action, lr=0.5, max_steps=5, threshold=0.711):
         """Gradient-ascend the APN margin surface to find a safe action proxy.
 
         If the initially proposed action is unsafe, this method performs gradient
@@ -433,19 +433,31 @@ class SPRL_Agent:
             return a
 
         with torch.no_grad():
-            p = self.safeguard.classify(state_fixed, a)
+            _, g1, g2, g4 = self.safeguard.forward_aux(state_fixed, a)
+            p_g1 = torch.sigmoid(g1)
+            p_g2 = torch.sigmoid(g2)
+            p_g4 = torch.sigmoid(g4)
+            p = torch.min(torch.stack([p_g1, p_g2, p_g4], dim=0), dim=0)[0]
             if p.item() >= threshold:
                 self._proj_noop += 1
                 return a
 
         best_a      = a.clone()
-        best_margin = self.safeguard(state_fixed, a).item()
+        with torch.no_grad():
+            _, g1, g2, g4 = self.safeguard.forward_aux(state_fixed, a)
+            smooth_tau = 0.25
+            stacked = torch.stack([g1, g2, g4], dim=-1)
+            best_margin = (-smooth_tau * torch.logsumexp(-stacked / smooth_tau, dim=-1)).item()
 
         with torch.enable_grad():
             for step in range(max_steps):
                 self._proj_iters += 1
                 a_var  = a.clone().requires_grad_(True)
-                margin = self.safeguard(state_fixed, a_var)
+                _, g1, g2, g4 = self.safeguard.forward_aux(state_fixed, a_var)
+                
+                smooth_tau = 0.25
+                stacked = torch.stack([g1, g2, g4], dim=-1)
+                margin = -smooth_tau * torch.logsumexp(-stacked / smooth_tau, dim=-1)
 
                 p = torch.sigmoid(margin)
                 if p.item() >= threshold:

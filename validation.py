@@ -15,7 +15,7 @@ import torch
 import numpy as np
 import os
 from pretrain import ActionProjectionNetwork, load_compatible_checkpoint
-from env_core import PhycocyaninEnvCore
+from env_core import PhycocyaninEnvCore, integrate_rk4
 
 # ── Physical constants (must match env.py and data_gen.py) ────────────────────
 I_MIN, I_MAX     = 120.0, 400.0
@@ -58,7 +58,7 @@ def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS, lr=L
     """
     state_fixed = state_norm_t.detach()
     stage_mask = PhycocyaninEnvCore.get_action_mask(state_fixed)
-    default_squashed = torch.tensor([-0.333, -1.0, -1.0, -1.0], device=state_fixed.device)
+    default_squashed = torch.tensor([-0.407, -1.0, -1.0, -1.0], device=state_fixed.device)
 
     # SERL checkpoint 2: clamp initial action
     a = action_t.clone().detach() * stage_mask + default_squashed * (1 - stage_mask)
@@ -228,23 +228,23 @@ def run_validation(model=None, num_test_samples: int = 2000):
                           t_norm=t, supply_norm=0.5, device=device)
         a_t = torch.ones(1, 4, device=device)  # max intent
 
-        a_proj, iters = _project_to_safe(apn, s_t, a_t)
-        g1_iters.append(iters)
+        state_phys = np.array([cx, cN, cq, V], dtype=np.float64)
+        rollout_steps = 5
+        for step_idx in range(rollout_steps):
+            a_proj, iters = _project_to_safe(apn, s_t, a_t)
+            g1_iters.append(iters)
+            
+            a_scaled = (a_proj[0] + 1.0) / 2.0
+            I_phys = I_MIN + a_scaled[1].item() * (I_MAX - I_MIN)
+            Fn_phys = a_scaled[2].item() * FN_MAX_GROWTH
+            
+            state_phys = integrate_rk4(state_phys, I_phys, Fn_phys, 0.0, 10.0/60.0, 60)
+            
+            if step_idx < rollout_steps - 1:
+                s_t = _make_state(state_phys[0], state_phys[1], state_phys[2], state_phys[3], stage_idx=0, credit_norm=0.5,
+                                  t_norm=t, supply_norm=0.5, device=device)
 
-        # Physics
-        a_scaled = (a_proj[0] + 1.0) / 2.0
-        I_phys = I_MIN + a_scaled[1].item() * (I_MAX - I_MIN)
-        Fn_phys = a_scaled[2].item() * FN_MAX_GROWTH
-        
-        um = 0.0572; KN = 393.1; YNX = 504.5; ks = 178.9; ki = 447.1
-        phi_I = I_phys / (I_phys + ks + (I_phys**2 / ki))
-        phi_N = cN / (cN + KN)
-        growth = um * phi_I * cx * phi_N
-        F_in_vol = Fn_phys * V / C_N_STOCK
-        dCN = -YNX * growth + F_in_vol * (C_N_STOCK - cN) / V
-        cN_next = cN + dCN * CONTROL_INTERVAL
-
-        if cN_next <= N_LIMIT_PATH * SAFE_BUFFER:
+        if state_phys[1] <= N_LIMIT_PATH * SAFE_BUFFER:
             g1_passes += 1
 
     g1_rate = g1_passes / num_test_samples
@@ -395,7 +395,7 @@ def run_validation(model=None, num_test_samples: int = 2000):
         
         # Pre-mask a_t so we don't unfairly penalize the default clamp
         stage_mask = PhycocyaninEnvCore.get_action_mask(s_t)
-        default_squashed = torch.tensor([-0.333, -1.0, -1.0, -1.0], device=device)
+        default_squashed = torch.tensor([-0.407, -1.0, -1.0, -1.0], device=device)
         a_t_masked = a_t * stage_mask + default_squashed * (1 - stage_mask)
 
         a_proj, _ = _project_to_safe(apn, s_t, a_t_masked)

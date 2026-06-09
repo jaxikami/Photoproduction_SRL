@@ -28,7 +28,7 @@ from torch.optim.lr_scheduler import LinearLR
 # =============================================================================
 STATE_DIM = 12     # [Cx, CN, Cq, V, stage_0..3, credit, t_norm, supply, op_time_left]
 ACTION_DIM = 4     # [time_mult, I, Fn, Fout]
-MAX_EPISODES = 50000
+MAX_EPISODES = 20000
 UPDATE_TIMESTEP = 2048
 K_EPOCHS = 4
 EPS_CLIP = 0.2
@@ -40,7 +40,7 @@ INITIAL_ENTROPY = 0.05
 MIN_ENTROPY = 1e-5
 EVALUATE_ONLY = False  # True → skip training and run evaluation only; False → run full train + eval
 RUN_BENCHMARK = False # True → run Standard RL (bench) only; False → run Safe RL only
-RESUME_TRAINING = False # True → load existing weights before training
+RESUME_TRAINING = True # True → load existing weights before training
 NOISE_STD = 0.05
 ACTION_NOISE = False
 STATE_NOISE = False
@@ -182,7 +182,7 @@ def train_agent(agent_name, agent, logger):
 
     time_step = 0
     WINDOW_SIZE = 200
-    EARLY_STOP_WARMUP = 8000
+    EARLY_STOP_WARMUP = 10000
     EARLY_STOP_PATIENCE = 2000
     min_improvement = 1e-3
     rewards_window = deque(maxlen=WINDOW_SIZE)
