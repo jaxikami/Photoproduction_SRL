@@ -119,7 +119,7 @@ def _project_to_safe(apn, state_norm_t, action_t, max_steps=MAX_PROJ_STEPS, lr=L
                 # Boost step size for Fn (index 2) when volume is high to quickly avoid overflow
                 lr_mult = torch.ones_like(grad)
                 is_high_vol = state_fixed[..., 3] > 0.75
-                lr_mult[..., 2] = torch.where(is_high_vol, torch.tensor(3.0, device=grad.device), torch.tensor(1.0, device=grad.device))
+                lr_mult[..., 2] = torch.where(is_high_vol, torch.tensor(5.0, device=grad.device), torch.tensor(1.0, device=grad.device))
                 
                 a = a + step_size * grad.sign() * lr_mult
                 a = a.clamp(-1.0, 1.0)

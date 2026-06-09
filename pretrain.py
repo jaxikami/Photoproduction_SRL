@@ -236,7 +236,7 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=1000000,
     constraint losses.
 
     Args:
-        epochs (int, optional): Max number of epochs to train. Defaults to 100000.
+        epochs (int, optional): Max number of epochs to train. Defaults to 10000.
         batch_size (int, optional): Mini-batch size. Defaults to 32768.
         buffer_size (int, optional): Size of the background dataset buffer. Defaults to 1000000.
         refresh_interval (int, optional): Epochs between dataset refreshes. Defaults to 100.
@@ -422,14 +422,23 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=1000000,
                 # 2. Scaled regression
                 l_reg = F.smooth_l1_loss(margin_pred, b_m * MARGIN_SCALE)
 
-                # 3. Per-constraint auxiliary BCE losses
+                # 3. Per-constraint auxiliary losses (BCE + scaled regression)
                 target_g1 = (b_m_g1 >= 0.0).float()
                 target_g2 = (b_m_g2 >= 0.0).float()
                 target_g4 = (b_m_g4 >= 0.0).float()
 
-                l_aux_g1 = F.binary_cross_entropy_with_logits(aux_g1, target_g1)
-                l_aux_g2 = F.binary_cross_entropy_with_logits(aux_g2, target_g2)
-                l_aux_g4 = F.binary_cross_entropy_with_logits(aux_g4, target_g4)
+                l_aux_g1 = (
+                    0.5 * F.binary_cross_entropy_with_logits(aux_g1, target_g1) +
+                    0.5 * F.smooth_l1_loss(aux_g1, b_m_g1 * MARGIN_SCALE)
+                )
+                l_aux_g2 = (
+                    0.5 * F.binary_cross_entropy_with_logits(aux_g2, target_g2) +
+                    0.5 * F.smooth_l1_loss(aux_g2, b_m_g2 * MARGIN_SCALE)
+                )
+                l_aux_g4 = (
+                    0.5 * F.binary_cross_entropy_with_logits(aux_g4, target_g4) +
+                    0.5 * F.smooth_l1_loss(aux_g4, b_m_g4 * MARGIN_SCALE)
+                )
 
                 # Dynamically weight auxiliary losses based on latest validation pass rates
                 if latest_pass_rates is not None:

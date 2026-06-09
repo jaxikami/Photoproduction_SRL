@@ -91,8 +91,8 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # G1 boundary — high cN with variable Fn feed
     # ══════════════════════════════════════════════════════════════════════════
     cx_g1 = 0.5 + torch.rand(n_g1, device=device) * 5.0
-    # cN from 75% to 100% of limit
-    cN_g1 = N_LIMIT_PATH * (0.75 + torch.rand(n_g1, device=device) * 0.25)
+    # cN from 75% to 110% of limit (include over-limit to learn inward gradient)
+    cN_g1 = N_LIMIT_PATH * (0.75 + torch.rand(n_g1, device=device) * 0.35)
     cq_g1 = torch.rand(n_g1, device=device) * cx_g1 * RATIO_LIMIT * 0.5
     V_g1  = V_MAX * (0.40 + torch.rand(n_g1, device=device) * 0.50)
     t_g1  = torch.rand(n_g1, device=device) * 0.8
@@ -101,12 +101,12 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # Override Fn channel: full sweep [-1, 1]
     a_g1[:, 2] = torch.rand(n_g1, device=device) * 2.0 - 1.0
 
-    # ── G1 EXTREME sub-group: cN at 85-100% with max Fn pressure ──────────────
+    # ── G1 EXTREME sub-group: cN at 85-110% with max Fn pressure ──────────────
     # Mirrors the exact validation scenario so the APN
     # learns to project aggressively in this hardest corner of the constraint.
     n_g1_extreme = n_g1 // 3
     cx_g1e = 0.5 + torch.rand(n_g1_extreme, device=device) * 5.0
-    cN_g1e = N_LIMIT_PATH * (0.85 + torch.rand(n_g1_extreme, device=device) * 0.15)
+    cN_g1e = N_LIMIT_PATH * (0.85 + torch.rand(n_g1_extreme, device=device) * 0.25)
     cq_g1e = torch.rand(n_g1_extreme, device=device) * cx_g1e * RATIO_LIMIT * 0.5
     V_g1e  = V_MAX * (0.40 + torch.rand(n_g1_extreme, device=device) * 0.50)
     t_g1e  = torch.rand(n_g1_extreme, device=device) * 0.8
@@ -118,8 +118,8 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # G2 boundary — cq/cx near ratio limit
     # ══════════════════════════════════════════════════════════════════════════
     cx_g2 = 0.3 + torch.rand(n_g2, device=device) * 5.0
-    # Product ratio from 80% to 100% of limit (tight boundary focus)
-    ratio_target = RATIO_LIMIT * (0.80 + torch.rand(n_g2, device=device) * 0.20)
+    # Product ratio from 80% to 120% of limit (tight boundary focus + above limit)
+    ratio_target = RATIO_LIMIT * (0.80 + torch.rand(n_g2, device=device) * 0.40)
     cq_g2 = (cx_g2 * ratio_target).clamp(0.0, 0.2)
     # Moderate-to-high cN so biomass growth is active (cx growth dilutes ratio)
     cN_g2 = N_LIMIT_PATH * (0.25 + torch.rand(n_g2, device=device) * 0.50)
@@ -137,22 +137,47 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     cx_g4 = 0.5 + torch.rand(n_g4, device=device) * 5.0
     cN_g4 = torch.rand(n_g4, device=device) * 600.0
     cq_g4 = torch.rand(n_g4, device=device) * cx_g4 * RATIO_LIMIT * 0.6
-    # V from 75% to SAFE_BUFFER of V_MAX
-    V_g4  = V_MAX * (0.75 + torch.rand(n_g4, device=device) * (SAFE_BUFFER - 0.75))
+    # V from 75% to 103% of V_MAX — include above-limit states so the APN
+    # trains on clearly unsafe volumes and builds gradient signal there.
+    V_g4  = V_MAX * (0.75 + torch.rand(n_g4, device=device) * 0.28)
     t_g4  = torch.rand(n_g4, device=device) * 0.6
     a_g4  = torch.rand(n_g4, 4, device=device) * 2.0 - 1.0
     # Sweep Fn: high feed creates overflow
     a_g4[:, 2] = torch.rand(n_g4, device=device) * 2.0 - 1.0
 
-    # ── G4 EXTREME sub-group: V at 85-SAFE_BUFFER% with max Fn pressure ──────
+    # ── G4 EXTREME sub-group: V at 85-SAFE_BUFFER% with balanced Fn ──────────
+    # 50% unsafe (high Fn → overflow) + 50% safe (zero/low Fn → safe).
+    # This contrast is critical: without safe examples the APN's gradient
+    # during projection doesn't clearly point toward reducing Fn.
     n_g4_extreme = n_g4 // 3
-    cx_g4e = 0.5 + torch.rand(n_g4_extreme, device=device) * 5.0
-    cN_g4e = torch.rand(n_g4_extreme, device=device) * 600.0
-    cq_g4e = torch.rand(n_g4_extreme, device=device) * cx_g4e * RATIO_LIMIT * 0.6
-    V_g4e  = V_MAX * (0.85 + torch.rand(n_g4_extreme, device=device) * (SAFE_BUFFER - 0.85))
-    t_g4e  = torch.rand(n_g4_extreme, device=device) * 0.6
-    a_g4e  = torch.rand(n_g4_extreme, 4, device=device) * 2.0 - 1.0
-    a_g4e[:, 2] = 0.5 + torch.rand(n_g4_extreme, device=device) * 0.5  # Fn in [0.5, 1.0]
+    n_g4e_unsafe = n_g4_extreme // 2
+    n_g4e_safe   = n_g4_extreme - n_g4e_unsafe
+
+    # --- Unsafe half: high feed, near-overflow ---
+    cx_g4e_u = 0.5 + torch.rand(n_g4e_unsafe, device=device) * 5.0
+    cN_g4e_u = torch.rand(n_g4e_unsafe, device=device) * 600.0
+    cq_g4e_u = torch.rand(n_g4e_unsafe, device=device) * cx_g4e_u * RATIO_LIMIT * 0.6
+    V_g4e_u  = V_MAX * (0.85 + torch.rand(n_g4e_unsafe, device=device) * 0.18)  # up to 1.03 * V_MAX
+    t_g4e_u  = torch.rand(n_g4e_unsafe, device=device) * 0.6
+    a_g4e_u  = torch.rand(n_g4e_unsafe, 4, device=device) * 2.0 - 1.0
+    a_g4e_u[:, 2] = 0.5 + torch.rand(n_g4e_unsafe, device=device) * 0.5  # Fn in [0.5, 1.0]
+
+    # --- Safe half: zero/low feed, near-overflow (but safe because Fn ≈ 0) ---
+    cx_g4e_s = 0.5 + torch.rand(n_g4e_safe, device=device) * 5.0
+    cN_g4e_s = torch.rand(n_g4e_safe, device=device) * 600.0
+    cq_g4e_s = torch.rand(n_g4e_safe, device=device) * cx_g4e_s * RATIO_LIMIT * 0.6
+    V_g4e_s  = V_MAX * (0.85 + torch.rand(n_g4e_safe, device=device) * (SAFE_BUFFER - 0.85))
+    t_g4e_s  = torch.rand(n_g4e_safe, device=device) * 0.6
+    a_g4e_s  = torch.rand(n_g4e_safe, 4, device=device) * 2.0 - 1.0
+    a_g4e_s[:, 2] = -1.0 + torch.rand(n_g4e_safe, device=device) * 0.1  # Fn in [-1.0, -0.9]
+
+    # Merge the two halves
+    cx_g4e = torch.cat([cx_g4e_u, cx_g4e_s])
+    cN_g4e = torch.cat([cN_g4e_u, cN_g4e_s])
+    cq_g4e = torch.cat([cq_g4e_u, cq_g4e_s])
+    V_g4e  = torch.cat([V_g4e_u,  V_g4e_s])
+    t_g4e  = torch.cat([t_g4e_u,  t_g4e_s])
+    a_g4e  = torch.cat([a_g4e_u,  a_g4e_s])
 
 
 

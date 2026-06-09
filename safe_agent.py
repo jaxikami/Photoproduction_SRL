@@ -341,7 +341,7 @@ class SPRL_Agent:
         self._proj_calls = self._proj_noop = self._proj_iters = 0
         return {'calls': calls, 'noop': noop, 'iters': iters, 'avg_it': avg_it}
 
-    def _project_to_safe(self, state_norm, action, lr=0.5, max_steps=5, threshold=0.711):
+    def _project_to_safe(self, state_norm, action, lr=0.3, max_steps=5, threshold=0.711):
         """Gradient-ascend the APN margin surface to find a safe action proxy.
 
         If the initially proposed action is unsafe, this method performs gradient
@@ -417,7 +417,7 @@ class SPRL_Agent:
                     # Boost step size for Fn (index 2) when volume is high to quickly avoid overflow
                     lr_mult = torch.ones_like(grad)
                     is_high_vol = state_fixed[..., 3] > 0.75
-                    lr_mult[..., 2] = torch.where(is_high_vol, torch.tensor(3.0, device=grad.device), torch.tensor(1.0, device=grad.device))
+                    lr_mult[..., 2] = torch.where(is_high_vol, torch.tensor(5.0, device=grad.device), torch.tensor(1.0, device=grad.device))
                     
                     a = a + step_size * grad.sign() * lr_mult
                     a = a.clamp(-1.0, 1.0)
