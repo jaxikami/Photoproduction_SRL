@@ -94,7 +94,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # cN from 75% to 110% of limit (include over-limit to learn inward gradient)
     cN_g1 = N_LIMIT_PATH * (0.75 + torch.rand(n_g1, device=device) * 0.35)
     cq_g1 = torch.rand(n_g1, device=device) * cx_g1 * RATIO_LIMIT * 0.5
-    V_g1  = V_MAX * (0.40 + torch.rand(n_g1, device=device) * 0.50)
+    V_g1  = V_MAX * (0.10 + torch.rand(n_g1, device=device) * 0.80)
     t_g1  = torch.rand(n_g1, device=device) * 0.8
     # Actions: sweep Fn from low to high to create boundary crossings
     a_g1  = torch.rand(n_g1, 4, device=device) * 2.0 - 1.0
@@ -108,7 +108,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     cx_g1e = 0.5 + torch.rand(n_g1_extreme, device=device) * 5.0
     cN_g1e = N_LIMIT_PATH * (0.85 + torch.rand(n_g1_extreme, device=device) * 0.25)
     cq_g1e = torch.rand(n_g1_extreme, device=device) * cx_g1e * RATIO_LIMIT * 0.5
-    V_g1e  = V_MAX * (0.40 + torch.rand(n_g1_extreme, device=device) * 0.50)
+    V_g1e  = V_MAX * (0.10 + torch.rand(n_g1_extreme, device=device) * 0.80)
     t_g1e  = torch.rand(n_g1_extreme, device=device) * 0.8
     # Max-pressure actions: Fn forced near maximum, other dims random
     a_g1e  = torch.rand(n_g1_extreme, 4, device=device) * 2.0 - 1.0

@@ -63,14 +63,14 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         # Scale: harvest_r peaks ~13/step. Penalties should dominate only
         # at severe/persistent violations, not on first contact.
         self.lag_lr     = 0.5          # Slow growth so λ ramps gradually
-        self.lag_lr_g1  = 2000.0       # Scaled up for G1 (path nitrate)
+        self.lag_lr_g1  = 100000.0     # Scaled up for G1 (path nitrate) — 50x
         self.lag_lr_g2  = 500.0        # Gentle ramp — g2 is borderline-feasible, agent needs time to learn
         self.lag_lr_g3  = 50.0         # 100× default lag_lr — matches the 100× penalty scale-up
         self.lag_decay  = 1.0 / 600.0  # Faster decay to recover production signal after compliance
         self.lag_decay_g2 = 2.0 / 600.0  # Meaningful per-step decay (was 0.3/600)
         self.lag_ep_decay_g2 = 0.90    # Per-EPISODE multiplicative decay to prevent death spiral
         self.lag_max    = 15.0         # Default matches env_bench W_g4_SPIKE
-        self.lag_max_g1 = 15000.0      # Dedicated high cap for G1 (retains G1 > G2 priority)
+        self.lag_max_g1 = 750000.0     # Dedicated high cap for G1 (retains G1 > G2 priority) — 50x
         self.lag_max_g2 = 500.0        # Hard cap prevents reward signal death
         self.lag_max_g3 = 20000.0       # 100× scale-up to match the 100× G3 penalty multiplier
         self.lag_max_g5 = 100.0        # G5 cap (hard constraint)
@@ -196,7 +196,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
                 p_g1 += self.BUFFER_COEF * buf_depth ** 2
             if n_ratio > 1.0:
                 viol = n_ratio - 1.0
-                p_g1 += self.lam_g1 * viol + self.BASE_SPIKE * (1.0 + viol)
+                p_g1 += 50.0 * (self.lam_g1 * viol + self.BASE_SPIKE * (1.0 + viol))
                 self.lam_g1 = min(self.lag_max_g1, self.lam_g1 + self.lag_lr_g1 * viol)
                 self.violation_count    += 1
                 self.g1_violation_count += 1

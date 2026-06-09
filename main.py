@@ -139,9 +139,9 @@ def train_agent(agent_name, agent, logger):
 
     time_step = 0
     WINDOW_SIZE = 200
-    EARLY_STOP_WARMUP = 10000
+    EARLY_STOP_WARMUP = 8000
     EARLY_STOP_PATIENCE = 2000
-    min_improvement = 1e-3 if agent_name == "Standard RL" else 1e-4
+    min_improvement = 1e-3 
     rewards_window = deque(maxlen=WINDOW_SIZE)
     best_avg_reward = -float('inf')
     no_improve_count = 0
