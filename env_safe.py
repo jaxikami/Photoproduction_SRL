@@ -90,8 +90,8 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         self.prod_coef    = 0.4    # Gentle stockpile nudge
         self.harvest_coef = 400.0  # Massive payout for physical harvesting
         self.time_penalty = 0.05   # Small operational cost (was 0.2, too aggressive)
-        self.smooth_coef  = 0.05   # Action-smoothing penalty coefficient
-        self.raw_mat_coef = 0.1    # Nitrate feed penalty (was 0.5; conflicted with g2 avoidance)
+        self.smooth_coef  = 5.0    # 100x scale-up to heavily penalize jittery controls
+        self.raw_mat_coef = 5.0    # 50x scale-up to strongly discourage wasteful nitrate feed
 
         # Disable inherited monolithic Lagrangian attributes to avoid confusion
         self.lagrange_updates_enabled = False

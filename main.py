@@ -139,8 +139,8 @@ def train_agent(agent_name, agent, logger):
 
     time_step = 0
     WINDOW_SIZE = 200
-    EARLY_STOP_WARMUP = 15000
-    EARLY_STOP_PATIENCE = 3000
+    EARLY_STOP_WARMUP = 10000
+    EARLY_STOP_PATIENCE = 2000
     min_improvement = 1e-3 if agent_name == "Standard RL" else 1e-4
     rewards_window = deque(maxlen=WINDOW_SIZE)
     best_avg_reward = -float('inf')
@@ -185,13 +185,13 @@ def train_agent(agent_name, agent, logger):
 
         if i_episode > EARLY_STOP_WARMUP and len(rewards_window) == WINDOW_SIZE:
             avg_reward = np.mean(rewards_window)
-            if avg_reward > best_avg_reward * (1 + min_improvement):
+            if avg_reward > best_avg_reward + abs(best_avg_reward) * min_improvement:
                 best_avg_reward = avg_reward
                 no_improve_count = 0
                 os.makedirs("policy", exist_ok=True)
                 torch.save(agent.policy.state_dict(),
                            os.path.join("policy", f"{agent_name}_best_weights.pth"))
-            elif i_episode > 15000:
+            elif i_episode > EARLY_STOP_WARMUP:
                 no_improve_count += 1
 
             if no_improve_count >= EARLY_STOP_PATIENCE:
