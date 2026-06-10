@@ -38,11 +38,11 @@ LR_CRITIC = 1e-4
 MIN_LR = 1e-5
 INITIAL_ENTROPY = 0.05
 MIN_ENTROPY = 1e-5
-EVALUATE_ONLY = False  # True → skip training and run evaluation only; False → run full train + eval
-RUN_BENCHMARK = False # True → run Standard RL (bench) only; False → run Safe RL only
+EVALUATE_ONLY = True  # True → skip training and run evaluation only; False → run full train + eval
+RUN_BENCHMARK = True # True → run Standard RL (bench) only; False → run Safe RL only
 RESUME_TRAINING = True # True → load existing weights before training
 NOISE_STD = 0.05
-ACTION_NOISE = False
+ACTION_NOISE = True
 STATE_NOISE = False
 
 class Memory:
@@ -446,7 +446,9 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
              states=np.array(median_states), 
              actions=np.array(median_actions), 
              stages=stages_101, 
-             rewards=np.array(median_rewards))
+             rewards=np.array(median_rewards),
+             final_mass=agg_data["harvested_avg"][-1],
+             final_conc=agg_data["production_avg"][-1] * 0.2)
     print(f"Saved evaluation trajectory to {npz_path}")
 
 # =============================================================================
@@ -471,3 +473,4 @@ if __name__ == "__main__":
 
     evaluate_agent(agent_name, agent, logger, noise_std=NOISE_STD, action_noise=ACTION_NOISE, state_noise=STATE_NOISE)
     Plotter.plot_comprehensive_evaluation(logger, agent_name)
+    Plotter.plot_comparison_table()

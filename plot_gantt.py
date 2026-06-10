@@ -66,21 +66,22 @@ def generate_gantt():
         # We find contiguous stage segments to plot them as single bars
         start_idx = 0
         current_stage = stages[0]
+        total_steps = len(stages) - 1
         
         for i in range(1, len(stages)):
             if stages[i] != current_stage or i == len(stages) - 1:
                 end_idx = i if stages[i] != current_stage else i + 1
-                start_time = start_idx * CONTROL_INTERVAL
-                end_time = end_idx * CONTROL_INTERVAL
-                duration = end_time - start_time
+                start_val = start_idx / total_steps
+                end_val = end_idx / total_steps
+                duration = end_val - start_val
                 
                 # Draw the bar segment
-                ax.barh(y_pos, duration, left=start_time, height=0.4, 
+                ax.barh(y_pos, duration, left=start_val, height=0.4, 
                         color=stage_colors[current_stage], edgecolor='black', alpha=0.95)
                 
                 # Add stage numbers inside the blocks if they are wide enough
-                if duration > 30:
-                    ax.text(start_time + duration/2, y_pos, f"S{current_stage}", 
+                if duration > 0.03:
+                    ax.text(start_val + duration/2, y_pos, f"S{current_stage}", 
                             ha='center', va='center', color='white', fontweight='bold', fontsize=10)
                 
                 start_idx = i
@@ -93,12 +94,12 @@ def generate_gantt():
     # Set up layout, ticks, and labels
     ax.set_yticks([1, 2])
     ax.set_yticklabels(["Safe RL", "Standard RL"], fontweight='bold')
-    ax.set_xlabel("Time (hours)", fontsize=12, fontweight='bold')
+    ax.set_xlabel("Normalized Progress", fontsize=12, fontweight='bold')
     ax.set_title("Operational Stage Schedule Comparison (Best Episode Run)", fontsize=14, fontweight='bold', pad=15)
-    ax.set_xlim(0, 1000)
+    ax.set_xlim(0, 1)
     
     # Grid and ticks
-    ax.set_xticks(np.arange(0, 1001, 100))
+    ax.set_xticks(np.arange(0, 1.1, 0.1))
     ax.grid(False)
 
     # Create manual legend patches

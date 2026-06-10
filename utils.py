@@ -372,3 +372,54 @@ class Plotter:
         plt.legend(fontsize=9)
         plt.savefig(os.path.join("plot", f"plot_ratio{suffix}.png"), dpi=300, bbox_inches='tight')
         plt.close()
+
+    @staticmethod
+    def plot_comparison_table():
+        """Generates a table plot comparing final production and concentration for both RL agents."""
+        safe_path = os.path.join("policy", "eval_data_safe.npz")
+        std_path = os.path.join("policy", "eval_data_standard.npz")
+        
+        data_safe = None
+        data_std = None
+        
+        if os.path.exists(safe_path):
+            data_safe = np.load(safe_path)
+        if os.path.exists(std_path):
+            data_std = np.load(std_path)
+            
+        if data_safe is None and data_std is None:
+            print("No evaluation data found for comparison table.")
+            return
+            
+        rows = []
+        cell_text = []
+        
+        if data_std is not None:
+            mass = data_std["final_mass"] if "final_mass" in data_std else data_std['states'][-1, 2] * 0.2 * data_std['states'][-1, 3] * 20.0
+            conc = data_std["final_conc"] if "final_conc" in data_std else data_std['states'][-1, 2] * 0.2
+            rows.append("Standard RL")
+            cell_text.append([f"{float(mass):.2f}", f"{float(conc):.4f}"])
+            
+        if data_safe is not None:
+            mass = data_safe["final_mass"] if "final_mass" in data_safe else data_safe['states'][-1, 2] * 0.2 * data_safe['states'][-1, 3] * 20.0
+            conc = data_safe["final_conc"] if "final_conc" in data_safe else data_safe['states'][-1, 2] * 0.2
+            rows.append("Safe RL")
+            cell_text.append([f"{float(mass):.2f}", f"{float(conc):.4f}"])
+            
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.axis('tight')
+        ax.axis('off')
+        
+        table = ax.table(cellText=cell_text,
+                         rowLabels=rows,
+                         colLabels=["Final Production (g)", "Final Concentration (g/L)"],
+                         loc='center',
+                         cellLoc='center')
+        table.auto_set_font_size(False)
+        table.set_fontsize(12)
+        table.scale(1.2, 1.5)
+        
+        plt.title("Comparison of Final Production and Concentration")
+        os.makedirs("plot", exist_ok=True)
+        plt.savefig(os.path.join("plot", "comparison_table.png"), dpi=300, bbox_inches='tight')
+        plt.close()
