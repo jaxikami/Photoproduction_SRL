@@ -1,4 +1,4 @@
-"""The ablated Safe RL agent and the study's environment."""
+"""The ablated Safe RL agent, the Standard RL baseline and the study's environments."""
 
 # ─── Standard Library ─────────────────────────────────────────────────────────
 import os
@@ -8,9 +8,12 @@ import torch
 import torch.nn as nn
 
 # ─── Local ────────────────────────────────────────────────────────────────────
+from agents.bench import PPO_Agent as StandardRL_Agent
 from agents.checkpoint import load_checkpoint
 from agents.safe import PPO_Agent as SafePPO_Agent
+from envs.bench import PhycocyaninEnvBench
 from envs.safe import PhycocyaninEnvSafe
+from experiments.ablation.config import ALL_CONFIGS, BASELINE
 from experiments.config import (ACTION_DIM, EPS_CLIP, GAMMA, INITIAL_ENTROPY, K_EPOCHS, LR_ACTOR,
                                 LR_CRITIC, STATE_DIM)
 from safety.constants import APN_PATH
@@ -86,6 +89,21 @@ class AblationAgent(SafePPO_Agent):
             self.policy_old.use_safeguard = False
 
 
+def make_agent(name):
+    """A fresh agent for a run: an ablation config's AblationAgent or the baseline."""
+    if name == BASELINE:
+        return StandardRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS,
+                                EPS_CLIP, INITIAL_ENTROPY)
+    return AblationAgent(ALL_CONFIGS[name])
+
+
+def make_train_env(name):
+    """The environment a run trains on (the baseline trains with static penalties)."""
+    if name == BASELINE:
+        return PhycocyaninEnvBench()
+    return make_env(ALL_CONFIGS[name].lagrangian)
+
+
 def make_env(use_lagrangian):
     """Create the PhycocyaninEnvSafe the study trains and evaluates on.
 
@@ -102,16 +120,16 @@ def make_env(use_lagrangian):
     return env
 
 
-def load_agent(cfg, run_dir):
-    """Rebuild a trained variant from its saved policy.pth.
+def load_agent(name, run_dir):
+    """Rebuild a trained run from its saved policy.pth.
 
     Args:
-        cfg: AblationConfig of the variant.
+        name: Ablation config name or BASELINE.
         run_dir: Run directory holding policy.pth.
 
     Returns:
-        AblationAgent with the trained policy in both policy and policy_old.
+        The agent with the trained policy in both policy and policy_old.
     """
-    agent = AblationAgent(cfg)
+    agent = make_agent(name)
     load_checkpoint(agent, run_dir / "policy.pth")
     return agent

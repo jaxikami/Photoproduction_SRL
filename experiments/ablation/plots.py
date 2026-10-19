@@ -9,8 +9,8 @@ from matplotlib.ticker import MaxNLocator, StrMethodFormatter
 
 # ─── Local ────────────────────────────────────────────────────────────────────
 from experiments.ablation.config import (
-    ALL_CONFIGS, NOISE_LABELS, NOISE_MODES, SEVERITY_TYPES, SEVERITY_UNITS, VIOLATION_LABELS,
-    VIOLATION_NAMES
+    BASELINE, BASELINE_LABEL, NOISE_LABELS, NOISE_MODES, SEVERITY_TYPES, SEVERITY_UNITS,
+    VIOLATION_LABELS, VIOLATION_NAMES, run_label
 )
 
 matplotlib.use('Agg')
@@ -92,7 +92,7 @@ def plot_learning_curves(curves, out_path, window=100):
             if ref is not None:
                 _plot_band(ax, x0, ref[col], _REF, "Full model")
             _plot_band(ax, x0, series, _ACCENT, "Ablated variant")
-        axes[row, 0].set_title(ALL_CONFIGS[name].label, loc="left", fontsize=10,
+        axes[row, 0].set_title(run_label(name), loc="left", fontsize=10,
                                fontweight="bold", color=_INK)
         axes[row, 0].set_ylabel(f"Harvested, g/ep ({window}-ep avg)", fontsize=9, color=_INK_2)
         axes[row, 1].set_ylabel("Cumulative violation steps", fontsize=9, color=_INK_2)
@@ -174,7 +174,7 @@ def _plot_grouped_panels(rows, panels, out_path, title):
         if right >= 1000:
             ax.xaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
     axes[0].set_yticks(y)
-    axes[0].set_yticklabels([ALL_CONFIGS[c].label for c in configs], fontsize=9, color=_INK)
+    axes[0].set_yticklabels([run_label(c) for c in configs], fontsize=9, color=_INK)
     axes[0].invert_yaxis()
 
     handles, labels = next(ax for ax, (k, _, _) in zip(axes, panels)
@@ -265,7 +265,7 @@ def _plot_heatmaps(rows, panels, out_path, title, n_cols=2):
         ax.set_xticks(np.arange(len(modes)) + 0.5)
         ax.set_xticklabels([NOISE_LABELS[m] for m in modes], fontsize=8, color=_INK_2)
         ax.set_yticks(np.arange(len(configs)) + 0.5)
-        ax.set_yticklabels([ALL_CONFIGS[c].label for c in configs], fontsize=8.5, color=_INK)
+        ax.set_yticklabels([run_label(c) for c in configs], fontsize=8.5, color=_INK)
         ax.invert_yaxis()
         ax.tick_params(length=0)
         for spine in ax.spines.values():
@@ -318,3 +318,69 @@ def plot_severity(rows, out_path):
                        f"{VIOLATION_LABELS[n]}: mean per event ({SEVERITY_UNITS[n]})", _compact))
     _plot_heatmaps(rows, panels, out_path,
                    "Constraint severity: exceedance as % of the limit (mean over seeds)")
+
+
+def plot_safe_vs_baseline(rows, out_path):
+    """Compare the full Safe RL agent with the Standard RL baseline under every noise mode.
+
+    One figure, one panel per KPI: grouped bars per noise mode, Safe RL in the
+    accent color and the baseline in gray, across-seed mean with a ±1 std
+    whisker and a direct value label.
+
+    Args:
+        rows: Summary rows from summarize(), one per (config, noise mode).
+        out_path: PNG destination.
+
+    Returns:
+        False (nothing written) unless both the full model and the baseline
+        have results.
+    """
+    by_key = {(r["config"], r["noise_mode"]): r for r in rows}
+    modes = [m for m in NOISE_MODES if ("full", m) in by_key and (BASELINE, m) in by_key]
+    if not modes:
+        return False
+    agents = (("full", "Safe RL", _ACCENT), (BASELINE, BASELINE_LABEL, _REF))
+    panels = (("harvested", "Phycocyanin harvested (g/ep)", "{:.2f}"),
+              ("violation_steps", "Violations per episode", "{:.2f}"),
+              ("violation_episode_pct", "Episodes with a violation (%)", "{:.1f}"))
+
+    x = np.arange(len(modes))
+    bar_w = 0.38
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.2 * len(panels), 4.2), squeeze=False)
+    axes = axes[0]
+    fig.patch.set_facecolor(_SURFACE)
+    for ax, (key, title, fmt) in zip(axes, panels):
+        _style_axes(ax, "y")
+        bars = []
+        for i, (name, label, color) in enumerate(agents):
+            xx = x + (i - 0.5) * bar_w
+            means = np.array([by_key[(name, m)][f"{key}_mean"] or 0.0 for m in modes])
+            stds = np.array([by_key[(name, m)][f"{key}_std"] or 0.0 for m in modes])
+            ax.bar(xx, means, width=bar_w, color=color, edgecolor=_SURFACE, linewidth=1.0,
+                   label=label)
+            spread = stds > 0  # single-seed runs have no error bar
+            ax.errorbar(xx[spread], means[spread], yerr=stds[spread], fmt="none",
+                        ecolor=_INK_2, elinewidth=0.8, capsize=2)
+            bars.append((xx, means, stds))
+        top = max([m + s for _, ms, ss in bars for m, s in zip(ms, ss)] + [0.0]) or 1.0
+        for xx, means, stds in bars:
+            for xi, m, s in zip(xx, means, stds):
+                ax.text(xi, m + s + 0.02 * top, fmt.format(m), ha="center", va="bottom",
+                        fontsize=7.5, color=_INK_2)
+        ax.set_ylim(0, top * 1.18)
+        ax.set_xticks(x)
+        ax.set_xticklabels([NOISE_LABELS[m] for m in modes], fontsize=9, color=_INK)
+        ax.tick_params(axis="x", length=0)
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+        ax.set_title(title, loc="left", fontsize=10, color=_INK)
+
+    n_seeds = sorted({by_key[(n, m)]["seeds"] for n, _, _ in agents for m in modes})
+    fig.legend(*axes[0].get_legend_handles_labels(), loc="upper right", ncol=2,
+               frameon=False, fontsize=9, labelcolor=_INK_2)
+    fig.suptitle("Safe RL vs Standard RL baseline (mean ± 1 std over "
+                 f"{'/'.join(str(n) for n in n_seeds)} seeds; multipliers frozen at 0)",
+                 x=0.01, ha="left", fontsize=11, color=_INK)
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.savefig(out_path, dpi=150, facecolor=_SURFACE)
+    plt.close(fig)
+    return True

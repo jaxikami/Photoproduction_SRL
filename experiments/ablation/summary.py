@@ -10,10 +10,11 @@ import numpy as np
 
 # ─── Local ────────────────────────────────────────────────────────────────────
 from experiments.ablation.config import (
-    ALL_CONFIGS, NOISE_LABELS, NOISE_MODES, SEVERITY_TYPES, VIOLATION_NAMES
+    BASELINE, NOISE_LABELS, NOISE_MODES, RUN_NAMES, SEVERITY_TYPES, VIOLATION_NAMES, run_label
 )
 from experiments.ablation.plots import (
-    plot_final_metrics, plot_learning_curves, plot_occurrence, plot_severity
+    plot_final_metrics, plot_learning_curves, plot_occurrence, plot_safe_vs_baseline,
+    plot_severity
 )
 from experiments.ablation.runner import _run_dir
 
@@ -32,7 +33,7 @@ SUMMARY_KEYS = EVAL_METRICS + [key for key, _ in TRAIN_METRICS]
 
 
 def load_results(out_dir):
-    """Load every completed run, grouped by config in canonical order.
+    """Load every completed run (variants, then the baseline), grouped by config.
 
     Args:
         out_dir: Study output directory.
@@ -46,7 +47,7 @@ def load_results(out_dir):
             result = json.load(f)
         grouped.setdefault(result["config"], []).append(result)
     return {name: sorted(grouped[name], key=lambda r: r["seed"])
-            for name in ALL_CONFIGS if name in grouped}
+            for name in RUN_NAMES if name in grouped}
 
 
 def _load_train_curves(out_dir, results):
@@ -99,7 +100,7 @@ def summarize(out_dir):
             evals = [r["eval"][mode] for r in runs if isinstance(r["eval"].get(mode), dict)]
             if not evals:
                 continue
-            row = {"config": name, "label": ALL_CONFIGS[name].label,
+            row = {"config": name, "label": run_label(name),
                    "noise_mode": mode, "seeds": len(evals)}
             for key in EVAL_METRICS:
                 row[f"{key}_mean"], row[f"{key}_std"] = aggregate([e.get(key) for e in evals])
@@ -167,11 +168,39 @@ def summarize(out_dir):
             if row["illegal_cmd_rate_mean"]:
                 print(f"  {row['label']}: the interlock blocked stage-illegal commands on "
                       f"{100 * row['illegal_cmd_rate_mean']:.1f}% of locked action dims")
+    _print_safe_vs_baseline(rows, rule)
     print(f"{rule}\n")
 
     plot_learning_curves(_load_train_curves(out_dir, results), Path(out_dir, "ablation_curves.png"))
     plot_final_metrics(rows, Path(out_dir, "ablation_final.png"))
     plot_occurrence(rows, Path(out_dir, "ablation_occurrence.png"))
     plot_severity(rows, Path(out_dir, "ablation_severity.png"))
+    written = ["curves", "final", "occurrence", "severity"]
+    if plot_safe_vs_baseline(rows, Path(out_dir, "ablation_vs_baseline.png")):
+        written.append("vs_baseline")
     print(f"Wrote {Path(out_dir, 'summary.csv')} and " + ", ".join(
-        str(Path(out_dir, f"ablation_{n}.png")) for n in ("curves", "final", "occurrence", "severity")))
+        str(Path(out_dir, f"ablation_{n}.png")) for n in written))
+
+
+
+def _print_safe_vs_baseline(rows, rule):
+    """Console table: the full Safe RL agent against the baseline per noise mode."""
+    by_key = {(r["config"], r["noise_mode"]): r for r in rows}
+    modes = [m for m in NOISE_MODES if ("full", m) in by_key and (BASELINE, m) in by_key]
+    if not modes:
+        return
+    print(f"\n{rule}")
+    print("  SAFE RL vs STANDARD RL BASELINE (mean ± std over seeds)")
+    print(rule)
+    print(f"  {'Noise':<14} {'Agent':<14} {'Harvested (g/ep)':>18} {'Violations/ep':>15} "
+          f"{'Viol eps (%)':>13} {'Ends idle (%)':>14} {'Worst exceed (%)':>18}")
+    for mode in modes:
+        for name in ("full", BASELINE):
+            r = by_key[(name, mode)]
+            agent = "Safe RL" if name == "full" else run_label(name)
+            print(f"  {NOISE_LABELS[mode]:<14} {agent:<14} "
+                  f"{_fmt(r['harvested_mean'], r['harvested_std'], '.2f'):>18} "
+                  f"{_fmt(r['violation_steps_mean'], r['violation_steps_std'], '.2f'):>15} "
+                  f"{_fmt(r['violation_episode_pct_mean'], r['violation_episode_pct_std'], '.1f'):>13} "
+                  f"{_fmt(r['ended_idle_pct_mean'], r['ended_idle_pct_std'], '.1f'):>14} "
+                  f"{_fmt(r['peak_violation_pct_mean'], r['peak_violation_pct_std'], '.2f'):>18}")

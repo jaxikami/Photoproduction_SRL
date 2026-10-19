@@ -20,10 +20,10 @@ from tqdm import tqdm
 from agents.checkpoint import save_checkpoint
 from agents.memory import PPOMemory
 from agents.networks import device
-from experiments.ablation.agent import AblationAgent, load_agent, make_env
+from experiments.ablation.agent import load_agent, make_agent, make_env, make_train_env
 from experiments.ablation.config import (
-    ALL_CONFIGS, COMPONENTS, DEFAULT_NOISE_STD, EVAL_SEED_OFFSET, FEED_DIMS, NOISE_MODES,
-    SEVERITY_TYPES, STATE_NOISE_DIMS, STUDY_VERSION, VIOLATION_NAMES
+    ALL_CONFIGS, BASELINE, COMPONENTS, DEFAULT_NOISE_STD, EVAL_SEED_OFFSET, FEED_DIMS, NOISE_MODES,
+    SEVERITY_TYPES, STATE_NOISE_DIMS, STUDY_VERSION, VIOLATION_NAMES, run_label
 )
 from experiments.ablation.metrics import TRAIN_LOG_FIELDS, EpisodeStats
 from experiments.config import (ACTION_DIM, INITIAL_ENTROPY, LR_ACTOR, MIN_ENTROPY, MIN_LR,
@@ -57,11 +57,11 @@ def _noisy_action(action, std):
 # ─── Training and Evaluation ──────────────────────────────────────────────────
 
 
-def train_run(cfg, seed, settings, run_dir):
-    """Train one variant with experiments.train's protocol for a fixed budget.
+def train_run(name, seed, settings, run_dir):
+    """Train one variant (or the baseline) with experiments.train's protocol for a fixed budget.
 
     Args:
-        cfg: AblationConfig of the variant.
+        name: Ablation config name or BASELINE.
         seed: Random seed for NumPy and torch.
         settings: Dict with 'episodes', 'schedule_episodes' and 'progress'.
         run_dir: Directory receiving train_log.csv and policy.pth.
@@ -70,15 +70,15 @@ def train_run(cfg, seed, settings, run_dir):
         A tuple of (trained agent, dict of training statistics).
     """
     _seed_everything(seed)
-    env = make_env(cfg.lagrangian)
-    agent = AblationAgent(cfg)
+    env = make_train_env(name)
+    agent = make_agent(name)
 
     memory = PPOMemory(UPDATE_TIMESTEP, STATE_DIM, ACTION_DIM)
     scheduler = LinearLR(agent.optimizer, start_factor=1.0, end_factor=MIN_LR / LR_ACTOR,
                          total_iters=settings["schedule_episodes"])
 
     n_episodes = settings["episodes"]
-    tag = f"{cfg.name} seed {seed}"
+    tag = f"{name} seed {seed}"
     pbar = tqdm(range(1, n_episodes + 1), desc=tag, disable=not settings["progress"])
     recent_harv = deque(maxlen=100)
     recent_viol = deque(maxlen=100)
@@ -153,7 +153,7 @@ def evaluate_run(agent, seed, n_episodes, noise_mode="none", noise_std=DEFAULT_N
     and the policy samples stochastically, as in experiments.evaluate.
 
     Args:
-        agent: Trained AblationAgent.
+        agent: Trained AblationAgent or baseline agent.
         seed: Run seed; evaluation reseeds with seed + EVAL_SEED_OFFSET.
         n_episodes: Number of evaluation episodes.
         noise_mode: One of NOISE_MODES.  'action' perturbs the actuators sent
@@ -168,7 +168,8 @@ def evaluate_run(agent, seed, n_episodes, noise_mode="none", noise_std=DEFAULT_N
     """
     _seed_everything(seed + EVAL_SEED_OFFSET)
     env = make_env(use_lagrangian=False)
-    agent.get_and_reset_proj_stats()  # drop counters left over from training
+    if hasattr(agent, "get_and_reset_proj_stats"):
+        agent.get_and_reset_proj_stats()  # drop counters left over from training
 
     rows, stats_all = [], []
     for _ in range(n_episodes):
@@ -280,21 +281,21 @@ def _run_job(job):
     name, seed, settings, eval_only = job
     if settings["threads"]:
         torch.set_num_threads(settings["threads"])
-    cfg = ALL_CONFIGS[name]
     run_dir = _run_dir(settings["out"], name, seed)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     if eval_only:
         with open(run_dir / "eval.json") as f:
             result = json.load(f)
-        agent = load_agent(cfg, run_dir)
+        agent = load_agent(name, run_dir)
     else:
-        agent, train_stats = train_run(cfg, seed, settings, run_dir)
+        agent, train_stats = train_run(name, seed, settings, run_dir)
         result = {
             "config": name,
-            "label": cfg.label,
+            "label": run_label(name),
             "seed": seed,
-            "components": {c: getattr(cfg, c) for c in COMPONENTS},
+            "components": (None if name == BASELINE
+                           else {c: getattr(ALL_CONFIGS[name], c) for c in COMPONENTS}),
             "settings": {
                 "episodes": settings["episodes"],
                 "schedule_episodes": settings["schedule_episodes"],

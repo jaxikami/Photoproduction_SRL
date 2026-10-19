@@ -112,3 +112,14 @@ ALL_CONFIGS = {
         key=lambda c: (len(c.removed), [COMPONENTS.index(r) for r in c.removed]))
 }
 LOO_CONFIGS = ["full"] + [f"no_{c}" for c in COMPONENTS]
+
+# The Standard RL baseline (agents/bench.py trained on envs/bench.py), run with
+# the same protocol and evaluated on the same environment as the variants.
+BASELINE = "baseline"
+BASELINE_LABEL = "Standard RL"
+RUN_NAMES = list(ALL_CONFIGS) + [BASELINE]
+
+
+def run_label(name):
+    """Human-readable name of a run: an ablation config or the baseline."""
+    return BASELINE_LABEL if name == BASELINE else ALL_CONFIGS[name].label

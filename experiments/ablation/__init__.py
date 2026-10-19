@@ -26,6 +26,14 @@ Components:
 
     Without proj and grad the APN is gone altogether.
 
+Baseline:
+    The Standard RL agent (agents/bench.py, trained on envs/bench.py's static
+    penalties) runs as the extra config 'baseline' with the same budget, seeds
+    and evaluation as the variants (--no-baseline leaves it out).  Both
+    environments share the plant and count violations identically, so its
+    KPIs are directly comparable; ablation_vs_baseline.png sets it against
+    the full Safe RL agent under every noise mode.
+
 Why the mask ablation keeps the interlock:
     The plant decodes only the dimensions its stage allows (envs/plant.py), and
     the APN is trained on stage-masked actions.  Without the interlock the
@@ -74,6 +82,7 @@ Outputs (under --out, default ablation/):
     ablation_final.png                     final evaluation metrics per noise mode
     ablation_occurrence.png                violation events per episode by constraint
     ablation_severity.png                  worst and mean exceedance by constraint
+    ablation_vs_baseline.png               Safe RL vs Standard RL per noise mode
 
 Runs with an eval.json are skipped, so re-running the same command resumes an
 interrupted study; a run that was interrupted part-way restarts from scratch.
@@ -82,7 +91,8 @@ different --noise-std or --eval-episodes) is re-evaluated from its saved
 policy.pth without retraining.
 
 Usage:
-    python ablation.py                                # leave-one-out, seeds 0-2
+    python ablation.py                                # leave-one-out + baseline, seeds 0-2
+    python ablation.py --configs full baseline        # Safe RL vs baseline only
     python ablation.py --configs full no_proj --seeds 0 1 2 3 4
     python ablation.py --design factorial --episodes 5000
     python ablation.py --workers 1                    # one process, progress bars

@@ -5,8 +5,11 @@ import numpy as np
 import torch
 
 # ─── Local ────────────────────────────────────────────────────────────────────
-from envs.plant import PhycocyaninEnvCore
+from envs.plant import DEFAULT_SQUASHED, PhycocyaninEnvCore
 from experiments.ablation.config import ILLEGAL_CMD_TOL, SEVERITY_TYPES, VIOLATION_NAMES
+
+_DEFAULT = np.array(DEFAULT_SQUASHED)
+_NO_PROJ = {"calls": 0, "noop": 0, "iters": 0, "avg_it": 0.0}
 
 TRAIN_LOG_FIELDS = ("episode", "return", "harvested", "violation_steps", "violation_ids",
                     "ended_idle", "lambda_max", "apn_noop_frac", "apn_avg_iters",
@@ -54,13 +57,13 @@ class EpisodeStats:
             reward: Step reward.
             info: Info dict from env.step().
         """
-        # select_action() overwrites stage-locked dims with their defaults, so a
-        # gap there between the raw command and the action sent is an illegal
-        # command the interlock blocked (always zero for a masked policy).
+        # A raw command away from the stage-locked default is an illegal command:
+        # the safe agent's interlock overwrites it, the plant ignores it for the
+        # baseline (always zero for a masked policy).
         locked = PhycocyaninEnvCore.get_action_mask(
             torch.as_tensor(obs, dtype=torch.float32)).numpy() == 0
         self.locked += int(locked.sum())
-        self.illegal += int((locked & (np.abs(np.tanh(raw_intent) - action) > ILLEGAL_CMD_TOL)).sum())
+        self.illegal += int((locked & (np.abs(np.tanh(raw_intent) - _DEFAULT) > ILLEGAL_CMD_TOL)).sum())
 
         cx, cn, cq, v = env.state
         stage = info["current_stage"]
@@ -80,12 +83,14 @@ class EpisodeStats:
 
         Args:
             env: Environment at the end of the episode.
-            agent: Agent whose projection counters cover this episode.
+            agent: Agent whose projection counters cover this episode (the
+                baseline has none).
 
         Returns:
             Dict keyed by TRAIN_LOG_FIELDS except 'episode' and 'seconds'.
         """
-        proj = agent.get_and_reset_proj_stats()
+        proj = (agent.get_and_reset_proj_stats()
+                if hasattr(agent, "get_and_reset_proj_stats") else _NO_PROJ)
         info = self.last_info
         for vid, name in VIOLATION_NAMES.items():
             self.events[name] = int(info.get(f"g{vid}_violation_count", 0))

@@ -9,8 +9,8 @@ import warnings
 from agents.networks import device
 from experiments.ablation import summary
 from experiments.ablation.config import (
-    ALL_CONFIGS, DEFAULT_EPISODES, DEFAULT_EVAL_EPISODES, DEFAULT_NOISE_STD, DEFAULT_SEEDS,
-    DEFAULT_WORKERS, LOO_CONFIGS, NOISE_MODES, SCHEDULE_EPISODES
+    ALL_CONFIGS, BASELINE, DEFAULT_EPISODES, DEFAULT_EVAL_EPISODES, DEFAULT_NOISE_STD, DEFAULT_SEEDS,
+    DEFAULT_WORKERS, LOO_CONFIGS, NOISE_MODES, RUN_NAMES, SCHEDULE_EPISODES
 )
 from experiments.ablation.runner import _needs_eval, _run_dir, _stale, run_jobs
 
@@ -23,12 +23,14 @@ def _parse_args():
     parser = argparse.ArgumentParser(
         description="Ablation study of the Safe RL agent "
                     "(GRU memory, Lagrangian, stage mask, APN projection, safety gradient).",
-        epilog="configs: " + ", ".join(ALL_CONFIGS),
+        epilog="configs: " + ", ".join(RUN_NAMES),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--design", choices=("loo", "factorial"), default="loo",
                         help="loo: full model plus one run per removed component; "
                              f"factorial: all {len(ALL_CONFIGS)} combinations")
-    parser.add_argument("--configs", nargs="+", choices=list(ALL_CONFIGS), metavar="NAME",
+    parser.add_argument("--no-baseline", action="store_true",
+                        help=f"leave the Standard RL baseline ('{BASELINE}') out of the design set")
+    parser.add_argument("--configs", nargs="+", choices=RUN_NAMES, metavar="NAME",
                         help="run only these configs instead of the --design set")
     parser.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SEEDS,
                         help="each config is trained once per seed")
@@ -55,7 +57,8 @@ def main():
     """Run the requested ablation runs, then summarize everything on disk."""
     args = _parse_args()
     if not args.summarize_only:
-        names = args.configs or (LOO_CONFIGS if args.design == "loo" else list(ALL_CONFIGS))
+        names = args.configs or ((LOO_CONFIGS if args.design == "loo" else list(ALL_CONFIGS))
+                                 + ([] if args.no_baseline else [BASELINE]))
         settings = {
             "out": args.out,
             "episodes": args.episodes,

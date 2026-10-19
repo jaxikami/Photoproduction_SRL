@@ -123,7 +123,7 @@ python main.py
 ```bash
 python ablation.py
 ```
-Leave-one-out over the GRU, Lagrangian, stage mask, APN projection and safety gradient, seeds 0-2, 10,000 episodes per run. Each policy is evaluated without noise, with actuator noise and with sensor noise (no disturbances). Results land in `ablation/`; `--summarize-only` re-plots and `--help` lists the options.
+Leave-one-out over the GRU, Lagrangian, stage mask, APN projection and safety gradient, seeds 0-2, 10,000 episodes per run. Each policy is evaluated without noise, with actuator noise and with sensor noise (no disturbances). The Standard RL baseline is trained and evaluated alongside (`--no-baseline` leaves it out), and `ablation/ablation_vs_baseline.png` compares it with the full Safe RL agent under all three noise modes. Results land in `ablation/`; `--summarize-only` re-plots and `--help` lists the options.
 
 5. **Compare stage schedules** (after evaluating both agents)
 ```bash
