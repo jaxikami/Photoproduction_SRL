@@ -56,6 +56,7 @@ A feedforward PPO actor-critic without the projection filter. Relies on reward s
 
 ```
 main.py                   run settings + dispatch (python main.py)
+ablation.py               ablation study entry point (python ablation.py --help)
 envs/
   kinetics.py             Numba rate equations and RK4 integrator
   plant.py                PhycocyaninEnvCore: state, stage logic, action mask
@@ -76,6 +77,7 @@ safety/                   the Action Projection Network
 experiments/
   config.py               RunConfig and PPO hyperparameters
   train.py / evaluate.py  main.py's training loop and noisy evaluation
+  ablation/               study config, ablated agent, runs, summary, plots, CLI
 reporting/
   logger.py               DataLogger
   plots.py                training and evaluation plots, comparison table
@@ -117,7 +119,13 @@ PPO hyperparameters live in `experiments/config.py`. Then run:
 python main.py
 ```
 
-4. **Compare stage schedules** (after evaluating both agents)
+4. **Ablation study** (optional)
+```bash
+python ablation.py
+```
+Leave-one-out over the GRU, Lagrangian, stage mask, APN projection and safety gradient, seeds 0-2, 10,000 episodes per run. Each policy is evaluated without noise, with actuator noise and with sensor noise (no disturbances). Results land in `ablation/`; `--summarize-only` re-plots and `--help` lists the options.
+
+5. **Compare stage schedules** (after evaluating both agents)
 ```bash
 python -m reporting.gantt
 ```

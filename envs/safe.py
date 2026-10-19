@@ -116,6 +116,15 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         # Disable inherited monolithic Lagrangian attributes to avoid confusion
         self.lagrange_updates_enabled = False
 
+    def disable_lagrangian(self):
+        """Freeze every Lagrange multiplier at 0 (no dual ascent).
+
+        The static shaping (base spikes, buffer zones, G3 anticipation, G5
+        guiding and idle spike) is kept, so only the adaptive part is removed.
+        """
+        self.lag_lr = self.lag_lr_g1 = self.lag_lr_g2 = self.lag_lr_g3 = 0.0
+        self.lam_g1 = self.lam_g2 = self.lam_g3 = self.lam_g4 = self.lam_g5 = 0.0
+
     # ------------------------------------------------------------------
 
     def reset(self, randomize=False):
