@@ -11,12 +11,12 @@ from dataclasses import dataclass
 # compressed one.
 SCHEDULE_EPISODES = 20000
 
-DEFAULT_EPISODES = 10000
+DEFAULT_EPISODES = 3000
 DEFAULT_EVAL_EPISODES = 100
 DEFAULT_SEEDS = [0, 1, 2]
 # Not measured for this project: rollouts are one reactor at a time
 # (latency-bound), so several processes share the GPU; lower it if they contend.
-DEFAULT_WORKERS = 6
+DEFAULT_WORKERS = 10
 
 # Evaluation reseeds with seed + offset so its sampling noise does not depend
 # on how training consumed the RNG.

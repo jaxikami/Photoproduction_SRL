@@ -17,8 +17,8 @@ from reporting.logger import DataLogger  # noqa: E402
 from reporting.plots import Plotter  # noqa: E402
 
 # ---------------- Run configuration ----------------
-EVALUATE_ONLY = True    # True → skip training and run evaluation only; False → run full train + eval
-RUN_BENCHMARK = True    # True → run Standard RL (bench) only; False → run Safe RL only
+EVALUATE_ONLY = False    # True → skip training and run evaluation only; False → run full train + eval
+RUN_BENCHMARK = False   # True → run Standard RL (bench) only; False → run Safe RL only
 RESUME_TRAINING = True  # True → load existing weights before training
 MAX_EPISODES = 20000
 NOISE_STD = 0.05
