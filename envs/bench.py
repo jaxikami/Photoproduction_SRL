@@ -1,5 +1,5 @@
 import numpy as np
-from env_core import PhycocyaninEnvCore, integrate_rk4
+from envs.plant import PhycocyaninEnvCore
 
 # =============================================================================
 # BENCHMARK ENVIRONMENT — Fixed-Weight Barrier + Spike Penalties

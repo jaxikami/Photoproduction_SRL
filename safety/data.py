@@ -13,21 +13,9 @@ by the single-step APN safety filter.
 
 import torch
 
-# ── Global safety parameters (mirror env.py) ─────────────────────────────────
-I_MIN, I_MAX    = 120.0, 400.0
-FN_MAX_GROWTH   = 40.0
-FN_MAX_PROD     = 10.0
-FOUT_MAX        = 2.0
-N_LIMIT_PATH    = 800.0
-RATIO_LIMIT     = 0.011
-
-V_MAX           = 20.0
-V_MIN           = 2.0
-V_RESET         = 0.10 * V_MAX   # 2.0 L — post-harvest partial reset (10% V_MAX)
-C_N_STOCK       = 3000.0
-CONTROL_INTERVAL = 10.0
-TOTAL_TIME      = 1000.0
-SAFE_BUFFER     = 0.98
+from safety.constants import (C_N_STOCK, CONTROL_INTERVAL, FN_MAX_GROWTH, FN_MAX_PROD,
+                              FOUT_MAX, I_MAX, I_MIN, N_LIMIT_PATH, RATIO_LIMIT,
+                              SAFE_BUFFER, V_MAX, V_MIN, V_RESET)
 
 
 def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = None):

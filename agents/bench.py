@@ -2,17 +2,21 @@
 Standard Proximal Policy Optimization (PPO) Agent.
 
 This module implements the benchmark PPO agent used for training the
-unconstrained or penalty-based formulation of the photobioreactor environment.
-It includes the Actor-Critic network definition and the PPO update loop.
+penalty-based formulation of the photobioreactor environment
+(envs/bench.py).  It uses a feedforward Actor-Critic with no recurrent
+memory, no action projection and no safety masking.
+
+Pipeline overview::
+
+    Actor (MLP policy) -> tanh squash -> environment
 """
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
-import numpy as np
 from numba import njit
+from torch.distributions import Normal
 
-# Hardware setup
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from agents.networks import device
 
 
 @njit(cache=True)
@@ -142,7 +146,7 @@ class ActorCriticStandardRL(nn.Module):
         return log_probs, state_values, dist_entropy
 
 
-class StandardRL_Agent:
+class PPO_Agent:
     """PPO algorithm wrapper for the standard (penalty-based) RL agent.
     
     This class handles trajectory collection, reward discounting, advantage
@@ -188,23 +192,35 @@ class StandardRL_Agent:
 
         self.MseLoss = nn.MSELoss()
 
-    def select_action(self, state_norm):
+    def reset(self):
+        """No per-episode state (feedforward policy); kept for a common agent interface."""
+
+    def discard_rollout(self):
+        """No rollout state outside the memory; kept for a common agent interface."""
+
+    def select_action(self, state_norm, intent_noise=0.0):
         """Selects an action using the old (frozen) policy during trajectory collection.
 
         Args:
             state_norm (np.ndarray): The normalized state observation.
+            intent_noise (float, optional): Relative Gaussian noise on the
+                squashed action (evaluation robustness tests). Defaults to 0.
 
         Returns:
             tuple:
-                - z (np.ndarray): The squashed action array.
-                - log_prob (np.ndarray): Log probability of the action.
+                - z (np.ndarray): The squashed action array sent to the env.
                 - z_raw (np.ndarray): Unbounded raw action array.
+                - log_prob (float): Log probability of the action.
+                - state (np.ndarray): The state fed to the actor.
         """
         with torch.no_grad():
-            state_t = torch.FloatTensor(state_norm).to(device).unsqueeze(0)
+            state_t = torch.FloatTensor(np.asarray(state_norm)).to(device).unsqueeze(0)
             z, log_prob, z_raw = self.policy_old.act(state_t)
 
-        return z.cpu().numpy().flatten(), log_prob.cpu().numpy(), z_raw.cpu().numpy().flatten()
+        z = z.cpu().numpy().flatten()
+        if intent_noise > 0:
+            z = np.clip(z + z * np.random.normal(0, intent_noise, size=z.shape), -1.0, 1.0)
+        return z, z_raw.cpu().numpy().flatten(), log_prob.item(), state_t.cpu().numpy()[0]
 
     def learn(self, memory):
         """Executes the PPO optimization update.
@@ -214,28 +230,21 @@ class StandardRL_Agent:
         networks using the PPO clipped surrogate loss.
 
         Args:
-            memory (Memory): Buffer containing states, actions, rewards, and logprobs
+            memory (PPOMemory): Buffer containing states, actions, rewards, and logprobs
                 collected during the recent trajectory rollout.
         """
+        n = memory.size
         # Fast vectorized reward discounting using numba
-        if hasattr(memory, '_rewards'):
-            raw_rewards = memory._rewards[:memory._ptr].copy()
-            terminals = memory._is_terminals[:memory._ptr].astype(np.float32)
-        else:
-            raw_rewards = np.array(memory.rewards, dtype=np.float32)
-            terminals = np.array(memory.is_terminals, dtype=np.float32)
+        raw_rewards = memory.rewards[:n].copy()
+        terminals = memory.is_terminals[:n].astype(np.float32)
         discounted = _discount_rewards(raw_rewards, terminals, self.gamma)
 
         rewards = torch.from_numpy(discounted).to(device)
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
-        # Use fast pre-stacked tensor path if available
-        if hasattr(memory, 'get_tensors'):
-            old_states, _, old_z_raw, old_logprobs, _ = memory.get_tensors(device)
-        else:
-            old_states = torch.squeeze(torch.stack(memory.states, dim=0)).detach().to(device)
-            old_z_raw = torch.squeeze(torch.stack(memory.raw_actions, dim=0)).detach().to(device)
-            old_logprobs = torch.squeeze(torch.stack(memory.logprobs, dim=0)).detach().to(device)
+        old_states = torch.from_numpy(memory.states[:n]).to(device)
+        old_z_raw = torch.from_numpy(memory.actions[:n]).to(device)
+        old_logprobs = torch.from_numpy(memory.logprobs[:n]).to(device)
 
         # Precalculate and normalize advantages over the entire batch
         with torch.no_grad():
