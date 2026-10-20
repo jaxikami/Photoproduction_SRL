@@ -17,6 +17,7 @@ import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
+from reporting.paths import agent_plot_dir
 from safety.apn import ActionProjectionNetwork
 from safety.constants import APN_PATH
 from safety.data import get_fresh_batch_dataset
@@ -368,8 +369,7 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=1000000,
     plt.title("Safety Classifier Convergence")
     ax1.grid(True, which="both", linestyle="--", alpha=0.5)
     plt.tight_layout()
-    os.makedirs("plot", exist_ok=True)
-    plt.savefig(os.path.join("plot", "am_loss.png"))
+    plt.savefig(os.path.join(agent_plot_dir("safe"), "am_loss.png"))
     plt.close()
 
 

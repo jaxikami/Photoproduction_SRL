@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from reporting.paths import agent_plot_dir, compare_plot_dir
+
 # Configure matplotlib for research paper quality plots
 plt.rcParams.update({
     'font.size': 12,
@@ -80,8 +82,7 @@ class Plotter:
         plt.ylabel("Cumulative Reward (Normalized)")
         plt.legend()
         plt.grid(True, alpha=0.3)
-        os.makedirs("plot", exist_ok=True)
-        plt.savefig(os.path.join("plot", f"training_{agent_name}.png"), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(agent_plot_dir(agent_name), f"training_{agent_name}.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
     @staticmethod
@@ -101,8 +102,7 @@ class Plotter:
         ax1.set_ylabel("Number of Violations")
         ax1.grid(True, axis='y', linestyle='--', alpha=0.7)
         plt.tight_layout()
-        os.makedirs("plot", exist_ok=True)
-        plt.savefig(os.path.join("plot", "training_violations.png"), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(compare_plot_dir(), "training_violations.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
     @staticmethod
@@ -140,7 +140,7 @@ class Plotter:
         V_MAX         = 20.0
         V_MIN         = 2.0
         
-        os.makedirs("plot", exist_ok=True)
+        out_dir = agent_plot_dir(agent_name)
 
         # 1. Nitrate concentration
         plt.figure(figsize=(8, 5))
@@ -157,7 +157,7 @@ class Plotter:
         plt.xlabel("Time (hours)")
         plt.grid(True, alpha=0.2)
         plt.legend(fontsize=9)
-        plt.savefig(os.path.join("plot", f"plot_nitrate{suffix}.png"), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(out_dir, f"plot_nitrate{suffix}.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
         # 2. g1,2,3,4,5 violated during evaluation as a bar chart
@@ -172,7 +172,7 @@ class Plotter:
         for bar in bars:
             yval = bar.get_height()
             plt.text(bar.get_x() + bar.get_width()/2, yval, int(yval), ha='center', va='bottom')
-        plt.savefig(os.path.join("plot", f"plot_violations{suffix}.png"), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(out_dir, f"plot_violations{suffix}.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
         # 3. Final phycocyanin produced in concentration as well as g
@@ -198,7 +198,7 @@ class Plotter:
             
             plt.title(f"Average Phycocyanin Production — {agent_name}")
             fig.tight_layout()
-            plt.savefig(os.path.join("plot", f"plot_phycocyanin{suffix}.png"), dpi=300, bbox_inches='tight')
+            plt.savefig(os.path.join(out_dir, f"plot_phycocyanin{suffix}.png"), dpi=300, bbox_inches='tight')
             plt.close(fig)
         else:
             plt.close()
@@ -245,7 +245,7 @@ class Plotter:
         plt.xlabel("Time (hours)")
         plt.grid(True, alpha=0.2)
         plt.legend()
-        plt.savefig(os.path.join("plot", f"plot_light{suffix}.png"), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(out_dir, f"plot_light{suffix}.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
         # 5. Nitrate feed control plot for the best episode
@@ -257,7 +257,7 @@ class Plotter:
         plt.xlabel("Time (hours)")
         plt.grid(True, alpha=0.2)
         plt.legend()
-        plt.savefig(os.path.join("plot", f"plot_nitrate_feed{suffix}.png"), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(out_dir, f"plot_nitrate_feed{suffix}.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
         # 6. Reactor volume with min and max shadow area
@@ -274,7 +274,7 @@ class Plotter:
         plt.xlabel("Time (hours)")
         plt.grid(True, alpha=0.2)
         plt.legend(fontsize=9)
-        plt.savefig(os.path.join("plot", f"plot_volume{suffix}.png"), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(out_dir, f"plot_volume{suffix}.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
         # 7. Cq/Cx with min and max shadow area
@@ -288,7 +288,7 @@ class Plotter:
         plt.xlabel("Time (hours)")
         plt.grid(True, alpha=0.2)
         plt.legend(fontsize=9)
-        plt.savefig(os.path.join("plot", f"plot_ratio{suffix}.png"), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(out_dir, f"plot_ratio{suffix}.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
     @staticmethod
@@ -338,6 +338,5 @@ class Plotter:
         table.scale(1.2, 1.5)
         
         plt.title("Comparison of Final Production and Concentration")
-        os.makedirs("plot", exist_ok=True)
-        plt.savefig(os.path.join("plot", "comparison_table.png"), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(compare_plot_dir(), "comparison_table.png"), dpi=300, bbox_inches='tight')
         plt.close()

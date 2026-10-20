@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import os
 
+from reporting.paths import compare_plot_dir
+
 
 def generate_gantt():
     """Generates a Gantt chart comparing stage schedules of Safe vs Standard RL.
@@ -116,8 +118,7 @@ def generate_gantt():
     ax.spines['right'].set_visible(False)
     ax.spines['left'].set_visible(False)
     
-    os.makedirs("plot", exist_ok=True)
-    out_path = os.path.join("plot", "gantt_comparison.png")
+    out_path = os.path.join(compare_plot_dir(), "gantt_comparison.png")
     plt.savefig(out_path, dpi=300, bbox_inches='tight')
     print(f"Gantt comparison plot successfully saved to {out_path}")
     plt.close()

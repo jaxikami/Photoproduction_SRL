@@ -82,8 +82,12 @@ reporting/
   logger.py               DataLogger
   plots.py                training and evaluation plots, comparison table
   gantt.py                stage-schedule Gantt chart (python -m reporting.gantt)
+  paths.py                plot output folders
 policy/                   checkpoints and evaluation trajectories
 plot/                     generated plots
+  plot_bench/             Standard RL agent
+  plot_safe/              Safe RL agent and APN pretraining
+  plot_compare/           both agents side by side
 ```
 
 ## Setup
@@ -132,9 +136,7 @@ python -m reporting.gantt
 
 ## Outputs
 
-Generated plots are saved in the `plot/` directory, including:
-- `training_Standard RL.png` / `training_safe_RL agent.png`
-- `training_violations.png`
-- Detailed Evaluation Trajectories: `plot_nitrate.png`, `plot_phycocyanin.png`, `plot_light.png`, `plot_nitrate_feed.png`, `plot_volume.png`, `plot_ratio.png`, and `plot_violations.png`.
-- `am_loss.png` (APN pretraining convergence)
-- `comparison_table.png` and `gantt_comparison.png` (both agents)
+Generated plots are saved in sub folders of `plot/`:
+- `plot/plot_bench/` (Standard RL): `training_Standard RL.png` and the evaluation trajectories `plot_nitrate_standard.png`, `plot_phycocyanin_standard.png`, `plot_light_standard.png`, `plot_nitrate_feed_standard.png`, `plot_volume_standard.png`, `plot_ratio_standard.png`, `plot_violations_standard.png`
+- `plot/plot_safe/` (Safe RL): `training_safe_RL agent.png`, the same evaluation trajectories with the `_safe` suffix, and `am_loss.png` (APN pretraining convergence)
+- `plot/plot_compare/` (both agents): `training_violations.png`, `comparison_table.png` and `gantt_comparison.png`
