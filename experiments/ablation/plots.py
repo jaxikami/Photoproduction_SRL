@@ -177,10 +177,12 @@ def _plot_grouped_panels(rows, panels, out_path, title):
     axes[0].set_yticklabels([run_label(c) for c in configs], fontsize=9, color=_INK)
     axes[0].invert_yaxis()
 
-    handles, labels = next(ax for ax, (k, _, _) in zip(axes, panels)
-                           if not k.startswith("train_")).get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper right", ncol=len(labels), frameon=False,
-               fontsize=9, labelcolor=_INK_2)
+    # Noise-mode legend, unless every panel is a training metric.
+    eval_axes = [ax for ax, (k, _, _) in zip(axes, panels) if not k.startswith("train_")]
+    if eval_axes:
+        handles, labels = eval_axes[0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="upper right", ncol=len(labels), frameon=False,
+                   fontsize=9, labelcolor=_INK_2)
     fig.suptitle(title, x=0.01, ha="left", fontsize=11, color=_INK)
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     fig.savefig(out_path, dpi=150, facecolor=_SURFACE)
@@ -201,6 +203,27 @@ def plot_final_metrics(rows, out_path):
         ("apn_intervention_rate", "Steps corrected by the APN", "{:.2f}"),
         ("train_hours", "Training time (h)", "{:.2f}"),
     ), out_path, "Ablation study (evaluation with multipliers frozen at 0)")
+
+
+def plot_learning_speed(rows, out_path, target, levels, window, early):
+    """Plot how fast every config learns, from its training curves.
+
+    Args:
+        rows: Summary rows from summarize(), one per (config, noise mode).
+        out_path: PNG destination.
+        target: The full model's final harvest (g/ep) the levels are shares of.
+        levels: Fractions of target behind the train_eps_to_<pct> metrics.
+        window: Moving-average window of the episodes-to-level metrics.
+        early: Episodes in the early-harvest metric.
+    """
+    _plot_grouped_panels(rows, [
+        (f"train_eps_to_{round(100 * lvl)}",
+         f"Episodes to {round(100 * lvl)}% ({lvl * target:.2f} g/ep)", "{:,.0f}")
+        for lvl in levels] + [
+        ("train_auc_early", f"Mean harvest, first {early:,} eps (g/ep)", "{:.2f}"),
+        ("train_auc", "Mean harvest, whole run (g/ep)", "{:.2f}"),
+    ], out_path, f"Learning speed ({window}-episode average harvest vs Full's final "
+                 f"{target:.2f} g/ep; lower episodes and higher harvest are better)")
 
 
 def _compact(v):

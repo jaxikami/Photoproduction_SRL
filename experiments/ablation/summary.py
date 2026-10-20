@@ -13,8 +13,8 @@ from experiments.ablation.config import (
     BASELINE, NOISE_LABELS, NOISE_MODES, RUN_NAMES, SEVERITY_TYPES, VIOLATION_NAMES, run_label
 )
 from experiments.ablation.plots import (
-    plot_final_metrics, plot_learning_curves, plot_occurrence, plot_safe_vs_baseline,
-    plot_severity
+    plot_final_metrics, plot_learning_curves, plot_learning_speed, plot_occurrence,
+    plot_safe_vs_baseline, plot_severity
 )
 from experiments.ablation.runner import _run_dir
 
@@ -29,7 +29,15 @@ EVAL_METRICS = (["harvested", "violation_steps", "violation_episode_pct", "ended
 TRAIN_METRICS = [("train_violation_steps", "violation_steps_total"),
                  ("train_hours", "hours"),
                  ("s_per_episode", "s_per_episode")]
-SUMMARY_KEYS = EVAL_METRICS + [key for key, _ in TRAIN_METRICS]
+# Learning speed, read off the training curves.  The harvest levels are
+# fractions of the full model's final harvest (its last SPEED_WINDOW episodes,
+# averaged over seeds), so every config chases the same targets.
+SPEED_LEVELS = (0.90, 0.97)
+SPEED_WINDOW = 100
+EARLY_EPISODES = 1000
+SPEED_METRICS = ([f"train_eps_to_{round(100 * lvl)}" for lvl in SPEED_LEVELS]
+                 + ["train_auc_early", "train_auc"])
+SUMMARY_KEYS = EVAL_METRICS + [key for key, _ in TRAIN_METRICS] + SPEED_METRICS
 
 
 def load_results(out_dir):
@@ -69,6 +77,43 @@ def _load_train_curves(out_dir, results):
     return curves
 
 
+def _learning_speed(curves):
+    """Learning-speed metrics of every run, from its training curve.
+
+    Per run: the episode at which the SPEED_WINDOW-episode moving average of
+    the harvest first reaches each SPEED_LEVELS fraction of the full model's
+    final harvest (a run that never does is censored at its episode budget),
+    and the mean harvest per episode over the first EARLY_EPISODES episodes
+    and over the whole run (the area under the learning curve per episode).
+
+    Args:
+        curves: Output of _load_train_curves().
+
+    Returns:
+        A tuple of (dict of config name -> list of per-run metric dicts keyed
+        by SPEED_METRICS, the full model's final harvest or None without it).
+    """
+    full = curves.get("full")
+    target = (float(np.mean([s["harvested"][-SPEED_WINDOW:].mean() for s in full]))
+              if full else None)
+    speed = {}
+    for name, runs in curves.items():
+        per_run = []
+        for s in runs:
+            h = s["harvested"]
+            w = min(SPEED_WINDOW, len(h))
+            avg = np.convolve(h, np.ones(w) / w, mode="valid")
+            m = {"train_auc_early": float(h[:EARLY_EPISODES].mean()),
+                 "train_auc": float(h.mean())}
+            for lvl in SPEED_LEVELS:
+                hit = np.flatnonzero(avg >= lvl * target) if target is not None else None
+                m[f"train_eps_to_{round(100 * lvl)}"] = (
+                    None if hit is None else float(hit[0] + w if hit.size else len(h)))
+            per_run.append(m)
+        speed[name] = per_run
+    return speed, target
+
+
 def _fmt(mean, std, spec):
     """Format 'mean ± std' for the console table; '-' when unavailable."""
     if mean is None:
@@ -94,6 +139,8 @@ def summarize(out_dir):
         return (float(np.mean(vals)) if vals else None,
                 float(np.std(vals, ddof=1)) if len(vals) > 1 else None)
 
+    curves = _load_train_curves(out_dir, results)
+    speed, speed_target = _learning_speed(curves)
     rows = []
     for name, runs in results.items():
         for mode in NOISE_MODES:
@@ -107,6 +154,9 @@ def summarize(out_dir):
             for key, field in TRAIN_METRICS:
                 row[f"{key}_mean"], row[f"{key}_std"] = aggregate(
                     [r["train"].get(field) for r in runs])
+            for key in SPEED_METRICS:
+                row[f"{key}_mean"], row[f"{key}_std"] = aggregate(
+                    [m[key] for m in speed[name]])
             rows.append(row)
 
     full = {r["noise_mode"]: r for r in rows if r["config"] == "full"}
@@ -168,19 +218,44 @@ def summarize(out_dir):
             if row["illegal_cmd_rate_mean"]:
                 print(f"  {row['label']}: the policy commanded stage-illegal actions on "
                       f"{100 * row['illegal_cmd_rate_mean']:.1f}% of locked action dims")
+    _print_learning_speed(rows, rule, speed_target)
     _print_safe_vs_baseline(rows, rule)
     print(f"{rule}\n")
 
-    plot_learning_curves(_load_train_curves(out_dir, results), Path(out_dir, "ablation_curves.png"))
+    plot_learning_curves(curves, Path(out_dir, "ablation_curves.png"))
     plot_final_metrics(rows, Path(out_dir, "ablation_final.png"))
     plot_occurrence(rows, Path(out_dir, "ablation_occurrence.png"))
     plot_severity(rows, Path(out_dir, "ablation_severity.png"))
     written = ["curves", "final", "occurrence", "severity"]
+    if speed_target is not None:
+        plot_learning_speed(rows, Path(out_dir, "ablation_learning.png"), speed_target,
+                            SPEED_LEVELS, SPEED_WINDOW, EARLY_EPISODES)
+        written.append("learning")
     if plot_safe_vs_baseline(rows, Path(out_dir, "ablation_vs_baseline.png")):
         written.append("vs_baseline")
     print(f"Wrote {Path(out_dir, 'summary.csv')} and " + ", ".join(
         str(Path(out_dir, f"ablation_{n}.png")) for n in written))
 
+
+
+def _print_learning_speed(rows, rule, target):
+    """Console table: how fast each config's harvest rises during training."""
+    if target is None:
+        return
+    mode_rows = [r for r in rows if r["noise_mode"] == NOISE_MODES[0]]
+    keys = [f"train_eps_to_{round(100 * lvl)}" for lvl in SPEED_LEVELS]
+    print(f"\n{rule}")
+    print(f"  LEARNING SPEED (training curves, mean ± std over seeds): episodes until the "
+          f"{SPEED_WINDOW}-episode average harvest reaches a share of Full's final "
+          f"{target:.2f} g/ep (never: the budget)")
+    print(rule)
+    print(f"  {'Config':<26} " + " ".join(f"{f'Eps to {round(100 * l)}%':>18}" for l in SPEED_LEVELS)
+          + f" {f'Harvest, first {EARLY_EPISODES:,} eps':>26} {'Harvest, all eps':>18}")
+    for row in mode_rows:
+        print(f"  {row['label']:<26} "
+              + " ".join(f"{_fmt(row[f'{k}_mean'], row[f'{k}_std'], '.0f'):>18}" for k in keys)
+              + f" {_fmt(row['train_auc_early_mean'], row['train_auc_early_std'], '.2f'):>26}"
+              + f" {_fmt(row['train_auc_mean'], row['train_auc_std'], '.2f'):>18}")
 
 
 def _print_safe_vs_baseline(rows, rule):
