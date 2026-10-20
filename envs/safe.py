@@ -28,6 +28,12 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         g4 (path):     Reactor volume <= V_MAX                      — λ_g4, buffer + spike
         g5 (terminal): Episode MUST end in Idle stage (stage 3)     — λ_g5, HARD terminal spike
 
+    Scenario constraints (envs/plant.SCENARIOS), active only with their scenario:
+        g6 (episode):  Nitrate discharged <= NITRATE_DISCHARGE_BUDGET ('discharge') —
+            λ_g6 prices every mg drained, λ_g6 <- clip(λ_g6 + η (C/B - 1), 0, λ_max)
+            once per episode (CMDP dual ascent); a terminal spike over budget
+        g7 (path):     No stage-locked actuator driven ('actuators') — λ_g7 + spike
+
     Attributes:
         reset_lambdas_per_episode (bool): Whether to reset Lagrangian multipliers at the beginning
             of each episode. Defaults to False.
@@ -50,6 +56,9 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         lag_max_g2 (float): Maximum cap for the g2 multiplier.
         lag_max_g3 (float): Maximum cap for the g3 multiplier.
         lag_max_g5 (float): Maximum cap for the g5 multiplier.
+        lam_g6, lam_g7 (float): Multipliers of the scenario constraints g6 and g7.
+        lag_lr_g6, lag_lr_g7 (float): Their learning rates.
+        lag_max_g6, lag_max_g7 (float): Their caps.
         BASE_SPIKE (float): Base penalty spike applied on constraint violations.
         BUFFER_COEF (float): Coefficient scaling the barrier buffer penalties.
         IDLE_BASE_SPIKE (float): Fixed base penalty spike for failing the terminal idle constraint.
@@ -63,8 +72,12 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         lagrange_updates_enabled (bool): Flag indicating if monolithic Lagrangian updates are enabled.
     """
 
-    def __init__(self):
-        """Initializes the safe environment settings and Lagrangian hyperparameters."""
+    def __init__(self, scenarios=()):
+        """Initializes the safe environment settings and Lagrangian hyperparameters.
+
+        Args:
+            scenarios (iterable of str, optional): envs/plant.SCENARIOS to switch on.
+        """
         # ── Initialise attributes used by reset() BEFORE super().__init__() ──
         # super().__init__() calls self.reset(), so these must exist first.
         self.reset_lambdas_per_episode = False
@@ -75,9 +88,11 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         self.lam_g3 = 0.0
         self.lam_g4 = 0.0
         self.lam_g5 = 0.0
+        self.lam_g6 = 0.0
+        self.lam_g7 = 0.0
         self.prev_Cx = 1.1             # Set early; step() uses it
 
-        super().__init__()
+        super().__init__(scenarios)
 
         # ── Lagrangian update hyperparameters ──────────────────────
         # Scale: harvest_r peaks ~13/step. Penalties should dominate only
@@ -94,6 +109,12 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         self.lag_max_g2 = 500.0        # Hard cap prevents reward signal death
         self.lag_max_g3 = 200000.0     # Increased to match G1 penalty capacity
         self.lag_max_g5 = 100.0        # G5 cap (hard constraint)
+        # Scenario constraints.  λ_g6 is the price of a whole budget's worth of
+        # discharge (harvest_r totals ~2800/episode), raised per episode.
+        self.lag_lr_g6  = 200.0
+        self.lag_max_g6 = 10000.0
+        self.lag_lr_g7  = 10.0         # per breach step
+        self.lag_max_g7 = 1000.0
 
         # ── Barrier + base spike params ────────────────────────────
         # BASE_SPIKE fires even at λ=0; must be painful but not catastrophic.
@@ -123,7 +144,9 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         guiding and idle spike) is kept, so only the adaptive part is removed.
         """
         self.lag_lr = self.lag_lr_g1 = self.lag_lr_g2 = self.lag_lr_g3 = 0.0
+        self.lag_lr_g6 = self.lag_lr_g7 = 0.0
         self.lam_g1 = self.lam_g2 = self.lam_g3 = self.lam_g4 = self.lam_g5 = 0.0
+        self.lam_g6 = self.lam_g7 = 0.0
 
     # ------------------------------------------------------------------
 
@@ -160,6 +183,8 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             self.lam_g3 = 0.0
             self.lam_g4 = 0.0
             self.lam_g5 = 0.0
+            self.lam_g6 = 0.0
+            self.lam_g7 = 0.0
         else:
             # Per-episode decay to prevent death spiral from early exploration
             self.lam_g2 *= self.lag_ep_decay_g2
@@ -194,6 +219,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
                   and current multiplier values.
         """
         prev_harvested = self.total_cq_harvested
+        prev_discharged = self.nitrate_discharged
         prev_stage = self.current_stage          # capture BEFORE physics step
         a_clipped, Fn_phys, done = self._physics_step(action)
         harvested_step = self.total_cq_harvested - prev_harvested
@@ -356,6 +382,33 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
                 self.lam_g5 *= (1.0 - self.lag_decay)
                 step_reward += 50.0  # Idle completion bonus
 
+        # ── Scenario constraints ───────────────────────────────────
+        p_g6 = p_g7 = 0.0
+        if "discharge" in self.scenarios:
+            # g6: λ_g6 prices every mg drained (a dense signal); the budget
+            # itself is only known to be broken at the end of the episode.
+            budget = self.NITRATE_DISCHARGE_BUDGET
+            p_g6 += self.lam_g6 * (self.nitrate_discharged - prev_discharged) / budget
+            if done:
+                over = self.nitrate_discharged / budget - 1.0
+                if over > 0:
+                    p_g6 += 100.0 * self.BASE_SPIKE * (1.0 + over)
+                    self.violation_count    += 1
+                    self.g6_violation_count += 1
+                # Dual ascent on the episode's budget: up when over, down when under.
+                self.lam_g6 = float(np.clip(self.lam_g6 + self.lag_lr_g6 * over,
+                                            0.0, self.lag_max_g6))
+        if "actuators" in self.scenarios:
+            # g7: a stage-locked actuator was driven in this step.
+            if self.interlock_breach:
+                p_g7 += self.lam_g7 + 50.0 * self.BASE_SPIKE
+                self.lam_g7 = min(self.lag_max_g7, self.lam_g7 + self.lag_lr_g7)
+                self.violation_count    += 1
+                self.g7_violation_count += 1
+            else:
+                self.lam_g7 *= (1.0 - self.lag_decay)
+        step_reward -= p_g6 + p_g7
+
         # ── Metrics bookkeeping ────────────────────────────────────
         self.ep_total_reward += step_reward
         self.ep_rewards.append(step_reward)
@@ -369,7 +422,7 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
         self.ep_g3_penalties.append(p_g3)
         self.ep_g4_penalties.append(p_g4)
         self.ep_g5_penalties.append(p_g5)
-        self.ep_g6_penalties.append(0.0)
+        self.ep_g6_penalties.append(p_g6)
 
         info = {
             "avg_reward":             float(np.mean(self.ep_rewards)),
@@ -390,16 +443,21 @@ class PhycocyaninEnvSafe(PhycocyaninEnvCore):
             "g3_violation_count":     self.g3_violation_count,
             "g4_violation_count":     self.g4_violation_count,
             "g5_violation_count":     self.g5_violation_count,
+            "g6_violation_count":     self.g6_violation_count,
+            "g7_violation_count":     self.g7_violation_count,
             "current_stage":          self.current_stage,
             "volume":                 float(self.state[3]),
             "nitrate_supply":         float(self.nitrate_supply),
             "total_cq_harvested":     float(self.total_cq_harvested),
+            "nitrate_discharged":     float(self.nitrate_discharged),
             # Expose current λ values for monitoring / logging
             "lam_g1": float(self.lam_g1),
             "lam_g2": float(self.lam_g2),
             "lam_g3": float(self.lam_g3),
             "lam_g4": float(self.lam_g4),
             "lam_g5": float(self.lam_g5),
+            "lam_g6": float(self.lam_g6),
+            "lam_g7": float(self.lam_g7),
         }
 
         return self.get_state_norm(), step_reward, done, info

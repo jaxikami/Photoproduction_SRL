@@ -16,6 +16,30 @@ from envs.kinetics import integrate_rk4
 DEFAULT_INTENT = (-0.4329, -10.0, -10.0, -10.0)
 DEFAULT_SQUASHED = (-0.407, -1.0, -1.0, -1.0)
 
+# Optional stress scenarios, off by default.  Each one is a failure mode the
+# APN projection cannot cover by construction, so a different safety layer
+# has to:
+#
+#   discharge    G6: an episode budget on the nitrate drained with the
+#                culture.  Cumulative over every batch, so no one-step
+#                projection can enforce it: the Lagrangian prices it.
+#   variability  Hidden batch-to-batch kinetics (growth rate, nitrate yield,
+#                synthesis rate), redrawn at every batch.  The observation
+#                shows the state, not the rates, and the APN predicts with
+#                the nominal ones: the GRU can infer them from the trajectory.
+#   actuators    The plant runs every actuator command in every stage, as a
+#                real one does; the stage locks are the controller's alone.
+#                A locked actuator driven anyway is a G7 interlock breach,
+#                which only the stage mask (L0) prevents.
+SCENARIOS = ("discharge", "variability", "actuators")
+
+# Actuators each stage drives (time multiplier, light, nitrate feed, outflow),
+# as get_action_mask() without the nitrate-supply lock.
+STAGE_ACTIVE = np.array([[True, True, True, False],     # Inoculation
+                         [True, True, True, False],     # Growth
+                         [False, False, False, True],   # Harvesting
+                         [False, False, False, False]])  # Idle
+
 
 # =============================================================================
 # REINFORCEMENT LEARNING ENVIRONMENT
@@ -68,10 +92,30 @@ class PhycocyaninEnvCore:
         nitrate_supply (float): Remaining global nitrate supply.
         prev_action (np.ndarray): The action executed in the previous step.
         violation_count (int): Total number of safety violations in the episode.
+        scenarios (frozenset): Active SCENARIOS.
+        NITRATE_DISCHARGE_BUDGET (float): g6: nitrate drained per episode (mg), 'discharge'.
+        KINETIC_SPREAD (float): Relative half-width of the hidden kinetics, 'variability'.
+        INTERLOCK_TOL (float): Command on a locked actuator, in [0, 1] actuator
+            units, above which it is a g7 breach ('actuators').
+        kin_scale (tuple): The batch's multipliers on um, YNX and km (1.0 nominal).
+        nitrate_discharged (float): Nitrate drained with the culture this episode (mg).
+        interlock_breach (bool): The last step drove a stage-locked actuator ('actuators').
     """
 
-    def __init__(self):
-        """Initializes the environment settings, physical boundaries, and parameters."""
+    def __init__(self, scenarios=()):
+        """Initializes the environment settings, physical boundaries, and parameters.
+
+        Args:
+            scenarios (iterable of str, optional): SCENARIOS to switch on.
+
+        Raises:
+            ValueError: On an unknown scenario.
+        """
+        unknown = set(scenarios) - set(SCENARIOS)
+        if unknown:
+            raise ValueError(f"unknown scenarios {sorted(unknown)}; choose from {SCENARIOS}")
+        self.scenarios = frozenset(scenarios)
+
         # --- Simulation Config ---
         self.total_time = 1000.0
         self.control_freq = 10.0
@@ -105,6 +149,13 @@ class PhycocyaninEnvCore:
 
         # --- Buffer / Barrier Zone Config ---
         self.OVERFLOW_BUFFER_FRAC = 0.10   # g4 buffer activates at 90% V_MAX
+
+        # --- Scenario Config ---
+        # g6: mg drained per episode.  The nominal Safe RL policy drains
+        # ~9300, the Standard RL one ~6500: binding for both.
+        self.NITRATE_DISCHARGE_BUDGET = 5000.0
+        self.KINETIC_SPREAD = 0.20               # um, YNX, km each within ±20%
+        self.INTERLOCK_TOL  = 0.025              # ILLEGAL_CMD_TOL in [0, 1] units
 
         # --- Integration Config ---
         self.dt = 10.0 / 60.0   # 10 minutes (0.1667 h)
@@ -163,6 +214,12 @@ class PhycocyaninEnvCore:
         self.g4_violation_count = 0
         self.g5_violation_count = 0
         self.g6_violation_count = 0
+        self.g7_violation_count = 0
+
+        # Scenario state
+        self.nitrate_discharged = 0.0
+        self.interlock_breach = False
+        self._draw_batch_kinetics()
 
         # Metric tracking
         self.ep_total_reward = 0.0
@@ -285,7 +342,15 @@ class PhycocyaninEnvCore:
         """
         self.state = np.array([1.1, 150.0, 0.005, self.V_RESET], dtype=np.float64)
         self.prev_action = np.zeros(4)
+        self._draw_batch_kinetics()
 
+    def _draw_batch_kinetics(self):
+        """Draw the kinetics of a new batch: hidden under 'variability', else nominal."""
+        if "variability" in self.scenarios:
+            spread = self.KINETIC_SPREAD
+            self.kin_scale = tuple(float(s) for s in 1.0 + np.random.uniform(-spread, spread, 3))
+        else:
+            self.kin_scale = (1.0, 1.0, 1.0)
 
     def _physics_step(self, action):
         """Executes one control step of the physics simulation.
@@ -334,6 +399,18 @@ class PhycocyaninEnvCore:
             Fn_phys = 0.0
             F_out   = 0.0
 
+        # ── Scenario 'actuators': no plant-side interlock ─────────────
+        # Every actuator runs as commanded whatever the stage; a locked
+        # physical actuator (light, feed, outflow) driven is a g7 breach.
+        self.interlock_breach = False
+        if "actuators" in self.scenarios:
+            locked = ~STAGE_ACTIVE[self.current_stage]
+            self.interlock_breach = bool(np.any(locked[1:] & (a_scaled[1:] > self.INTERLOCK_TOL)))
+            I_phys = self.I_MIN + a_scaled[1] * (self.I_MAX - self.I_MIN)
+            fn_max = self.FN_MAX_GROWTH if self.current_stage == 0 else self.FN_MAX_PROD
+            Fn_phys = a_scaled[2] * fn_max
+            F_out = a_scaled[3] * self.FOUT_MAX
+
         # ── Mass Balance: Cap Fn by available supply ──────────────────
         if Fn_phys > 0 and self.nitrate_supply > 0:
             # Approximate demand over control period
@@ -367,11 +444,16 @@ class PhycocyaninEnvCore:
         # ── Bioreactor Integration ─────────────────────────────────────────
         self.state = integrate_rk4(
             self.state, I_phys, Fn_phys, F_out,
-            self.dt, self.n_inner_steps)
+            self.dt, self.n_inner_steps, *self.kin_scale)
 
-        # Track harvested phycocyanin mass during cleanup outflow
+        # Track harvested phycocyanin mass during cleanup outflow; outflow in
+        # any other stage ('actuators') drains the culture to waste.  Either
+        # way the nitrate in it is discharged (g6).
         if F_out > 0:
-            self.total_cq_harvested += self.state[2] * F_out * self.control_freq
+            drained = F_out * self.control_freq
+            if self.current_stage == 2:
+                self.total_cq_harvested += self.state[2] * drained
+            self.nitrate_discharged += self.state[1] * drained
 
         # ── Stage Transition Logic ────────────────────────────────────
 

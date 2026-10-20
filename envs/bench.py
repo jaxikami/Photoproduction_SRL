@@ -48,10 +48,14 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         force_idle_signal (float): Penalty signal to force transition to idle.
     """
 
-    def __init__(self):
-        """Initializes the benchmark environment and stationary penalty parameters."""
+    def __init__(self, scenarios=()):
+        """Initializes the benchmark environment and stationary penalty parameters.
+
+        Args:
+            scenarios (iterable of str, optional): envs/plant.SCENARIOS to switch on.
+        """
         self.episode_count = 0
-        super().__init__()
+        super().__init__(scenarios)
 
         # Disable inherited Lagrangian updates
         self.lagrange_updates_enabled = False
@@ -69,6 +73,8 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         self.W_g3_SPIKE  = 2400.0  # G3: terminal, so higher
         self.W_g4_SPIKE  = 150.0   # G4: volume overflow
         self.W_IDLE_HARD = 5000.0  # G5: ~40× one harvest step — hard terminal
+        self.W_g6_SPIKE  = 2400.0  # G6: terminal, per unit of budget overrun (as G3)
+        self.W_g7_SPIKE  = 150.0   # G7: per interlock breach step
 
         # ── Reward shaping coefficients ────────────────────────────
         self.prod_coef    = 0.4    # Gentle stockpile nudge
@@ -264,6 +270,20 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
             else:
                 step_reward += 50.0  # Idle completion bonus
 
+        # ── Scenario constraints (fixed weights) ───────────────────
+        p_g6 = 0.0
+        if "discharge" in self.scenarios and done:
+            over = self.nitrate_discharged / self.NITRATE_DISCHARGE_BUDGET - 1.0
+            if over > 0:
+                p_g6 = self.W_g6_SPIKE * over
+                step_reward -= p_g6
+                self.violation_count    += 1
+                self.g6_violation_count += 1
+        if "actuators" in self.scenarios and self.interlock_breach:
+            step_reward -= self.W_g7_SPIKE
+            self.violation_count    += 1
+            self.g7_violation_count += 1
+
         # ── Metrics bookkeeping ────────────────────────────────────
         self.ep_total_reward += step_reward
         self.ep_rewards.append(step_reward)
@@ -277,7 +297,7 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
         self.ep_g3_penalties.append(p_g3)
         self.ep_g4_penalties.append(p_g4)
         self.ep_g5_penalties.append(p_g5)
-        self.ep_g6_penalties.append(0.0)
+        self.ep_g6_penalties.append(p_g6)
 
         info = {
             "avg_reward":             float(np.mean(self.ep_rewards)),
@@ -298,10 +318,13 @@ class PhycocyaninEnvBench(PhycocyaninEnvCore):
             "g3_violation_count":     self.g3_violation_count,
             "g4_violation_count":     self.g4_violation_count,
             "g5_violation_count":     self.g5_violation_count,
+            "g6_violation_count":     self.g6_violation_count,
+            "g7_violation_count":     self.g7_violation_count,
             "current_stage":          self.current_stage,
             "volume":                 float(self.state[3]),
             "nitrate_supply":         float(self.nitrate_supply),
             "total_cq_harvested":     float(self.total_cq_harvested),
+            "nitrate_discharged":     float(self.nitrate_discharged),
         }
 
         return self.get_state_norm(), step_reward, done, info

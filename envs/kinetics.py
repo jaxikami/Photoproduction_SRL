@@ -11,7 +11,7 @@ from numba import njit
 C_N_STOCK = 3000.0
 
 @njit
-def calculate_rates_numba(state, I, Fn, F_out):
+def calculate_rates_numba(state, I, Fn, F_out, um_scale=1.0, ynx_scale=1.0, km_scale=1.0):
     """Computes instantaneous kinetic rates for the bioreactor state.
 
     The formulation accounts for dilution effects from feed inflow
@@ -19,11 +19,14 @@ def calculate_rates_numba(state, I, Fn, F_out):
     for fast execution during simulation.
 
     Args:
-        state (np.ndarray): Current physical state [Biomass Cx (g/L), 
+        state (np.ndarray): Current physical state [Biomass Cx (g/L),
             Nitrate CN (mg/L), Phycocyanin Cq (mg/L), Volume V (L)].
         I (float): Light intensity (umol/m^2/s).
         Fn (float): Nitrate feed concentration rate (mg/L/h).
         F_out (float): Outstream volumetric flow (L/h).
+        um_scale (float, optional): Multiplier on the maximum growth rate um.
+        ynx_scale (float, optional): Multiplier on the nitrate yield YNX.
+        km_scale (float, optional): Multiplier on the product synthesis rate km.
 
     Returns:
         np.ndarray: Array of instantaneous rates of change 
@@ -35,11 +38,11 @@ def calculate_rates_numba(state, I, Fn, F_out):
     V  = max(state[3], 0.1)
 
     # Static Kinetic Parameters
-    um  = 0.0572     # h^-1
+    um  = 0.0572 * um_scale     # h^-1
     ud  = 0.0        # h^-1 (Death rate)
     KN  = 393.1      # mg/L
-    YNX = 504.5      # mg/g
-    km  = 0.00016    # mg/g/h
+    YNX = 504.5 * ynx_scale     # mg/g
+    km  = 0.00016 * km_scale    # mg/g/h
     kd  = 0.281      # h^-1
     ks  = 178.9      # umol/m^2/s
     ki  = 447.1      # umol/m^2/s
@@ -73,7 +76,8 @@ def calculate_rates_numba(state, I, Fn, F_out):
 
 
 @njit
-def integrate_rk4(state_init, I, Fn, F_out, dt, n_steps):
+def integrate_rk4(state_init, I, Fn, F_out, dt, n_steps,
+                  um_scale=1.0, ynx_scale=1.0, km_scale=1.0):
     """Executes a 4th-order Runge-Kutta integration step for the bioreactor system.
 
     Advances the physical state of the bioreactor [Cx, CN, Cq, V] over a given
@@ -86,16 +90,21 @@ def integrate_rk4(state_init, I, Fn, F_out, dt, n_steps):
         F_out (float): Outstream flow rate during the step.
         dt (float): Inner integration time step duration (hours).
         n_steps (int): Number of integration steps to execute.
+        um_scale, ynx_scale, km_scale (float, optional): Kinetic multipliers
+            (calculate_rates_numba); 1.0 is the nominal plant.
 
     Returns:
         np.ndarray: The updated physical state after integration.
     """
     state = state_init.copy()
     for _ in range(n_steps):
-        k1 = calculate_rates_numba(state, I, Fn, F_out)
-        k2 = calculate_rates_numba(state + 0.5 * dt * k1, I, Fn, F_out)
-        k3 = calculate_rates_numba(state + 0.5 * dt * k2, I, Fn, F_out)
-        k4 = calculate_rates_numba(state + dt * k3, I, Fn, F_out)
+        k1 = calculate_rates_numba(state, I, Fn, F_out, um_scale, ynx_scale, km_scale)
+        k2 = calculate_rates_numba(state + 0.5 * dt * k1, I, Fn, F_out,
+                                   um_scale, ynx_scale, km_scale)
+        k3 = calculate_rates_numba(state + 0.5 * dt * k2, I, Fn, F_out,
+                                   um_scale, ynx_scale, km_scale)
+        k4 = calculate_rates_numba(state + dt * k3, I, Fn, F_out,
+                                   um_scale, ynx_scale, km_scale)
         state += (dt / 6.0) * (k1 + 2.0*k2 + 2.0*k3 + k4)
         # Clamp non-physical values
         state[0] = max(state[0], 0.0)
