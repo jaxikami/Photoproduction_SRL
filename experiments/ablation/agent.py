@@ -77,7 +77,7 @@ class AblationAgent(SafePPO_Agent):
             raise FileNotFoundError(f"{APN_PATH} not found; run python -m safety.train first.")
         super().__init__(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP,
                          INITIAL_ENTROPY, use_safeguard=True, use_projection=cfg.proj,
-                         use_safety_grad=cfg.grad)
+                         use_safety_grad=cfg.grad, use_g3=cfg.g3)
         if not cfg.gru:
             self.policy.gru = MemorylessGRU(self.policy.gru)
             self.policy_old.gru = MemorylessGRU(self.policy_old.gru)

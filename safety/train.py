@@ -142,7 +142,7 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=1000000,
     latest_pass_rates = None
 
     # Initial explicit dataset spawn
-    b_s_raw, b_a_raw, b_labels, b_margins, b_mg1, b_mg2, b_mg4 = \
+    b_s_raw, b_a_raw, b_labels, b_margins, b_mg1, b_mg2, b_mg4, b_mg3 = \
         get_fresh_batch_dataset(buffer_size, bias=0.7, pass_rates=latest_pass_rates)
     b_s_raw     = _to_device(b_s_raw, device)
     b_a_raw     = _to_device(b_a_raw, device)
@@ -151,6 +151,7 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=1000000,
     b_mg1       = _to_device(b_mg1, device)
     b_mg2       = _to_device(b_mg2, device)
     b_mg4       = _to_device(b_mg4, device)
+    b_mg3       = _to_device(b_mg3, device)
 
     # Print class balance diagnostics for the initial dataset
     safe_ratio = b_labels.mean().item()
@@ -165,7 +166,7 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=1000000,
             # accuracy continuously across completely distinct batches of randomized sample points.
 
             if epoch > 0 and future_dataset is not None:
-                b_s_raw, b_a_raw, b_labels, b_margins, b_mg1, b_mg2, b_mg4 = \
+                b_s_raw, b_a_raw, b_labels, b_margins, b_mg1, b_mg2, b_mg4, b_mg3 = \
                     future_dataset.result()
                 b_s_raw     = _to_device(b_s_raw, device)
                 b_a_raw     = _to_device(b_a_raw, device)
@@ -174,6 +175,7 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=1000000,
                 b_mg1       = _to_device(b_mg1, device)
                 b_mg2       = _to_device(b_mg2, device)
                 b_mg4       = _to_device(b_mg4, device)
+                b_mg3       = _to_device(b_mg3, device)
                 safe_ratio = b_labels.mean().item()
                 print(
                     f"\n[Data] Refreshed class balance at epoch {epoch}: {safe_ratio:.2%} safe, {1-safe_ratio:.2%} unsafe")
@@ -199,6 +201,7 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=1000000,
             b_m_g1 = b_mg1[batch_idx]
             b_m_g2 = b_mg2[batch_idx]
             b_m_g4 = b_mg4[batch_idx]
+            b_m_g3 = b_mg3[batch_idx]
 
             optimizer.zero_grad()
 
@@ -214,7 +217,7 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=1000000,
                         - correct (int): Number of correct safety classifications.
                         - total (int): Total number of samples evaluated in the batch.
                 """
-                margin_pred, aux_g1, aux_g2, aux_g4 = _fwd_aux(b_s, b_a)
+                margin_pred, aux_g1, aux_g2, aux_g3, aux_g4 = _fwd_aux(b_s, b_a)
 
                 # Hard class target from physical margin sign
                 sign_target = (b_m >= 0.0).float()
@@ -240,41 +243,26 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=1000000,
                 # 2. Scaled regression
                 l_reg = F.smooth_l1_loss(margin_pred, b_m * MARGIN_SCALE)
 
-                # 3. Per-constraint auxiliary losses (BCE + scaled regression)
-                target_g1 = (b_m_g1 >= 0.0).float()
-                target_g2 = (b_m_g2 >= 0.0).float()
-                target_g4 = (b_m_g4 >= 0.0).float()
+                # 3. Per-constraint losses (BCE + scaled regression), one per head
+                targets = {"G1": (aux_g1, b_m_g1), "G2": (aux_g2, b_m_g2),
+                           "G3": (aux_g3, b_m_g3), "G4": (aux_g4, b_m_g4)}
+                head_losses = {
+                    k: (0.5 * F.binary_cross_entropy_with_logits(pred, (m >= 0.0).float())
+                        + 0.5 * F.smooth_l1_loss(pred, m * MARGIN_SCALE))
+                    for k, (pred, m) in targets.items()}
 
-                l_aux_g1 = (
-                    0.5 * F.binary_cross_entropy_with_logits(aux_g1, target_g1) +
-                    0.5 * F.smooth_l1_loss(aux_g1, b_m_g1 * MARGIN_SCALE)
-                )
-                l_aux_g2 = (
-                    0.5 * F.binary_cross_entropy_with_logits(aux_g2, target_g2) +
-                    0.5 * F.smooth_l1_loss(aux_g2, b_m_g2 * MARGIN_SCALE)
-                )
-                l_aux_g4 = (
-                    0.5 * F.binary_cross_entropy_with_logits(aux_g4, target_g4) +
-                    0.5 * F.smooth_l1_loss(aux_g4, b_m_g4 * MARGIN_SCALE)
-                )
-
-                # Dynamically weight auxiliary losses based on latest validation pass rates
+                # Dynamically weight the heads by their latest validation failure rates
+                n_heads = len(head_losses)
+                coef = dict.fromkeys(head_losses, 2.0)
                 if latest_pass_rates is not None:
-                    err_g1 = max(0.0, 1.0 - latest_pass_rates.get("G1", 1.0))
-                    err_g2 = max(0.0, 1.0 - latest_pass_rates.get("G2", 1.0))
-                    err_g4 = max(0.0, 1.0 - latest_pass_rates.get("G4", 1.0))
-                    total_err = err_g1 + err_g2 + err_g4
+                    errs = {k: max(0.0, 1.0 - latest_pass_rates.get(k, 1.0)) for k in head_losses}
+                    total_err = sum(errs.values())
                     if total_err > 1e-8:
-                        # Sum of default coefficients is 6.0 (2.0 + 2.0 + 2.0)
-                        c_g1 = 6.0 * (0.2 * (2.0/6.0) + 0.8 * (err_g1 / total_err))
-                        c_g2 = 6.0 * (0.2 * (2.0/6.0) + 0.8 * (err_g2 / total_err))
-                        c_g4 = 6.0 * (0.2 * (2.0/6.0) + 0.8 * (err_g4 / total_err))
-                    else:
-                        c_g1, c_g2, c_g4 = 2.0, 2.0, 2.0
-                else:
-                    c_g1, c_g2, c_g4 = 2.0, 2.0, 2.0
+                        # Default coefficients sum to 2.0 * n_heads
+                        coef = {k: 2.0 * n_heads * (0.2 / n_heads + 0.8 * errs[k] / total_err)
+                                for k in head_losses}
 
-                l_aux = (c_g1 * l_aux_g1 + c_g2 * l_aux_g2 + c_g4 * l_aux_g4) / 6.0
+                l_aux = sum(coef[k] * head_losses[k] for k in head_losses) / (2.0 * n_heads)
 
                 loss = 0.4 * l_bce + 0.25 * l_reg + 0.35 * l_aux
 

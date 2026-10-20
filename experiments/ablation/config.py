@@ -24,7 +24,8 @@ EVAL_SEED_OFFSET = 10_000
 
 # Bumped whenever a change invalidates trained runs (plant, constraints or
 # agent); a run trained under another version is retrained, not re-evaluated.
-STUDY_VERSION = 1
+# 2: the APN's G3 head and the g3 component.
+STUDY_VERSION = 2
 
 # A raw command on a stage-locked dimension counts as illegal when it differs
 # from the interlock default by more than this, in [-1, 1] action units.
@@ -58,9 +59,9 @@ STATE_NOISE_DIMS = [0, 1, 2, 3, 10]
 
 # ─── Ablation Configurations ──────────────────────────────────────────────────
 
-COMPONENTS = ("gru", "lagrangian", "mask", "proj", "grad")
+COMPONENTS = ("gru", "lagrangian", "mask", "proj", "grad", "g3")
 COMPONENT_LABELS = {"gru": "GRU", "lagrangian": "Lagrangian", "mask": "mask",
-                    "proj": "projection", "grad": "safety gradient"}
+                    "proj": "projection", "grad": "safety gradient", "g3": "G3 head"}
 
 
 @dataclass(frozen=True)
@@ -73,12 +74,14 @@ class AblationConfig:
         mask: L0, SERL stage mask applied to the policy distribution.
         proj: L2, APN projection of every action.
         grad: The APN's safety gradient in the PPO update.
+        g3: The APN's G3 head (harvest-start nitrate) in projection and gradient.
     """
     gru: bool = True
     lagrangian: bool = True
     mask: bool = True
     proj: bool = True
     grad: bool = True
+    g3: bool = True
 
     @property
     def removed(self):

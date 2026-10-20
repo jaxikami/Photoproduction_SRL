@@ -1,23 +1,27 @@
 """Action Projection Network (APN): the safe agent's L1 safety model and L2 projection.
 
 Given a (state, action) pair the APN predicts one signed margin logit per
-instantaneous constraint (positive = safe):
+constraint (positive = safe):
 
   G1 — Nitrate path constraint  (cN + Fn*10h ≤ 800 mg/L)
   G2 — Product/biomass ratio    (cq/cx ≤ 0.011)
+  G3 — Harvest-start nitrate    (cN ≤ 150 mg/L when Growth ends, still reachable
+                                 after this action; learned from offline
+                                 rollouts, safety/data.g3_margin())
   G4 — Reactor overflow         (V ≤ V_MAX)
 
-G3 (terminal nitrate) and G5 (end in Idle) are temporal and left to the GRU
-policy and the Lagrangian multipliers.  The APN covers the stages in which the
-agent drives the culture (Inoculation, Growth); in Harvesting and Idle it is
-bypassed.
+G3 is a constraint at the end of a stage, but its head is one forward pass like
+the others: the forecasting happened when the dataset was built.  G5 (end in
+Idle) is left to the policy and the Lagrangian multipliers.  The APN covers
+the stages in which the agent drives the culture (Inoculation, Growth); in
+Harvesting and Idle it is bypassed.
 
 Architecture (FiLM-conditioned, spectral-normalized):
   State encoder: Linear(12→256) → LN → Mish → Linear(256→256) → LN → Mish
   FiLM generators: 3× Linear(256→512) producing (γ,β) pairs
   Action trunk: Linear(4→256) → 3× [FC → LN → FiLM → Mish] (spectral-normed)
   → Linear(256→1) [raw margin]
-  + 3× per-constraint heads (g1, g2, g4)
+  + 4× per-constraint heads (g1, g2, g3, g4)
 """
 
 # ─── Third-Party ──────────────────────────────────────────────────────────────
@@ -27,7 +31,8 @@ import torch.nn.functional as F
 
 # ─── Local ────────────────────────────────────────────────────────────────────
 from envs.plant import PhycocyaninEnvCore
-from safety.constants import APN_PATH, LR_PROJ, MAX_PROJ_STEPS, SAFE_LOGIT, THRESHOLD
+from safety.constants import (APN_PATH, G3_FALLBACK, LR_PROJ, MAX_PROJ_STEPS, SAFE_LOGIT,
+                              THRESHOLD)
 
 # Temperature of the smooth minimum over the heads that the projection ascends.
 SMOOTH_TAU = 0.25
@@ -51,8 +56,13 @@ class ActionProjectionNetwork(nn.Module):
         State → FiLM params: 3× (γ, β) pairs for action trunk modulation
         Action trunk: Linear(4→256) → [FiLM block]×3 → Linear(256→1)
         Spectral norm on action-path layers for Lipschitz-bounded ∂margin/∂action.
-        Also includes 3 per-constraint heads (g1, g2, g4), which the
+        Also includes 4 per-constraint heads (g1, g2, g3, g4), which the
         projection and the safety gradient use.
+
+    Attributes:
+        use_g3: Include the G3 head in margins() (ablation switch).
+        has_g3: The G3 head is trained (False for a checkpoint saved before it
+            existed, whose g3_head would be random; margins() then leaves it out).
     """
 
     def __init__(self, state_dim: int = 12, action_dim: int = 4, latent_dim: int = 256):
@@ -112,7 +122,11 @@ class ActionProjectionNetwork(nn.Module):
         # Per-constraint heads (direct gradient signal per constraint)
         self.g1_head = nn.Linear(latent_dim, 1)
         self.g2_head = nn.Linear(latent_dim, 1)
+        self.g3_head = nn.Linear(latent_dim, 1)
         self.g4_head = nn.Linear(latent_dim, 1)
+
+        self.use_g3 = True
+        self.has_g3 = True
 
     def _encode_state(self, state_norm):
         """Encodes the state into FiLM conditioning parameter tensors.
@@ -200,15 +214,16 @@ class ActionProjectionNetwork(nn.Module):
             action_norm (torch.Tensor): Action vector.
 
         Returns:
-            tuple: (margin, g1_margin, g2_margin, g4_margin)
+            tuple: (margin, g1_margin, g2_margin, g3_margin, g4_margin)
         """
         _, film1, film2, film3 = self._encode_state(state_norm)
         h = self._action_trunk(action_norm, film1, film2, film3)
         margin = self.margin_head(h).squeeze(-1)
         g1 = self.g1_head(h).squeeze(-1)
         g2 = self.g2_head(h).squeeze(-1)
+        g3 = self.g3_head(h).squeeze(-1)
         g4 = self.g4_head(h).squeeze(-1)
-        return margin, g1, g2, g4
+        return margin, g1, g2, g3, g4
 
     def classify(self, state_norm, action_norm):
         """Returns the probability that the state-action pair is safe (margin > 0).
@@ -245,16 +260,23 @@ class ActionProjectionNetwork(nn.Module):
                       if k in current and current[k].shape == v.shape}
         skipped = len(ckpt) - len(compatible)
         model.load_state_dict(compatible, strict=False)
+        model.has_g3 = "g3_head.weight" in compatible
         print(f"[APN] Loaded '{path}' — {len(compatible)} tensors restored, "
-              f"{skipped} skipped (shape mismatch / new layers).")
+              f"{skipped} skipped (shape mismatch / new layers)."
+              + ("" if model.has_g3 else " No trained G3 head: G3 is not covered "
+                 "(retrain with python -m safety.train)."))
         return model
 
     # ── L1: Per-constraint margins ────────────────────────────────────────────
 
     def margins(self, state_norm, action_norm):
-        """Per-constraint margin logits [..., 3] in (g1, g2, g4) order."""
-        _, g1, g2, g4 = self.forward_aux(state_norm, action_norm)
-        return torch.stack([g1, g2, g4], dim=-1)
+        """Per-constraint margin logits [..., H] in (g1, g2, g3, g4) order.
+
+        G3 is left out (H = 3) when it is switched off or untrained.
+        """
+        _, g1, g2, g3, g4 = self.forward_aux(state_norm, action_norm)
+        heads = [g1, g2, g3, g4] if (self.use_g3 and self.has_g3) else [g1, g2, g4]
+        return torch.stack(heads, dim=-1)
 
     def _smooth_min(self, state_norm, action_norm):
         """Smooth minimum of the per-constraint margins (the projection objective)."""
@@ -336,7 +358,37 @@ class ActionProjectionNetwork(nn.Module):
 
                     a = (a + step_size * grad.sign() * lr_mult).clamp(-1.0, 1.0)
 
+        if self.use_g3 and self.has_g3:
+            best_a = self._toward_fallback(state_fixed, best_a, stage_mask, threshold)
+            stats["iters"] += 1
         return best_a, stats
+
+    def _toward_fallback(self, state_norm, action, stage_mask, threshold, n=4):
+        """Line search from an action toward the G3 fallback, in one batched forward pass.
+
+        The fallback (no feed, slowest clock, growth-optimal light) is the most
+        G3-safe action there is, so when sign steps run out on the way there
+        the closest of n evenly spaced points on the segment that every head
+        accepts is taken (the fallback itself, the safest, if none is).
+
+        Args:
+            state_norm: Observation tensor [1, state_dim].
+            action: Action [1, action_dim] the sign steps ended at.
+            stage_mask: Stage action mask [1, action_dim]; locked dims stay put.
+            threshold: Safety probability at which an action is accepted.
+
+        Returns:
+            The chosen action [1, action_dim].
+        """
+        fallback = torch.tensor(G3_FALLBACK, device=action.device, dtype=action.dtype)
+        target = fallback * stage_mask + action * (1 - stage_mask)
+        lam = torch.linspace(1.0 / n, 1.0, n, device=action.device, dtype=action.dtype).unsqueeze(1)
+        cand = action + lam * (target - action)                                # [n, action_dim]
+        with torch.no_grad():
+            p = torch.sigmoid(self.margins(state_norm.expand(n, -1), cand)).min(dim=-1).values
+        ok = (p >= threshold).nonzero(as_tuple=True)[0]
+        k = int(ok[0]) if ok.numel() else n - 1
+        return cand[k:k + 1]
 
     # ── Safety Gradient ───────────────────────────────────────────────────────
 
@@ -359,7 +411,7 @@ class ActionProjectionNetwork(nn.Module):
             Scalar loss (mean over the active rows' heads).
         """
         m = self.margins(state_norm, action)
-        hinge = F.softplus(sharpness * (eps - m)) / sharpness          # [..., 3]
+        hinge = F.softplus(sharpness * (eps - m)) / sharpness          # [..., H]
         active = projection_active(state_norm).to(hinge.dtype).unsqueeze(-1)
         return (hinge * active).sum() / (active.sum() * m.shape[-1]).clamp(min=1.0)
 

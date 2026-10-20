@@ -1,28 +1,130 @@
 """
 Dataset generation for the Safety Boundary Classifier (Photoproduction).
 
-Generates (state, action, margin) tuples covering 4 instantaneous constraints:
+Generates (state, action, margin) tuples covering 4 constraints:
   G1 — Nitrate path:       cN + Fn*10h  ≤  N_LIMIT_PATH * SAFE_BUFFER
   G2 — Product ratio:      cq / cx       ≤  RATIO_LIMIT * SAFE_BUFFER
+  G3 — Harvest-start nitrate: cN at the Growth -> Harvesting transition
+                           ≤  N_LIMIT_TERM * SAFE_BUFFER, still reachable
+                           after this action (g3_margin(): offline rollout
+                           under the fastest nitrate draw-down)
   G4 — Reactor overflow:   V + dV*10h    ≤  V_MAX * SAFE_BUFFER
 
-Note: G3 (terminal nitrate, cN_final ≤ 150 mg/L) is a temporal constraint
-handled by the GRU's temporal context and the Lagrangian multiplier, not
-by the single-step APN safety filter.
+G3 is forecast here, once, when the dataset is built; the APN learns it as one
+more head, so the safety filter covers it without any rollout at run time.
+G5 (end in Idle) stays with the policy and the Lagrangian multiplier.
 """
 
 import torch
 
-from safety.constants import (C_N_STOCK, CONTROL_INTERVAL, FN_MAX_GROWTH, FN_MAX_PROD,
-                              FOUT_MAX, I_MAX, I_MIN, N_LIMIT_PATH, RATIO_LIMIT,
-                              SAFE_BUFFER, V_MAX, V_MIN, V_RESET)
+from safety.constants import (BASE_CREDITS, C_N_STOCK, CONTROL_INTERVAL, FN_MAX_GROWTH,
+                              FN_MAX_PROD, FOUT_MAX, G3_BUFFER, G3_DT, I_MAX, I_MIN, I_OPT,
+                              INITIAL_NITRATE_SUPPLY, MULT_MIN, MULT_RANGE, N_LIMIT_PATH,
+                              N_LIMIT_TERM, RATIO_LIMIT, SAFE_BUFFER, TOTAL_TIME, V_MAX, V_MIN,
+                              V_RESET)
+
+# Kinetic parameters of envs/kinetics.py used by the G3 label (no death, ud = 0).
+_UM, _KN, _YNX, _KS, _KI = 0.0572, 393.1, 504.5, 178.9, 447.1
+
+
+def _g3_rates(cx, cN, V, I, Fn):
+    """dCx/dt, dCN/dt and dV/dt of envs/kinetics.py (Cq does not affect them)."""
+    V = V.clamp(min=0.1)
+    f_in = (Fn * V / C_N_STOCK).clamp(min=0.0)
+    growth = _UM * (I / (I + _KS + I ** 2 / _KI)) * cx * (cN / (cN + _KN))
+    return (growth - f_in * cx / V,
+            -_YNX * growth + f_in * (C_N_STOCK - cN) / V,
+            f_in)
+
+
+def g3_margin(cx, cN, V, stage_idx, credit_norm, t_norm, supply_norm, actions, dt=G3_DT):
+    """G3 margin of each (state, action): can nitrate still end Growth at or below 150 mg/L?
+
+    Applies the action for one control step, then continues with the G3
+    fallback (no feed, slowest clock, growth-optimal light; the fastest
+    possible nitrate draw-down) until the Growth -> Harvesting transition, and
+    measures nitrate there.  Credit, supply and time bookkeeping mirror
+    envs/plant.py: a force-idle on nitrate exhaustion or the episode ending
+    first means G3 is never checked.  Because the fallback is the best any
+    continuation can do for G3, the margin is negative exactly when this
+    action makes G3 unrecoverable.
+
+    Args:
+        cx, cN, V: Physical state tensors [N] (g/L, mg/L, L).
+        stage_idx: Stage index tensor [N]; G3 applies in stages 0 and 1.
+        credit_norm, t_norm, supply_norm: Normalized observation entries [N].
+        actions: Stage-masked actions [N, 4] in [-1, 1].
+        dt: RK4 step (h) of the simulation.
+
+    Returns:
+        Margin (N_LIMIT_TERM * G3_BUFFER - CN at transition) / N_LIMIT_TERM,
+        clipped to [-1, 1]; +1 where G3 does not apply.
+    """
+    margin = torch.ones(cx.shape[0], device=cx.device, dtype=cx.dtype)
+    idx = (stage_idx <= 1).nonzero(as_tuple=True)[0]
+    if idx.numel() == 0:
+        return margin
+
+    cx, cN, V = cx[idx].clone(), cN[idx].clone(), V[idx].clone()
+    stage = stage_idx[idx].clone()
+    base = torch.tensor(BASE_CREDITS, device=cx.device)
+    credits = credit_norm[idx] * base[stage]
+    t = t_norm[idx] * TOTAL_TIME
+    supply = supply_norm[idx] * INITIAL_NITRATE_SUPPLY
+    a = (actions[idx].clamp(-1.0, 1.0) + 1.0) / 2.0
+    mult = MULT_MIN + a[:, 0] * MULT_RANGE
+    I = I_MIN + a[:, 1] * (I_MAX - I_MIN)
+    Fn = a[:, 2] * torch.where(stage == 0, FN_MAX_GROWTH, FN_MAX_PROD)
+    Fn = torch.where(supply > 0, Fn, torch.zeros_like(Fn))
+
+    result = torch.ones_like(cx)
+    pending = torch.ones_like(cx, dtype=torch.bool)
+    n_sub = max(1, round(CONTROL_INTERVAL / dt))
+    h = CONTROL_INTERVAL / n_sub
+    for _ in range(int(TOTAL_TIME / CONTROL_INTERVAL)):
+        # Supply caps the feed and is drawn down before integration.
+        demand = Fn * V * CONTROL_INTERVAL
+        consumed = torch.minimum(demand, supply)
+        Fn = torch.where(demand > 0, Fn * consumed / demand.clamp(min=1e-12), Fn)
+        supply = supply - consumed
+        credits = credits - mult * CONTROL_INTERVAL
+
+        for _ in range(n_sub):
+            k1 = _g3_rates(cx, cN, V, I, Fn)
+            k2 = _g3_rates(cx + 0.5 * h * k1[0], cN + 0.5 * h * k1[1], V + 0.5 * h * k1[2], I, Fn)
+            k3 = _g3_rates(cx + 0.5 * h * k2[0], cN + 0.5 * h * k2[1], V + 0.5 * h * k2[2], I, Fn)
+            k4 = _g3_rates(cx + h * k3[0], cN + h * k3[1], V + h * k3[2], I, Fn)
+            cx = (cx + h / 6.0 * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0])).clamp(min=0.0)
+            cN = (cN + h / 6.0 * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1])).clamp(min=0.0)
+            V = (V + h / 6.0 * (k1[2] + 2 * k2[2] + 2 * k3[2] + k4[2])).clamp(min=0.1)
+        t = t + CONTROL_INTERVAL
+
+        # Stage logic of envs/plant.py: force idle first, then credit expiry.
+        idle = pending & (supply <= 0)
+        ends_growth = pending & ~idle & (stage == 1) & (credits <= 0)
+        to_growth = pending & ~idle & (stage == 0) & (credits <= 0)
+        result = torch.where(ends_growth, (N_LIMIT_TERM * G3_BUFFER - cN) / N_LIMIT_TERM, result)
+        stage = torch.where(to_growth, torch.ones_like(stage), stage)
+        credits = torch.where(to_growth, torch.full_like(credits, BASE_CREDITS[1]), credits)
+        pending = pending & ~idle & ~ends_growth & (t < TOTAL_TIME)
+        if not bool(pending.any()):
+            break
+
+        # The fallback from the second step on.
+        mult = torch.full_like(mult, MULT_MIN)
+        I = torch.full_like(I, I_OPT)
+        Fn = torch.zeros_like(Fn)
+
+    margin[idx] = result.clamp(-1.0, 1.0)
+    return margin
 
 
 def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = None):
     """Generates a raw batch of state-action tuples and physical margins.
 
     Simulates the system dynamics forward by one step to compute instantaneous
-    margins for the G1, G2, and G4 constraints. The dataset is biased toward
+    margins for the G1, G2, and G4 constraints, and to the Growth -> Harvesting
+    transition under the G3 fallback for G3 (g3_margin()). The dataset is biased toward
     generating states near the constraint boundaries to train the APN effectively.
 
     State layout (12D, normalized):
@@ -46,6 +148,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
             - margin_g1 (torch.Tensor): Margin for G1 constraint.
             - margin_g2 (torch.Tensor): Margin for G2 constraint.
             - margin_g4 (torch.Tensor): Margin for G4 constraint.
+            - margin_g3 (torch.Tensor): Margin for G3 constraint.
             - near_boundary (torch.Tensor): Boolean mask indicating boundary proximity.
     """
     device = torch.device("cpu")   # always generate on CPU; training loop does the H2D move
@@ -54,23 +157,18 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     n_interior = int(num_samples * (1.0 - bias))
     n_boundary = num_samples - n_interior - n_postcycle
 
+    base_w = {"G1": 0.27, "G2": 0.23, "G3": 0.23, "G4": 0.27}
+    w = dict(base_w)
     if pass_rates is not None:
-        err_g1 = max(0.0, 1.0 - pass_rates.get("G1", 1.0))
-        err_g2 = max(0.0, 1.0 - pass_rates.get("G2", 1.0))
-        err_g4 = max(0.0, 1.0 - pass_rates.get("G4", 1.0))
-        total_err = err_g1 + err_g2 + err_g4
+        errs = {k: max(0.0, 1.0 - pass_rates.get(k, 1.0)) for k in base_w}
+        total_err = sum(errs.values())
         if total_err > 1e-8:
-            w_g1 = 0.2 * 0.35 + 0.8 * (err_g1 / total_err)
-            w_g2 = 0.2 * 0.30 + 0.8 * (err_g2 / total_err)
-            w_g4 = 0.2 * 0.35 + 0.8 * (err_g4 / total_err)
-        else:
-            w_g1, w_g2, w_g4 = 0.35, 0.30, 0.35
-    else:
-        w_g1, w_g2, w_g4 = 0.35, 0.30, 0.35
+            w = {k: 0.2 * base_w[k] + 0.8 * errs[k] / total_err for k in base_w}
 
-    n_g2 = int(n_boundary * w_g2)
-    n_g4 = int(n_boundary * w_g4)
-    n_g1 = n_boundary - n_g2 - n_g4
+    n_g2 = int(n_boundary * w["G2"])
+    n_g3 = int(n_boundary * w["G3"])
+    n_g4 = int(n_boundary * w["G4"])
+    n_g1 = n_boundary - n_g2 - n_g3 - n_g4
 
     # ══════════════════════════════════════════════════════════════════════════
     # INTERIOR samples — safely in the middle of operating space
@@ -224,14 +322,27 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     a_post  = torch.cat([a_pb, a_pi])
 
     # ══════════════════════════════════════════════════════════════════════════
+    # G3 boundary — nitrate vs. the uptake left before Growth ends
+    # ══════════════════════════════════════════════════════════════════════════
+    # Inoculation and Growth states with every amount of nitrate, biomass and
+    # remaining credit, so the transition nitrate spans both sides of the limit;
+    # full action sweep (time multiplier and feed set how much uptake is left).
+    cx_g3 = 0.3 + torch.rand(n_g3, device=device) * 4.7
+    cN_g3 = 30.0 + torch.rand(n_g3, device=device) * 670.0
+    cq_g3 = torch.rand(n_g3, device=device) * cx_g3 * RATIO_LIMIT * 0.6
+    V_g3  = V_MAX * (0.10 + torch.rand(n_g3, device=device) * 0.80)
+    t_g3  = torch.rand(n_g3, device=device) * 0.75
+    a_g3  = torch.rand(n_g3, 4, device=device) * 2.0 - 1.0
+
+    # ══════════════════════════════════════════════════════════════════════════
     # Concatenate all samples
     # ══════════════════════════════════════════════════════════════════════════
-    cx = torch.cat([cx_int, cx_g1, cx_g1e, cx_g2, cx_g4, cx_g4e, cx_post])
-    cN = torch.cat([cN_int, cN_g1, cN_g1e, cN_g2, cN_g4, cN_g4e, cN_post])
-    cq = torch.cat([cq_int, cq_g1, cq_g1e, cq_g2, cq_g4, cq_g4e, cq_post])
-    V  = torch.cat([V_int,  V_g1,  V_g1e,  V_g2,  V_g4,  V_g4e,  V_post]).clamp(V_MIN * 0.3, V_MAX * 1.3)
-    t_norm = torch.cat([t_int, t_g1, t_g1e, t_g2, t_g4, t_g4e, t_post])
-    actions = torch.cat([a_int, a_g1, a_g1e, a_g2, a_g4, a_g4e, a_post])
+    cx = torch.cat([cx_int, cx_g1, cx_g1e, cx_g2, cx_g4, cx_g4e, cx_post, cx_g3])
+    cN = torch.cat([cN_int, cN_g1, cN_g1e, cN_g2, cN_g4, cN_g4e, cN_post, cN_g3])
+    cq = torch.cat([cq_int, cq_g1, cq_g1e, cq_g2, cq_g4, cq_g4e, cq_post, cq_g3])
+    V  = torch.cat([V_int,  V_g1,  V_g1e,  V_g2,  V_g4,  V_g4e,  V_post,  V_g3]).clamp(V_MIN * 0.3, V_MAX * 1.3)
+    t_norm = torch.cat([t_int, t_g1, t_g1e, t_g2, t_g4, t_g4e, t_post, t_g3])
+    actions = torch.cat([a_int, a_g1, a_g1e, a_g2, a_g4, a_g4e, a_post, a_g3])
 
     num_samples = cx.shape[0]
 
@@ -258,6 +369,9 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # Cycle-initial samples: always Inoculation stage (just started / backtracked)
     post_start = n_interior + n_g1 + n_g1_extreme + n_g2 + n_g4 + n_g4_extreme
     stage_idx[post_start:post_start + n_postcycle] = 0
+    # G3 samples: Growth (where the transition is decided) or Inoculation
+    g3_start = post_start + n_postcycle
+    stage_idx[g3_start:] = (torch.rand(n_g3, device=device) < 0.7).long()
 
     stage_onehot = torch.zeros(num_samples, 4, device=device)
     stage_onehot.scatter_(1, stage_idx.unsqueeze(1), 1.0)
@@ -277,6 +391,11 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
         0.85 + torch.rand(n_pre_total, device=device) * 0.15)  # 0.85–1.0
     supply_norm[post_start + n_pre_total:post_start + n_postcycle] = (
         0.15 + torch.rand(n_postcycle - n_pre_total, device=device) * 0.55)  # 0.15–0.70
+    # G3 overrides: half of the samples late in their stage, where the
+    # transition is close and the boundary is sharpest
+    late = torch.rand(n_g3, device=device) < 0.5
+    credit_norm[g3_start:] = torch.where(late, torch.rand(n_g3, device=device) * 0.3,
+                                         credit_norm[g3_start:])
 
     # Target extreme overflow boundary with a continuous sweep [-1.0, 1.0]
     # analogous to Fermentation-PPO handling of the level constraint
@@ -368,10 +487,11 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     # G4: Reactor overflow
     margin_g4 = (V_MAX * SAFE_BUFFER - V_next) / V_MAX
 
-
+    # G3: harvest-start nitrate, still reachable after this action
+    margin_g3 = g3_margin(cx, cN, V, stage_idx, credit_norm, t_norm, supply_norm, actions)
 
     # ── Smooth-min across all constraints ─────────────────────────────────────
-    all_margins = torch.stack([margin_g1, margin_g2, margin_g4], dim=1)
+    all_margins = torch.stack([margin_g1, margin_g2, margin_g3, margin_g4], dim=1)
     smooth_tau  = 0.25
     min_margin  = -smooth_tau * torch.logsumexp(-all_margins / smooth_tau, dim=1)
 
@@ -379,7 +499,8 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     g1_vio = margin_g1 < 0.0
     g2_vio = margin_g2 < 0.0
     g4_vio = margin_g4 < 0.0
-    is_unsafe = g1_vio | g2_vio | g4_vio
+    g3_vio = margin_g3 < 0.0
+    is_unsafe = g1_vio | g2_vio | g3_vio | g4_vio
     is_safe   = (~is_unsafe).float()
 
     # Near-boundary detection
@@ -387,7 +508,8 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     ratio = cq / (cx + 1e-8)
     near_g2 = ratio > (RATIO_LIMIT * 0.65)
     near_g4 = (V / V_MAX) > 0.70
-    near_boundary = near_g1 | near_g2 | near_g4
+    near_g3 = margin_g3.abs() < 0.25
+    near_boundary = near_g1 | near_g2 | near_g3 | near_g4
 
     # ── Assemble normalised states (12D) ──────────────────────────────────────
     op_time_left = 1.0 - t_norm
@@ -404,7 +526,7 @@ def _generate_raw_batch(num_samples: int, bias: float = 0.7, pass_rates: dict = 
     ], dim=1)  # [N, 12]
 
     return (states.float(), actions.float(), is_safe,
-            min_margin.float(), margin_g1, margin_g2, margin_g4,
+            min_margin.float(), margin_g1, margin_g2, margin_g4, margin_g3,
             near_boundary)
 
 
@@ -429,14 +551,15 @@ def get_fresh_batch_dataset(num_samples: int = 500000, bias: float = 0.7, pass_r
             - margins_g1 (torch.Tensor): Margins for G1 constraint.
             - margins_g2 (torch.Tensor): Margins for G2 constraint.
             - margins_g4 (torch.Tensor): Margins for G4 constraint.
+            - margins_g3 (torch.Tensor): Margins for G3 constraint.
     """
     target_safe_reg = num_samples * 15 // 100
     target_safe_bnd = num_samples * 25 // 100
     target_unsafe   = num_samples - target_safe_reg - target_safe_bnd
 
-    s_safe_reg, a_safe_reg, m_safe_reg, mg1_sr, mg2_sr, mg4_sr = [], [], [], [], [], []
-    s_safe_bnd, a_safe_bnd, m_safe_bnd, mg1_sb, mg2_sb, mg4_sb = [], [], [], [], [], []
-    s_unsafe, a_unsafe, m_unsafe, mg1_u, mg2_u, mg4_u = [], [], [], [], [], []
+    s_safe_reg, a_safe_reg, m_safe_reg, mg1_sr, mg2_sr, mg4_sr, mg3_sr = [], [], [], [], [], [], []
+    s_safe_bnd, a_safe_bnd, m_safe_bnd, mg1_sb, mg2_sb, mg4_sb, mg3_sb = [], [], [], [], [], [], []
+    s_unsafe, a_unsafe, m_unsafe, mg1_u, mg2_u, mg4_u, mg3_u = [], [], [], [], [], [], []
 
     count_safe_reg = count_safe_bnd = count_unsafe = 0
 
@@ -444,7 +567,7 @@ def get_fresh_batch_dataset(num_samples: int = 500000, bias: float = 0.7, pass_r
            or count_safe_bnd < target_safe_bnd
            or count_unsafe   < target_unsafe):
 
-        cand_s, cand_a, is_safe_f, cand_m, c_mg1, c_mg2, c_mg4, is_near_bnd = \
+        cand_s, cand_a, is_safe_f, cand_m, c_mg1, c_mg2, c_mg4, c_mg3, is_near_bnd = \
             _generate_raw_batch(num_samples, bias, pass_rates)
 
         is_sf = is_safe_f.bool()
@@ -462,6 +585,7 @@ def get_fresh_batch_dataset(num_samples: int = 500000, bias: float = 0.7, pass_r
                 mg1_sr.append(c_mg1[idx[:take]])
                 mg2_sr.append(c_mg2[idx[:take]])
                 mg4_sr.append(c_mg4[idx[:take]])
+                mg3_sr.append(c_mg3[idx[:take]])
                 count_safe_reg += take
 
         if count_safe_bnd < target_safe_bnd:
@@ -474,6 +598,7 @@ def get_fresh_batch_dataset(num_samples: int = 500000, bias: float = 0.7, pass_r
                 mg1_sb.append(c_mg1[idx[:take]])
                 mg2_sb.append(c_mg2[idx[:take]])
                 mg4_sb.append(c_mg4[idx[:take]])
+                mg3_sb.append(c_mg3[idx[:take]])
                 count_safe_bnd += take
 
         if count_unsafe < target_unsafe:
@@ -486,6 +611,7 @@ def get_fresh_batch_dataset(num_samples: int = 500000, bias: float = 0.7, pass_r
                 mg1_u.append(c_mg1[idx[:take]])
                 mg2_u.append(c_mg2[idx[:take]])
                 mg4_u.append(c_mg4[idx[:take]])
+                mg3_u.append(c_mg3[idx[:take]])
                 count_unsafe += take
 
     states  = torch.cat(s_safe_reg + s_safe_bnd + s_unsafe, dim=0)
@@ -494,6 +620,7 @@ def get_fresh_batch_dataset(num_samples: int = 500000, bias: float = 0.7, pass_r
     margins_g1 = torch.cat(mg1_sr + mg1_sb + mg1_u, dim=0)
     margins_g2 = torch.cat(mg2_sr + mg2_sb + mg2_u, dim=0)
     margins_g4 = torch.cat(mg4_sr + mg4_sb + mg4_u, dim=0)
+    margins_g3 = torch.cat(mg3_sr + mg3_sb + mg3_u, dim=0)
 
     n_safe = target_safe_reg + target_safe_bnd
     labels = torch.full((states.size(0),), 0.05, device=states.device)
@@ -501,4 +628,4 @@ def get_fresh_batch_dataset(num_samples: int = 500000, bias: float = 0.7, pass_r
 
     perm = torch.randperm(states.size(0), device=states.device)
     return (states[perm], actions[perm], labels[perm], margins[perm],
-            margins_g1[perm], margins_g2[perm], margins_g4[perm])
+            margins_g1[perm], margins_g2[perm], margins_g4[perm], margins_g3[perm])

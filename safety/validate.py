@@ -1,14 +1,16 @@
 """
 Validation suite for the Photoproduction Safety Boundary Classifier.
 
-Tests the gradient-ascent projection (APN) against instantaneous constraints:
+Tests the gradient-ascent projection (APN) against the plant:
   - Test 1 (G1): Nitrate path constraint
   - Test 2 (G2): Product/biomass ratio
   - Test 3 (G4): Reactor overflow
   - Test 4 (ID): Identity mapping (safe states unmodified)
+  - Test 5 (G3): Harvest-start nitrate, rolled out on the plant to the
+    Growth -> Harvesting transition under maximum-pressure intents
 
-Note: G3 (terminal nitrate) and G5 (idle stage) are handled by the GRU temporal 
-context and Lagrangian multipliers, not by the APN's instantaneous projection.
+Note: G5 (end in Idle) is handled by the policy and the Lagrangian multipliers,
+not by the APN.  Run from the repository root:  python -m safety.validate
 """
 
 import numpy as np
@@ -17,8 +19,11 @@ import torch
 from envs.kinetics import integrate_rk4
 from envs.plant import DEFAULT_SQUASHED, PhycocyaninEnvCore
 from safety.apn import load_apn
-from safety.constants import (C_N_STOCK, CONTROL_INTERVAL, FN_MAX_GROWTH, FN_MAX_PROD, I_MAX,
-                              I_MIN, N_LIMIT_PATH, RATIO_LIMIT, SAFE_BUFFER, V_MAX, V_MIN)
+from safety.constants import (BASE_CREDITS, C_N_STOCK, CONTROL_INTERVAL, FN_MAX_GROWTH,
+                              FN_MAX_PROD, G3_BUFFER, G3_FALLBACK, I_MAX, I_MIN, INITIAL_NITRATE_SUPPLY,
+                              N_LIMIT_PATH, N_LIMIT_TERM, RATIO_LIMIT, SAFE_BUFFER, TOTAL_TIME,
+                              V_MAX, V_MIN)
+from safety.data import g3_margin
 
 
 def _project_to_safe(apn, state_norm_t, action_t):
@@ -282,29 +287,37 @@ def run_validation(model=None, num_test_samples: int = 2000):
     print(f"\n--- [TEST 4] Identity mapping: safe states unmodified (diff ≤ 2%) ---")
     id_passes = 0
     for _ in range(num_test_samples):
-        if _ % 2 == 0:
-            # Typical operation states
-            cx     = float(torch.empty(1).uniform_(0.5, 5.0))
-            cN     = float(torch.empty(1).uniform_(0.0, N_LIMIT_PATH * 0.50))
-            cq     = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.60))
-            V      = float(torch.empty(1).uniform_(V_MAX * 0.40, V_MAX * 0.80))
-            t_norm = float(torch.empty(1).uniform_(0.0, 0.50))
-        else:
-            # Broad safe spectrum
-            cx     = float(torch.empty(1).uniform_(0.1, 6.0))
-            cN     = float(torch.empty(1).uniform_(0.0, N_LIMIT_PATH * 0.80))
-            cq     = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.80))
-            V      = float(torch.empty(1).uniform_(V_MIN, V_MAX * 0.90))
-            t_norm = float(torch.empty(1).uniform_(0.0, 0.90))
+        # Resample until the action is safe for G3 as well (from Inoculation
+        # with high nitrate some moderate intents already make G3 unreachable).
+        while True:
+            if _ % 2 == 0:
+                # Typical operation states
+                cx     = float(torch.empty(1).uniform_(0.5, 5.0))
+                cN     = float(torch.empty(1).uniform_(0.0, N_LIMIT_PATH * 0.50))
+                cq     = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.60))
+                V      = float(torch.empty(1).uniform_(V_MAX * 0.40, V_MAX * 0.80))
+                t_norm = float(torch.empty(1).uniform_(0.0, 0.50))
+            else:
+                # Broad safe spectrum
+                cx     = float(torch.empty(1).uniform_(0.1, 6.0))
+                cN     = float(torch.empty(1).uniform_(0.0, N_LIMIT_PATH * 0.80))
+                cq     = float(torch.empty(1).uniform_(0.0, cx * RATIO_LIMIT * 0.80))
+                V      = float(torch.empty(1).uniform_(V_MIN, V_MAX * 0.90))
+                t_norm = float(torch.empty(1).uniform_(0.0, 0.90))
 
-        s_t = _make_state(cx, cN, cq, V, stage_idx=0, credit_norm=0.7,
-                          t_norm=t_norm, supply_norm=0.7, device=device)
-        a_t = -0.5 + torch.rand(1, 4, device=device)  # moderate safe intent
+            s_t = _make_state(cx, cN, cq, V, stage_idx=0, credit_norm=0.7,
+                              t_norm=t_norm, supply_norm=0.7, device=device)
+            a_t = -0.5 + torch.rand(1, 4, device=device)  # moderate safe intent
         
-        # Pre-mask a_t so we don't unfairly penalize the default clamp
-        stage_mask = PhycocyaninEnvCore.get_action_mask(s_t)
-        default_squashed = torch.tensor(DEFAULT_SQUASHED, device=device)
-        a_t_masked = a_t * stage_mask + default_squashed * (1 - stage_mask)
+            # Pre-mask a_t so we don't unfairly penalize the default clamp
+            stage_mask = PhycocyaninEnvCore.get_action_mask(s_t)
+            default_squashed = torch.tensor(DEFAULT_SQUASHED, device=device)
+            a_t_masked = a_t * stage_mask + default_squashed * (1 - stage_mask)
+            g3 = g3_margin(torch.tensor([cx]), torch.tensor([cN]), torch.tensor([V]),
+                           torch.tensor([0]), torch.tensor([0.7]), torch.tensor([t_norm]),
+                           torch.tensor([0.7]), a_t_masked.cpu())
+            if g3.item() >= 0.05:
+                break
 
         a_proj, _ = _project_to_safe(apn, s_t, a_t_masked)
         diff = (a_proj - a_t_masked).abs().max().item()
@@ -319,8 +332,67 @@ def run_validation(model=None, num_test_samples: int = 2000):
     else:
         print("  ✓ PASSED")
 
+    # =========================================================================
+    # TEST 5 — G3: Harvest-start nitrate (rolled out to the transition)
+    # =========================================================================
+    print(f"\n--- [TEST 5] G3: Harvest-start nitrate (target ≤ {N_LIMIT_TERM*G3_BUFFER:.0f} mg/L) ---")
+    n_g3 = max(1, num_test_samples // 4)   # each case is a multi-step rollout
+    fallback = torch.tensor([G3_FALLBACK])
+    starts = []
+    while len(starts) < n_g3:
+        # Late Inoculation / Growth states; keep those still recoverable with slack.
+        m = 4 * n_g3
+        stage = (torch.rand(m) < 0.85).long()
+        cx_s = 0.5 + torch.rand(m) * 4.5
+        cN_s = 50.0 + torch.rand(m) * 550.0
+        V_s = V_MAX * (0.2 + torch.rand(m) * 0.6)
+        credit = torch.where(stage == 1, torch.rand(m) * 0.6, torch.rand(m) * 0.3)
+        t_s = torch.randint(0, 60, (m,)).float() / 100.0
+        supply = 0.3 + torch.rand(m) * 0.7
+        ok = g3_margin(cx_s, cN_s, V_s, stage, credit, t_s, supply, fallback.expand(m, 4)) >= 0.05
+        starts += [(cx_s[k].item(), cN_s[k].item(), V_s[k].item(), int(stage[k]), credit[k].item(),
+                    t_s[k].item(), supply[k].item()) for k in ok.nonzero(as_tuple=True)[0].tolist()]
+    starts = starts[:n_g3]
+
+    env = PhycocyaninEnvCore()
+    g3_passes = 0
+    g3_iters = []
+    pressure = torch.tensor([[1.0, 1.0, 1.0, -1.0]], device=device)  # fastest clock, max feed
+    for cx_s, cN_s, V_s, stage, credit, t_s, supply in starts:
+        env.reset()
+        env.state = np.array([cx_s, cN_s, 0.005, V_s], dtype=np.float64)
+        env.current_stage = stage
+        env.stage_credits = credit * BASE_CREDITS[stage]
+        env.time_step_count = int(round(t_s * TOTAL_TIME / CONTROL_INTERVAL))
+        env.time = env.time_step_count * CONTROL_INTERVAL
+        env.nitrate_supply = supply * INITIAL_NITRATE_SUPPLY
+        passed = True
+        while True:
+            s_t = torch.tensor(env.get_state_norm(), dtype=torch.float32, device=device).unsqueeze(0)
+            a_proj, iters = _project_to_safe(apn, s_t, pressure)
+            g3_iters.append(iters)
+            prev = env.current_stage
+            _, _, done = env._physics_step(a_proj[0].cpu().numpy().astype(np.float64))
+            if prev == 1 and env.current_stage == 2:
+                passed = env.state[1] <= N_LIMIT_TERM * G3_BUFFER
+                break
+            if done or env.current_stage not in (0, 1):
+                break
+        g3_passes += int(passed)
+
+    g3_rate = g3_passes / n_g3
+    print(f"  Pass rate: {g3_passes}/{n_g3} ({g3_rate:.1%})  "
+          f"Avg iters: {np.mean(g3_iters):.1f}")
+    if not (apn.use_g3 and apn.has_g3):
+        print("  - SKIPPED (the APN has no trained G3 head)")
+    elif g3_rate < PASS_THRESHOLD:
+        print("  ❌ FAILED")
+        all_passed = False
+    else:
+        print("  ✓ PASSED")
+
     print(f"\n{'[ALL TESTS PASSED]' if all_passed else '[SOME TESTS FAILED]'}")
-    return all_passed, {"G1": g1_rate, "G2": g2_rate, "G4": g4_rate}
+    return all_passed, {"G1": g1_rate, "G2": g2_rate, "G3": g3_rate, "G4": g4_rate}
 
 
 if __name__ == "__main__":

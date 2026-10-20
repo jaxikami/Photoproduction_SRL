@@ -23,8 +23,11 @@ Components:
     grad        The APN's safety gradient in the PPO update (safety loss on
                 the actor's mean and mapping penalty).  Ablated by training
                 the actor on the reward alone.
+    g3          The APN's G3 head (harvest-start nitrate still reachable).
+                Ablated by leaving it out of the projection and the safety
+                gradient, so G3 rests on the policy and the Lagrangian alone.
 
-    Without proj and grad the APN is gone altogether.
+    Without proj and grad the APN is gone altogether (and with it the G3 head).
 
 Baseline:
     The Standard RL agent (agents/bench.py, trained on envs/bench.py's static

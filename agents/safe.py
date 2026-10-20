@@ -56,8 +56,9 @@ class PPO_Agent:
     L0  **SERL stage mask** — locks the action dims a stage does not allow
         (e.g. no outflow outside Harvesting) to their defaults, in the policy
         distribution and again on the action sent.
-    L1  **APN** (safety/apn.py) — one learned margin logit per instantaneous
-        constraint (G1 path nitrate, G2 Cq/Cx ratio, G4 overflow).
+    L1  **APN** (safety/apn.py) — one learned margin logit per constraint
+        (G1 path nitrate, G2 Cq/Cx ratio, G3 harvest-start nitrate still
+        reachable, G4 overflow), all from one forward pass.
     L2  **Projection** — sign-gradient ascent on the smooth minimum of the
         margins until the action is accepted (or the best iterate).
 
@@ -66,8 +67,8 @@ class PPO_Agent:
     backpropagated through the frozen APN, plus a mapping penalty pulling the
     mean towards the projected action it led to.  PPO itself is trained on the
     raw intent the actor sampled, so its ratios stay on-policy.  The
-    environment's Lagrange multipliers shape the reward for the temporal
-    constraints (G3, G5) the APN does not cover.
+    environment's Lagrange multipliers shape the reward on top, and for G5
+    (end in Idle), which the APN does not cover.
 
     Training uses Deep Recurrent Policy Optimisation (DRPO): GAE with recurrent
     value estimates and Truncated Backpropagation Through Time (TBPTT) over
@@ -88,7 +89,7 @@ class PPO_Agent:
 
     def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma,
                  K_epochs, eps_clip, entropy_coeff, use_safeguard=True,
-                 use_projection=True, use_safety_grad=True):
+                 use_projection=True, use_safety_grad=True, use_g3=True):
         """Initialise the safe PPO agent.
 
         Args:
@@ -106,6 +107,7 @@ class PPO_Agent:
             use_projection: L2: project every action with the APN.
             use_safety_grad: The APN safety loss and mapping penalty in the PPO
                 update.
+            use_g3: The APN's G3 head in the projection and the safety gradient.
         """
         self.gamma = gamma
         self.eps_clip = eps_clip
@@ -136,6 +138,8 @@ class PPO_Agent:
             if self.apn is None:
                 print(f"WARNING: {APN_PATH} not found (run python -m safety.train); "
                       "actions are not projected and there is no safety gradient.")
+            else:
+                self.apn.use_g3 = use_g3
         # Projection runs one state at a time: a stream of tiny kernels that a
         # CPU copy executes faster than the GPU.
         self.apn_infer = (copy.deepcopy(self.apn).cpu()
@@ -399,7 +403,7 @@ class PPO_Agent:
                 and self.apn is not None):
             return 0.0
         with torch.no_grad(), autocast(device_type='cuda', enabled=False):
-            m = self.apn.margins(c_states.float(), safe_mean.detach())          # [B, L, 3]
+            m = self.apn.margins(c_states.float(), safe_mean.detach())          # [B, L, H]
             weight = torch.clamp(SAFE_LOGIT - m.min(dim=-1).values, min=0.0) + 0.1
             weight = weight * projection_active(c_states).float()             # [B, L]
         per_sample = (safe_mean - c_safe_acts).pow(2).mean(dim=-1)            # [B, L]
