@@ -94,7 +94,10 @@ class EpisodeStats:
         info = self.last_info
         for vid, name in VIOLATION_NAMES.items():
             self.events[name] = int(info.get(f"g{vid}_violation_count", 0))
-        lambda_max = max(info.get(f"lam_g{k}", 0.0) for k in range(1, 6))
+        if "discharge" in env.scenarios:
+            self._depth("nitrate_discharge",
+                        env.nitrate_discharged / env.NITRATE_DISCHARGE_BUDGET - 1.0)
+        lambda_max = max(info.get(f"lam_g{k}", 0.0) for k in VIOLATION_NAMES)
         return {
             "return": self.ret,
             "harvested": float(info.get("total_cq_harvested", 0.0)),

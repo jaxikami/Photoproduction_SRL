@@ -83,11 +83,13 @@ class AblationAgent(SafePPO_Agent):
             self.policy.gru = MemorylessGRU(self.policy.gru)
             self.policy_old.gru = MemorylessGRU(self.policy_old.gru)
         if not cfg.mask:
-            # Only the policy distribution is unmasked: the agent's own
-            # use_safeguard stays True, so select_action() keeps overwriting
-            # locked dimensions (the interlock) before the APN and the plant.
+            # The whole of L0: the policy distribution is unmasked and the
+            # interlock no longer overwrites locked dimensions.  The nominal
+            # plant ignores a locked actuator anyway; under the 'actuators'
+            # scenario it runs it (a G7 breach).
             self.policy.use_safeguard = False
             self.policy_old.use_safeguard = False
+            self.use_interlock = False
 
 
 def make_agent(name):
@@ -98,24 +100,25 @@ def make_agent(name):
     return AblationAgent(ALL_CONFIGS[name])
 
 
-def make_train_env(name):
+def make_train_env(name, scenarios=()):
     """The environment a run trains on (the baseline trains with static penalties)."""
     if name == BASELINE:
-        return PhycocyaninEnvBench()
-    return make_env(ALL_CONFIGS[name].lagrangian)
+        return PhycocyaninEnvBench(scenarios)
+    return make_env(ALL_CONFIGS[name].lagrangian, scenarios)
 
 
-def make_env(use_lagrangian):
+def make_env(use_lagrangian, scenarios=()):
     """Create the PhycocyaninEnvSafe the study trains and evaluates on.
 
     Args:
         use_lagrangian: If False, dual ascent is disabled; the multipliers stay
             at 0, leaving only the static constraint shaping.
+        scenarios: envs/plant.SCENARIOS to switch on.
 
     Returns:
         PhycocyaninEnvSafe instance.
     """
-    env = PhycocyaninEnvSafe()
+    env = PhycocyaninEnvSafe(scenarios)
     if not use_lagrangian:
         env.disable_lagrangian()
     return env

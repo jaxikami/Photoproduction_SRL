@@ -141,6 +141,9 @@ class PPO_Agent:
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.use_safeguard = use_safeguard
+        # L0 on the action sent (checkpoints 2 and 3 of select_action()); the
+        # ablation study switches it off together with the policy's own mask.
+        self.use_interlock = use_safeguard
         self.use_projection = use_projection
         self.use_safety_grad = use_safety_grad
 
@@ -315,7 +318,7 @@ class PPO_Agent:
                 squashed = torch.as_tensor(intent, dtype=torch.float32, device=device)
 
             # ── SERL checkpoint 2 ─────────────────────────────────────────────
-            if self.use_safeguard:
+            if self.use_interlock:
                 mask = PhycocyaninEnvCore.get_action_mask(state_t)
                 squashed = squashed * mask + self._default * (1 - mask)
 
@@ -327,7 +330,7 @@ class PPO_Agent:
                 final_action = squashed
 
             # ── SERL checkpoint 3 (final absolute override) ───────────────────
-            if self.use_safeguard:
+            if self.use_interlock:
                 final_action = final_action * mask + self._default * (1 - mask)
 
         final_np = final_action.cpu().numpy()[0]

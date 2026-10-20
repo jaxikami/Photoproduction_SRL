@@ -12,11 +12,9 @@ Components:
                 by freezing every multiplier at 0 (no dual ascent).  The static
                 shaping (base spikes, buffer zones, G3 anticipation, G5 guiding
                 and idle spike) is kept, so only the adaptive part is removed.
-    mask        L0, the SERL stage mask in the policy distribution.  Ablated
-                by sampling every action dimension unmasked.  select_action()
-                still overwrites stage-locked dimensions with their defaults
-                before the APN and the plant, which then acts as a plant-side
-                interlock.
+    mask        L0, the SERL stage mask: in the policy distribution and, as the
+                interlock, on the action select_action() sends.  Ablated by
+                removing both, so stage-locked commands reach the plant.
     proj        L2, the APN projection of every action.  Ablated by sending
                 the actor's (stage-masked) action unprojected; the APN can
                 still train the actor through the safety gradient.
@@ -37,29 +35,50 @@ Baseline:
     KPIs are directly comparable; ablation_vs_baseline.png sets it against
     the full Safe RL agent under every noise mode.
 
-Why the mask ablation keeps the interlock:
-    The plant decodes only the dimensions its stage allows (envs/plant.py), and
-    the APN is trained on stage-masked actions.  Without the interlock the
-    unmasked policy would explore and be credited for dimensions with no
-    effect, so the variant would be solving a different control problem.  With
-    it, every variant controls the same plant and the comparison is the
-    standard invalid-action masking vs. no-op one (Huang & Ontanon, 2020).
-    illegal_cmd_rate reports how often the unmasked policy still commands
-    stage-illegal actions that only the interlock blocked.
+Why the mask ablation removes the interlock too:
+    The nominal plant decodes only the dimensions its stage allows
+    (envs/plant.py), so there it is a plant-side interlock and removing L0
+    changes nothing physical: the comparison is the standard invalid-action
+    masking vs. no-op one (Huang & Ontanon, 2020), and illegal_cmd_rate
+    reports how often the unmasked policy commands stage-illegal actions.
+    Under the 'actuators' scenario the plant runs every command, so L0 is the
+    only thing between a locked actuator and the plant (G7).
+
+Scenarios (--scenarios, envs/plant.SCENARIOS):
+    On the nominal plant the APN projection covers G1-G4 so completely that
+    removing the GRU, the Lagrangian or the mask changes nothing measurable.
+    Each scenario adds a failure mode the projection cannot cover by
+    construction, aimed at one of those layers (config.SCENARIO_TARGETS):
+
+    discharge    -> lagrangian  G6, an episode budget on the nitrate drained
+                                with the culture: cumulative over the batches,
+                                so no one-step projection can enforce it.
+    variability  -> gru         Hidden batch-to-batch kinetics (um, YNX, km
+                                each within ±20%): the observation shows the
+                                state, not the rates, and the APN predicts
+                                with the nominal ones.
+    actuators    -> mask        The plant runs every actuator command in every
+                                stage; a stage-locked one driven is a G7
+                                breach.
+
+    The plant trains and evaluates under the chosen scenarios; results land in
+    ablation_<scenarios>/ by default.  --design layers runs the full model and
+    the three targeted ablations.
 
 Constraints:
     PhycocyaninEnvSafe's five constraints: G1 path nitrate (CN <= 800 mg/L),
     G2 product ratio (Cq/Cx <= 0.011), G3 nitrate at the Growth -> Harvesting
     transition (CN <= 150 mg/L), G4 reactor overflow (V <= V_MAX) and G5 the
-    episode ending in Idle.  Each is tracked by occurrence, the number of
-    violation events per episode as the environment counts them and the share
-    of episodes with one; G1-G4 also by severity: the worst exceedance over
-    all evaluation episodes and the mean exceedance per event, both as a
-    percentage of the limit.
+    episode ending in Idle, plus the scenario constraints G6 nitrate discharge
+    (<= NITRATE_DISCHARGE_BUDGET per episode) and G7 interlock breach.  Each
+    is tracked by occurrence, the number of violation events per episode as
+    the environment counts them and the share of episodes with one; G1-G4 and
+    G6 also by severity: the worst exceedance over all evaluation episodes and
+    the mean exceedance per event, both as a percentage of the limit.
 
 Noise (no disturbances):
-    Training runs on the nominal plant.  Each trained policy is evaluated on
-    the nominal plant three times: without noise, with multiplicative Gaussian
+    Training runs on the nominal plant (or under --scenarios).  Each trained
+    policy is evaluated on that plant three times: without noise, with multiplicative Gaussian
     actuator noise on the light, nitrate feed and outflow sent to the plant
     (after the safety stack, so the projection cannot correct it), and with
     multiplicative Gaussian sensor noise on the measured observations
@@ -98,6 +117,9 @@ Usage:
     python ablation.py --configs full baseline        # Safe RL vs baseline only
     python ablation.py --configs full no_proj --seeds 0 1 2 3 4
     python ablation.py --design factorial --episodes 5000
+    python ablation.py --design layers --scenarios discharge     # Lagrangian under G6
+    python ablation.py --design layers --scenarios variability   # GRU under hidden kinetics
+    python ablation.py --design layers --scenarios actuators     # mask under G7
     python ablation.py --workers 1                    # one process, progress bars
     python ablation.py --summarize-only               # re-aggregate and re-plot
 """

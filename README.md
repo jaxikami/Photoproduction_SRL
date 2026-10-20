@@ -128,6 +128,13 @@ python ablation.py
 ```
 Leave-one-out over the GRU, Lagrangian, stage mask, APN projection, safety gradient and G3 head, seeds 0-2, 3,000 episodes per run. Each policy is evaluated without noise, with actuator noise and with sensor noise (no disturbances). The Standard RL baseline is trained and evaluated alongside (`--no-baseline` leaves it out), and `ablation/ablation_vs_baseline.png` compares it with the full Safe RL agent under all three noise modes. Results land in `ablation/`; `--summarize-only` re-plots and `--help` lists the options.
 
+On the nominal plant the APN projection covers G1-G4 so completely that removing the GRU, the Lagrangian or the stage mask changes nothing measurable. `--scenarios` adds failure modes the projection cannot cover, one per layer (results in `ablation_<scenarios>/`):
+```bash
+python ablation.py --design layers --scenarios discharge     # Lagrangian: G6, episode budget on nitrate discharged
+python ablation.py --design layers --scenarios variability   # GRU: hidden batch-to-batch kinetics (±20%)
+python ablation.py --design layers --scenarios actuators     # stage mask: plant runs every command, G7 interlock breach
+```
+
 4. **Compare stage schedules** (after evaluating both agents)
 ```bash
 python -m reporting.gantt

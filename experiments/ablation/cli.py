@@ -7,10 +7,12 @@ import warnings
 
 # ─── Local ────────────────────────────────────────────────────────────────────
 from agents.networks import device
+from envs.plant import SCENARIOS
 from experiments.ablation import summary
 from experiments.ablation.config import (
     ALL_CONFIGS, BASELINE, DEFAULT_EPISODES, DEFAULT_EVAL_EPISODES, DEFAULT_NOISE_STD, DEFAULT_SEEDS,
-    DEFAULT_WORKERS, LOO_CONFIGS, NOISE_MODES, RUN_NAMES, SCHEDULE_EPISODES
+    DEFAULT_WORKERS, LAYER_CONFIGS, LOO_CONFIGS, NOISE_MODES, RUN_NAMES, SCENARIO_TARGETS,
+    SCHEDULE_EPISODES
 )
 from experiments.ablation.runner import _needs_eval, _run_dir, _stale, run_jobs
 
@@ -25,9 +27,14 @@ def _parse_args():
                     "(GRU memory, Lagrangian, stage mask, APN projection, safety gradient).",
         epilog="configs: " + ", ".join(RUN_NAMES),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--design", choices=("loo", "factorial"), default="loo",
+    parser.add_argument("--design", choices=("loo", "layers", "factorial"), default="loo",
                         help="loo: full model plus one run per removed component; "
-                             f"factorial: all {len(ALL_CONFIGS)} combinations")
+                             f"layers: {', '.join(LAYER_CONFIGS)} (the layers the scenarios "
+                             f"target); factorial: all {len(ALL_CONFIGS)} combinations")
+    parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=[], metavar="NAME",
+                        help="stress scenarios the plant trains and evaluates under, each "
+                             "aimed at one layer: " + ", ".join(
+                                 f"{s} -> {t}" for s, t in SCENARIO_TARGETS.items()))
     parser.add_argument("--no-baseline", action="store_true",
                         help=f"leave the Standard RL baseline ('{BASELINE}') out of the design set")
     parser.add_argument("--configs", nargs="+", choices=RUN_NAMES, metavar="NAME",
@@ -42,7 +49,8 @@ def _parse_args():
                         help="evaluation episodes per trained policy and noise mode")
     parser.add_argument("--noise-std", type=float, default=DEFAULT_NOISE_STD,
                         help="relative std of the action and state noise used in evaluation")
-    parser.add_argument("--out", default="ablation", help="output directory")
+    parser.add_argument("--out", help="output directory (default: ablation, or "
+                                      "ablation_<scenarios> with --scenarios)")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                         help="parallel training processes (they share the GPU); 1 shows "
                              "progress bars")
@@ -56,11 +64,16 @@ def _parse_args():
 def main():
     """Run the requested ablation runs, then summarize everything on disk."""
     args = _parse_args()
+    scenarios = sorted(set(args.scenarios))
+    if args.out is None:
+        args.out = "_".join(["ablation"] + scenarios)
     if not args.summarize_only:
-        names = args.configs or ((LOO_CONFIGS if args.design == "loo" else list(ALL_CONFIGS))
+        design = {"loo": LOO_CONFIGS, "layers": LAYER_CONFIGS, "factorial": list(ALL_CONFIGS)}
+        names = args.configs or (design[args.design]
                                  + ([] if args.no_baseline else [BASELINE]))
         settings = {
             "out": args.out,
+            "scenarios": scenarios,
             "episodes": args.episodes,
             "schedule_episodes": args.schedule_episodes,
             "eval_episodes": args.eval_episodes,
@@ -74,7 +87,7 @@ def main():
         to_train, to_eval = [], []
         for name, seed in jobs:
             run_dir = _run_dir(args.out, name, seed)
-            if args.force or not (run_dir / "eval.json").exists() or _stale(run_dir):
+            if args.force or not (run_dir / "eval.json").exists() or _stale(run_dir, settings):
                 to_train.append((name, seed))
             elif _needs_eval(run_dir, settings):
                 to_eval.append((name, seed))
@@ -83,6 +96,7 @@ def main():
               f"{len(to_train)} to train, {len(to_eval)} to re-evaluate "
               f"({len(jobs) - len(to_train) - len(to_eval)} already complete) ---")
         print(f"  configs: {', '.join(names)}")
+        print(f"  scenarios: {', '.join(scenarios) or 'none (nominal plant)'} | out: {args.out}")
         print(f"  {args.episodes:,} training episodes per run "
               f"(schedule horizon {args.schedule_episodes:,}), "
               f"{args.eval_episodes} evaluation episodes per noise mode: "

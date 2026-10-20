@@ -36,16 +36,26 @@ ILLEGAL_CMD_TOL = 0.05
 # ─── Constraints ──────────────────────────────────────────────────────────────
 
 # Constraint ids as PhycocyaninEnvSafe counts them (info["g<k>_violation_count"]).
+# G6 and G7 only exist under their scenario (envs/plant.SCENARIOS).
 VIOLATION_NAMES = {1: "path_nitrate", 2: "product_ratio", 3: "terminal_nitrate",
-                   4: "overflow", 5: "end_idle"}
+                   4: "overflow", 5: "end_idle", 6: "nitrate_discharge", 7: "interlock"}
 VIOLATION_LABELS = {"path_nitrate": "G1 path nitrate", "product_ratio": "G2 Cq/Cx ratio",
                     "terminal_nitrate": "G3 harvest-start nitrate", "overflow": "G4 overflow",
-                    "end_idle": "G5 end in Idle"}
+                    "end_idle": "G5 end in Idle", "nitrate_discharge": "G6 nitrate discharge",
+                    "interlock": "G7 interlock breach"}
 
-# Violations with a magnitude (G5 is pass/fail).
-SEVERITY_TYPES = ("path_nitrate", "product_ratio", "terminal_nitrate", "overflow")
+# Violations with a magnitude (G5 and G7 are pass/fail).
+SEVERITY_TYPES = ("path_nitrate", "product_ratio", "terminal_nitrate", "overflow",
+                  "nitrate_discharge")
 SEVERITY_UNITS = {"path_nitrate": "% over 800 mg/L", "product_ratio": "% over 0.011",
-                  "terminal_nitrate": "% over 150 mg/L", "overflow": "% over V_MAX"}
+                  "terminal_nitrate": "% over 150 mg/L", "overflow": "% over V_MAX",
+                  "nitrate_discharge": "% over budget"}
+
+# ─── Scenarios ────────────────────────────────────────────────────────────────
+
+# The layer each envs/plant.SCENARIOS entry is built to exercise: the failure
+# mode it adds is one the APN projection cannot cover.
+SCENARIO_TARGETS = {"discharge": "lagrangian", "variability": "gru", "actuators": "mask"}
 
 # ─── Evaluation Noise ─────────────────────────────────────────────────────────
 NOISE_MODES = ("none", "action", "state")
@@ -73,7 +83,8 @@ class AblationConfig:
     Attributes:
         gru: Recurrent memory (hidden state carried across timesteps).
         lagrangian: Adaptive Lagrange multipliers in the environment.
-        mask: L0, SERL stage mask applied to the policy distribution.
+        mask: L0, SERL stage mask: on the policy distribution and, as the
+            interlock, on the action sent.
         proj: L2, APN projection of every action.
         grad: The APN's safety gradient in the PPO update.
         g3: The APN's G3 head (harvest-start nitrate) in projection and gradient.
@@ -117,6 +128,8 @@ ALL_CONFIGS = {
         key=lambda c: (len(c.removed), [COMPONENTS.index(r) for r in c.removed]))
 }
 LOO_CONFIGS = ["full"] + [f"no_{c}" for c in COMPONENTS]
+# The full model and one run per layer a scenario targets (SCENARIO_TARGETS).
+LAYER_CONFIGS = ["full"] + [f"no_{c}" for c in COMPONENTS if c in SCENARIO_TARGETS.values()]
 
 # The Standard RL baseline (agents/bench.py trained on envs/bench.py), run with
 # the same protocol and evaluated on the same environment as the variants.

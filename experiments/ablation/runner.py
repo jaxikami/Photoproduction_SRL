@@ -63,14 +63,14 @@ def train_run(name, seed, settings, run_dir):
     Args:
         name: Ablation config name or BASELINE.
         seed: Random seed for NumPy and torch.
-        settings: Dict with 'episodes', 'schedule_episodes' and 'progress'.
+        settings: Dict with 'episodes', 'schedule_episodes', 'scenarios' and 'progress'.
         run_dir: Directory receiving train_log.csv and policy.pth.
 
     Returns:
         A tuple of (trained agent, dict of training statistics).
     """
     _seed_everything(seed)
-    env = make_train_env(name)
+    env = make_train_env(name, settings["scenarios"])
     agent = make_agent(name)
 
     memory = PPOMemory(UPDATE_TIMESTEP, STATE_DIM, ACTION_DIM)
@@ -144,7 +144,8 @@ def train_run(name, seed, settings, run_dir):
     }
 
 
-def evaluate_run(agent, seed, n_episodes, noise_mode="none", noise_std=DEFAULT_NOISE_STD):
+def evaluate_run(agent, seed, n_episodes, noise_mode="none", noise_std=DEFAULT_NOISE_STD,
+                 scenarios=()):
     """Evaluate a trained agent under one noise mode with every Lagrange multiplier frozen at 0.
 
     A fresh environment keeps the multipliers learned during training out of
@@ -159,6 +160,7 @@ def evaluate_run(agent, seed, n_episodes, noise_mode="none", noise_std=DEFAULT_N
         noise_mode: One of NOISE_MODES.  'action' perturbs the actuators sent
             to the plant, 'state' perturbs the observation the agent acts on.
         noise_std: Relative standard deviation of the injected noise.
+        scenarios: envs/plant.SCENARIOS of the plant (those the run trained on).
 
     Returns:
         Dict of evaluation metrics: means over episodes (plus selected stds),
@@ -167,7 +169,7 @@ def evaluate_run(agent, seed, n_episodes, noise_mode="none", noise_std=DEFAULT_N
         constraint over all episodes.
     """
     _seed_everything(seed + EVAL_SEED_OFFSET)
-    env = make_env(use_lagrangian=False)
+    env = make_env(use_lagrangian=False, scenarios=scenarios)
     if hasattr(agent, "get_and_reset_proj_stats"):
         agent.get_and_reset_proj_stats()  # drop counters left over from training
     if getattr(agent, "estimator", None) is not None:
@@ -235,13 +237,14 @@ def evaluate_run(agent, seed, n_episodes, noise_mode="none", noise_std=DEFAULT_N
     return result
 
 
-def evaluate_all(agent, seed, n_episodes, noise_std, modes=NOISE_MODES):
+def evaluate_all(agent, seed, n_episodes, noise_std, modes=NOISE_MODES, scenarios=()):
     """Evaluate a trained agent under every noise mode (identically reseeded).
 
     Returns:
         Dict of noise mode -> evaluate_run() metrics.
     """
-    return {mode: evaluate_run(agent, seed, n_episodes, mode, noise_std) for mode in modes}
+    return {mode: evaluate_run(agent, seed, n_episodes, mode, noise_std, scenarios)
+            for mode in modes}
 
 
 def _run_dir(out_dir, name, seed):
@@ -249,10 +252,12 @@ def _run_dir(out_dir, name, seed):
     return Path(out_dir) / "runs" / f"{name}__seed{seed}"
 
 
-def _stale(run_dir):
-    """Whether a completed run was trained under another STUDY_VERSION."""
+def _stale(run_dir, settings):
+    """Whether a completed run was trained under another STUDY_VERSION or other scenarios."""
     with open(run_dir / "eval.json") as f:
-        return json.load(f)["settings"].get("study_version") != STUDY_VERSION
+        trained = json.load(f)["settings"]
+    return (trained.get("study_version") != STUDY_VERSION
+            or sorted(trained.get("scenarios", [])) != sorted(settings["scenarios"]))
 
 
 def _needs_eval(run_dir, settings):
@@ -305,11 +310,13 @@ def _run_job(job):
                 "device": str(device),
                 "torch_threads": torch.get_num_threads(),
                 "study_version": STUDY_VERSION,
+                "scenarios": sorted(settings["scenarios"]),
             },
             "train": train_stats,
         }
     result["settings"]["noise_std"] = settings["noise_std"]
-    result["eval"] = evaluate_all(agent, seed, settings["eval_episodes"], settings["noise_std"])
+    result["eval"] = evaluate_all(agent, seed, settings["eval_episodes"], settings["noise_std"],
+                                  scenarios=settings["scenarios"])
     # Written last: its presence marks the run as complete.
     with open(run_dir / "eval.json", "w") as f:
         json.dump(result, f, indent=2)

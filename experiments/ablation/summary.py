@@ -125,7 +125,7 @@ def summarize(out_dir):
 
     rule = "=" * 120
     short = {"path_nitrate": "G1", "product_ratio": "G2", "terminal_nitrate": "G3",
-             "overflow": "G4", "end_idle": "G5"}
+             "overflow": "G4", "end_idle": "G5", "nitrate_discharge": "G6", "interlock": "G7"}
     names = list(VIOLATION_NAMES.values())
     for mode in NOISE_MODES:
         mode_rows = [r for r in rows if r["noise_mode"] == mode]
@@ -166,7 +166,7 @@ def summarize(out_dir):
             print(f"  {row['label']:<26} " + " ".join(f"{c:>15}" for c in cells))
         for row in mode_rows:
             if row["illegal_cmd_rate_mean"]:
-                print(f"  {row['label']}: the interlock blocked stage-illegal commands on "
+                print(f"  {row['label']}: the policy commanded stage-illegal actions on "
                       f"{100 * row['illegal_cmd_rate_mean']:.1f}% of locked action dims")
     _print_safe_vs_baseline(rows, rule)
     print(f"{rule}\n")
