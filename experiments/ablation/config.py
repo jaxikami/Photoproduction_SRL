@@ -25,7 +25,9 @@ EVAL_SEED_OFFSET = 10_000
 # Bumped whenever a change invalidates trained runs (plant, constraints or
 # agent); a run trained under another version is retrained, not re-evaluated.
 # 2: the APN's G3 head and the g3 component.
-STUDY_VERSION = 2
+# 3: the Fermentation-PPO safety stack (exact heads, KineticNet G3 head,
+#    closed-form projection and the state estimator).
+STUDY_VERSION = 3
 
 # A raw command on a stage-locked dimension counts as illegal when it differs
 # from the interlock default by more than this, in [-1, 1] action units.

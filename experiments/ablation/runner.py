@@ -170,6 +170,9 @@ def evaluate_run(agent, seed, n_episodes, noise_mode="none", noise_std=DEFAULT_N
     env = make_env(use_lagrangian=False)
     if hasattr(agent, "get_and_reset_proj_stats"):
         agent.get_and_reset_proj_stats()  # drop counters left over from training
+    if getattr(agent, "estimator", None) is not None:
+        # Each noise mode is its own set of sensors: identify their noise anew.
+        agent.estimator.reset(sensors=True)
 
     rows, stats_all = [], []
     for _ in range(n_episodes):

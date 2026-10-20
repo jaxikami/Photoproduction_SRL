@@ -9,6 +9,9 @@ Pipeline overview::
     Actor (GRU + raw-state skip, agents/networks.py)  ->  tanh squash
          ->  L0 SERL stage mask  ->  L1/L2 APN projection (safety/)
          ->  final SERL mask override  ->  environment
+
+The APN acts on a filtered state estimate (safety/estimator.py); the actor
+sees the raw observation.
 """
 
 # ─── Standard Library ─────────────────────────────────────────────────────────
@@ -25,18 +28,29 @@ from agents.memory import RunningMeanStd
 from agents.networks import GRU_HIDDEN_DIM, GRU_NUM_LAYERS, SEQ_LEN, ActorCritic, device
 from envs.plant import DEFAULT_SQUASHED, PhycocyaninEnvCore
 from safety.apn import load_apn, projection_active
-from safety.constants import APN_PATH, SAFE_LOGIT
+from safety.constants import N_LIMIT_PATH, N_LIMIT_TERM
+from safety.estimator import StateEstimator, pessimistic
 
 # ─── Safety Gradient ──────────────────────────────────────────────────────────
 
 # Weight of the APN safety loss (hinge on every head's margin at the actor's
 # own mean action) in the PPO loss.  Its gradient is the actor's direct signal
-# that an intent would have been corrected.  The APN's margins are logits
-# (~30x the physical margins), hence a smaller weight than Fermentation's 1.0.
-SAFETY_GRAD_COEF = 0.1
+# that an intent would have been corrected.
+SAFETY_GRAD_COEF = 1.0
 
 # Weight of the mapping penalty (actor mean -> the projected action it led to).
 MAPPING_COEF = 0.01
+
+# ─── State Estimate ───────────────────────────────────────────────────────────
+
+# Standard deviations of the state estimate's own uncertainty the APN's view of
+# the plant is moved towards every constraint (estimator.pessimistic).
+ESTIMATE_KAPPA = 2.0
+
+# Standard deviations of the identified process noise the feed-driven buffers
+# (G1, G3, G4) widen by (_offsets()).  Actuator noise scales with the feed but
+# the estimate is a median over all steps, so it reads low at full feed.
+PROCESS_KAPPA = 3.0
 
 # ─── PPO Update ───────────────────────────────────────────────────────────────
 
@@ -56,11 +70,22 @@ class PPO_Agent:
     L0  **SERL stage mask** — locks the action dims a stage does not allow
         (e.g. no outflow outside Harvesting) to their defaults, in the policy
         distribution and again on the action sent.
-    L1  **APN** (safety/apn.py) — one learned margin logit per constraint
-        (G1 path nitrate, G2 Cq/Cx ratio, G3 harvest-start nitrate still
-        reachable, G4 overflow), all from one forward pass.
-    L2  **Projection** — sign-gradient ascent on the smooth minimum of the
-        margins until the action is accepted (or the best iterate).
+    L1  **APN** (safety/apn.py, laid out like Fermentation-PPO's) — one
+        margin per constraint, as a fraction of its limit: exact heads for G1
+        path nitrate, G2 Cq/Cx ratio and G4 overflow (the plant's one-step
+        kinetics), and a learned head for G3 harvest-start nitrate still
+        reachable (KineticNet's fallback draw-down and the credit arithmetic).
+    L2  **Projection** — a closed-form, priority-weighted minimum-norm step
+        moves the action inside every head's boundary, then the containment
+        heads (G1, G4) are re-checked alone.
+
+    The APN acts on a **state estimate** (safety/estimator.py): a Kalman
+    filter around the nominal plant that removes sensor noise from the
+    measured features (the reading itself when there is none), moved
+    ESTIMATE_KAPPA of its own standard deviations towards every constraint,
+    and the feed-driven buffers (G1, G3, G4) widen by PROCESS_KAPPA of the
+    process noise it identifies (_offsets()).  The actor sees the raw
+    observation.
 
     During the PPO update the same margins give the actor a **safety
     gradient**: the APN's smooth hinge on the actor's own (squashed) mean,
@@ -134,17 +159,16 @@ class PPO_Agent:
         # 2. The APN: frozen, used for projection and the safety gradient.
         self.apn = None
         if use_safeguard and (use_projection or use_safety_grad):
-            self.apn = load_apn(device, state_dim=state_dim, action_dim=action_dim)
-            if self.apn is None:
-                print(f"WARNING: {APN_PATH} not found (run python -m safety.train); "
-                      "actions are not projected and there is no safety gradient.")
-            else:
-                self.apn.use_g3 = use_g3
+            self.apn = load_apn(device)
+            self.apn.use_g3 = use_g3
         # Projection runs one state at a time: a stream of tiny kernels that a
         # CPU copy executes faster than the GPU.
         self.apn_infer = (copy.deepcopy(self.apn).cpu()
                           if self.apn is not None and device.type != 'cpu' else self.apn)
         self._default = torch.tensor(DEFAULT_SQUASHED, device=device)
+
+        # The APN's state estimate (reset every episode).
+        self.estimator = StateEstimator() if use_safeguard else None
 
         # Running stats for reward normalisation (Welford online estimator).
         # Updated once per learn() call with the full rollout reward batch.
@@ -178,6 +202,8 @@ class PPO_Agent:
         consumed inside learn().)
         """
         self.h = None
+        if self.estimator is not None:
+            self.estimator.reset()
 
     def discard_rollout(self):
         """Drop the hidden-state snapshots of steps that will not be learned from."""
@@ -190,8 +216,8 @@ class PPO_Agent:
             A dict with keys:
                 - calls: Total projection calls.
                 - noop: Calls whose action was already safe (or bypassed).
-                - iters: Total ascent steps across all calls.
-                - avg_it: Mean ascent steps per call that needed correction.
+                - iters: Total correction steps across all calls.
+                - avg_it: Mean correction steps per call that needed correction.
         """
         calls, noop, iters = self._proj_calls, self._proj_noop, self._proj_iters
         needed = calls - noop
@@ -211,11 +237,26 @@ class PPO_Agent:
         Returns:
             Projected action [1, action_dim] on the agent's device.
         """
-        out, stats = self.apn_infer.project(state_t.cpu(), action.cpu())
+        out, stats = self.apn_infer.project(state_t.cpu(), action.cpu(), self._offsets())
         self._proj_calls += 1
         self._proj_noop += int(stats["noop"])
         self._proj_iters += stats["iters"]
         return out.to(state_t.device)
+
+    def _offsets(self):
+        """Buffer offsets per APN group (fraction of the limit), or None.
+
+        PROCESS_KAPPA of the state estimator's process-noise std (what one
+        decision does that the nominal plant did not predict, e.g. an actuator
+        error) on the feed-driven limits: nitrate for G1 and G3, volume for G4.
+        """
+        if self.estimator is None:
+            return None
+        std = self.estimator.process_std()
+        off = {g: PROCESS_KAPPA * extra
+               for g, extra in ((1, std[1] * 800.0 / N_LIMIT_PATH),
+                                (3, std[1] * 800.0 / N_LIMIT_TERM), (4, std[3]))}
+        return off if any(off.values()) else None
 
     # ── Action Selection ───────────────────────────────────────────────────────
 
@@ -224,6 +265,8 @@ class PPO_Agent:
 
         Executes Actor -> SERL mask -> APN projection -> SERL mask and records
         the hidden-state snapshot needed by learn() for TBPTT warm-starting.
+        The APN projects on the state estimate; the actor acts on the raw
+        observation.
 
         The stage mask is enforced at THREE checkpoints so no downstream
         layer can ever produce a structurally illegal action:
@@ -247,6 +290,12 @@ class PPO_Agent:
                 - log_prob: Log pi_old(z | s, h) at collection time (float).
                 - state_in: The state fed to the actor, shape [state_dim].
         """
+        # The APN's view of the plant: the filtered estimate, moved towards
+        # every constraint by its own uncertainty.
+        safe_np = np.asarray(state, dtype=np.float32)
+        if self.estimator is not None:
+            safe_np = pessimistic(*self.estimator.update(state), ESTIMATE_KAPPA)
+
         with torch.no_grad():
             state_t = torch.as_tensor(np.asarray(state, dtype=np.float32), device=device).unsqueeze(0)
 
@@ -272,7 +321,8 @@ class PPO_Agent:
 
             # ── L2: APN projection ────────────────────────────────────────────
             if self.use_safeguard and self.use_projection and self.apn is not None:
-                final_action = self._project(state_t, squashed)
+                final_action = self._project(
+                    torch.from_numpy(safe_np).to(device).unsqueeze(0), squashed)
             else:
                 final_action = squashed
 
@@ -280,7 +330,10 @@ class PPO_Agent:
             if self.use_safeguard:
                 final_action = final_action * mask + self._default * (1 - mask)
 
-        return (final_action.cpu().numpy()[0], raw_intent.cpu().numpy()[0],
+        final_np = final_action.cpu().numpy()[0]
+        if self.estimator is not None:
+            self.estimator.predict(final_np)
+        return (final_np, raw_intent.cpu().numpy()[0],
                 log_prob.item(), state_t.cpu().numpy()[0])
 
     # ── PPO Update Internals ───────────────────────────────────────────────────
@@ -387,8 +440,8 @@ class PPO_Agent:
     def _compute_mapping_penalty(self, c_states, safe_mean, c_safe_acts):
         """Pull the actor's mean towards the projected action it led to.
 
-        Weighted by how far the mean action is outside the APN's acceptance
-        margin, so corrected steps dominate; zero where the APN is bypassed
+        Weighted by how far the mean action is outside the APN's boundary (its
+        worst margin), so corrected steps dominate; zero where the APN is bypassed
         (Harvesting, Idle).  Only meaningful with the projection on.
 
         Args:
@@ -404,7 +457,7 @@ class PPO_Agent:
             return 0.0
         with torch.no_grad(), autocast(device_type='cuda', enabled=False):
             m = self.apn.margins(c_states.float(), safe_mean.detach())          # [B, L, H]
-            weight = torch.clamp(SAFE_LOGIT - m.min(dim=-1).values, min=0.0) + 0.1
+            weight = torch.clamp(-m.min(dim=-1).values, min=0.0) + 0.1
             weight = weight * projection_active(c_states).float()             # [B, L]
         per_sample = (safe_mean - c_safe_acts).pow(2).mean(dim=-1)            # [B, L]
         return (per_sample * weight).mean()

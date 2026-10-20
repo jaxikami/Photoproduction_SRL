@@ -16,7 +16,7 @@ from envs.safe import PhycocyaninEnvSafe
 from experiments.ablation.config import ALL_CONFIGS, BASELINE
 from experiments.config import (ACTION_DIM, EPS_CLIP, GAMMA, INITIAL_ENTROPY, K_EPOCHS, LR_ACTOR,
                                 LR_CRITIC, STATE_DIM)
-from safety.constants import APN_PATH
+from safety.constants import KINETIC_PATH
 
 
 class MemorylessGRU(nn.Module):
@@ -70,11 +70,12 @@ class AblationAgent(SafePPO_Agent):
             cfg: AblationConfig selecting the active components.
 
         Raises:
-            FileNotFoundError: If the APN is needed but its checkpoint is
-                missing (the parent would silently run without it).
+            FileNotFoundError: If the G3 head is needed but KineticNet's
+                checkpoint is missing (the parent would silently leave G3
+                uncovered).
         """
-        if (cfg.proj or cfg.grad) and not os.path.exists(APN_PATH):
-            raise FileNotFoundError(f"{APN_PATH} not found; run python -m safety.train first.")
+        if (cfg.proj or cfg.grad) and cfg.g3 and not os.path.exists(KINETIC_PATH):
+            raise FileNotFoundError(f"{KINETIC_PATH} not found; run python -m safety.train first.")
         super().__init__(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP,
                          INITIAL_ENTROPY, use_safeguard=True, use_projection=cfg.proj,
                          use_safety_grad=cfg.grad, use_g3=cfg.g3)

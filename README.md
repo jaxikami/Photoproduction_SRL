@@ -34,20 +34,21 @@ Implemented constraints in the environment (`envs/`):
 - `G4` (Reactor Overflow): `V <= 50 L`
 - `G5` (Idle Stage Minimum Volume): `V >= 5 L`
 
-*Note: the APN covers G1, G2, G3 and G4. G3 is decided over many steps, so its head is trained on offline rollouts (`safety.data.g3_margin`): after the action, the plant is run to the end of Growth under the fastest possible nitrate draw-down (no feed, slowest clock, growth-optimal light), so the head says whether G3 is still reachable. At run time it is one more output of the same forward pass, with no forecasting. G5 is handled by the Lagrangian multipliers and the policy.*
+*Note: the APN covers G1, G2, G3 and G4. G1, G2 and G4 are one control step ahead, so their heads are exact: the plant's own kinetics over the step. G3 is decided over many steps: the action must leave it reachable under the fastest possible nitrate draw-down (no feed, slowest clock, growth-optimal light) until Growth ends. A small network (KineticNet) predicts that draw-down step by step from biomass and nitrate, and the step on which Growth ends is the plant's credit arithmetic, computed exactly. G5 is handled by the Lagrangian multipliers and the policy.*
 
 ## Architecture
 
 ### Safe RL Agent (`agents/safe.py`)
-A recurrent PPO agent (GRU + raw-state skip connection, `agents/networks.py`) wrapped in a layered safety stack, laid out like the Fermentation PPO project's safe agent:
+A recurrent PPO agent (GRU + raw-state skip connection, `agents/networks.py`) wrapped in the Fermentation PPO project's safety stack:
 
 *   **L0 SERL Stage Mask**: locks the action dims a stage does not allow, in the policy distribution and again on the action sent.
-*   **L1 APN** (`safety/apn.py`): one learned margin logit per constraint (G1, G2, G3, G4), loaded from `policy/action_projection_network.pth`.
-*   **L2 Projection**: sign-gradient ascent on the smooth minimum of the margins until the action is accepted (Inoculation and Growth only). If the steps run out, one batched line search toward the G3 fallback picks the closest action every head accepts.
+*   **L1 APN** (`safety/apn.py`, a multi-head APN like Fermentation's): one margin per constraint as a fraction of its limit. G1, G2 and G4 are exact heads, the plant's own one-step kinetics in torch (`safety/dynamics.py`). G3 is the learned head: KineticNet (`safety/kinetic.py`, weights in `policy/apn_kinetic.pth`) predicts the fallback's nitrate draw-down, and the credit arithmetic picks the step where Growth ends.
+*   **L2 Projection**: a closed-form, priority-weighted minimum-norm correction of the heads that are short (Inoculation and Growth only), re-linearised a few times, then the containment heads (G1, G4) re-checked alone. A row G3 is still short on takes the closest accepted point toward the G3 fallback.
+*   **State estimate** (`safety/estimator.py`): the APN projects on a Kalman-filtered estimate of the measured features, not on the raw reading. The nominal plant (`safety/nominal.py`, the environment's own step) predicts the next reading from the action sent; sensor noise is identified online from the lag-1 correlation of the prediction errors (actuator noise leaves it at 0) and the estimate is moved two of its own standard deviations toward every constraint. The process noise it identifies (an actuator error) widens the G1, G3 and G4 buffers by three of its standard deviations. Without noise the estimate is the reading and the buffers stay static. The actor and the APN's training data stay noise-free.
 *   **Safety gradient**: during the PPO update the APN's hinge on the actor's own mean action is backpropagated into the actor, plus a mapping penalty towards the projected action, so it learns to propose actions the projection no longer corrects.
 *   **Lagrangian Constraint Shaping**: adaptive penalty multipliers in the environment (`PhycocyaninEnvSafe`) on top, and alone for G5.
 
-Training is Deep Recurrent Policy Optimisation: GAE over recurrent value estimates, Truncated Backpropagation Through Time over 32-step chunks, and Welford running reward normalisation. PPO is trained on the raw intent the actor sampled; `use_safeguard`, `use_projection` and `use_safety_grad` switch the safety components off for ablations.
+Training is Deep Recurrent Policy Optimisation: GAE over recurrent value estimates, Truncated Backpropagation Through Time over 32-step chunks, and Welford running reward normalisation. PPO is trained on the raw intent the actor sampled; `use_safeguard`, `use_projection`, `use_safety_grad` and `use_g3` switch the safety components off for ablations.
 
 ### Standard RL Agent (`agents/bench.py`)
 A feedforward PPO actor-critic without the projection filter. Relies on reward shaping to learn safety behaviors (`PhycocyaninEnvBench`).
@@ -70,10 +71,13 @@ agents/
   checkpoint.py           save / load policies
 safety/                   the Action Projection Network
   constants.py            physical limits and projection settings
-  apn.py                  network, projection, safety loss
-  data.py                 physics-based dataset generation
-  train.py                pretraining (python -m safety.train)
-  validate.py             checks against the plant (python -m safety.validate)
+  apn.py                  multi-head APN: margins, projection, safety loss
+  dynamics.py             the plant's one-step kinetics in torch (exact heads)
+  kinetic.py              KineticNet, the G3 fallback draw-down (learned head)
+  estimator.py            Kalman state estimate the APN projects on
+  nominal.py              nominal plant model the estimator predicts with
+  data.py                 KineticNet's dataset
+  train.py                KineticNet training (python -m safety.train)
 experiments/
   config.py               RunConfig and PPO hyperparameters
   train.py / evaluate.py  main.py's training loop and noisy evaluation
@@ -102,17 +106,12 @@ pip install torch numpy matplotlib pandas tqdm
 
 Run every command from the repository root.
 
-1. **Pretrain APN** (needed once after this G3 change: an APN checkpoint without a trained G3 head still loads, but G3 is then not covered; training continues from the existing weights)
+1. **Train the APN's G3 head** (KineticNet, a few minutes; the exact heads need no training, and without `policy/apn_kinetic.pth` G3 is not covered)
 ```bash
 python -m safety.train
 ```
 
-2. **Validate APN Safety Behavior**
-```bash
-python -m safety.validate
-```
-
-3. **Train and/or Evaluate RL Agents**
+2. **Train and/or Evaluate RL Agents**
 Open `main.py` and set:
 - `EVALUATE_ONLY = False` to train and then evaluate
 - `EVALUATE_ONLY = True` to evaluate existing checkpoints only
@@ -123,13 +122,13 @@ PPO hyperparameters live in `experiments/config.py`. Then run:
 python main.py
 ```
 
-4. **Ablation study** (optional)
+3. **Ablation study** (optional)
 ```bash
 python ablation.py
 ```
 Leave-one-out over the GRU, Lagrangian, stage mask, APN projection, safety gradient and G3 head, seeds 0-2, 3,000 episodes per run. Each policy is evaluated without noise, with actuator noise and with sensor noise (no disturbances). The Standard RL baseline is trained and evaluated alongside (`--no-baseline` leaves it out), and `ablation/ablation_vs_baseline.png` compares it with the full Safe RL agent under all three noise modes. Results land in `ablation/`; `--summarize-only` re-plots and `--help` lists the options.
 
-5. **Compare stage schedules** (after evaluating both agents)
+4. **Compare stage schedules** (after evaluating both agents)
 ```bash
 python -m reporting.gantt
 ```
@@ -138,5 +137,5 @@ python -m reporting.gantt
 
 Generated plots are saved in sub folders of `plot/`:
 - `plot/plot_bench/` (Standard RL): `training_Standard RL.png` and the evaluation trajectories `plot_nitrate_standard.png`, `plot_phycocyanin_standard.png`, `plot_light_standard.png`, `plot_nitrate_feed_standard.png`, `plot_volume_standard.png`, `plot_ratio_standard.png`, `plot_violations_standard.png`
-- `plot/plot_safe/` (Safe RL): `training_safe_RL agent.png`, the same evaluation trajectories with the `_safe` suffix, and `am_loss.png` (APN pretraining convergence)
+- `plot/plot_safe/` (Safe RL): `training_safe_RL agent.png`, the same evaluation trajectories with the `_safe` suffix, and `am_loss.png` (KineticNet training loss)
 - `plot/plot_compare/` (both agents): `training_violations.png`, `comparison_table.png` and `gantt_comparison.png`
