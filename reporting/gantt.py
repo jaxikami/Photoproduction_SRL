@@ -10,46 +10,6 @@ import matplotlib.patches as mpatches
 import os
 
 
-def encode_stage_runs(stages):
-    """Returns contiguous stage runs as [stage, length] pairs."""
-    runs = []
-    current_stage = int(stages[0])
-    count = 1
-
-    for stage in stages[1:]:
-        stage = int(stage)
-        if stage == current_stage:
-            count += 1
-        else:
-            runs.append([current_stage, count])
-            current_stage = stage
-            count = 1
-
-    runs.append([current_stage, count])
-    return runs
-
-
-def decode_stage_runs(runs):
-    """Expands contiguous stage runs back into a stage array."""
-    expanded = []
-    for stage, length in runs:
-        expanded.extend([stage] * length)
-    return np.array(expanded)
-
-
-def swap_stage_zero_one_timing(stages):
-    """Swaps stage 0 and 1 durations while keeping stage 0 plotted before stage 1."""
-    runs = encode_stage_runs(stages)
-
-    for index in range(len(runs) - 1):
-        left_stage, left_len = runs[index]
-        right_stage, right_len = runs[index + 1]
-        if left_stage == 0 and right_stage == 1:
-            runs[index][1] = right_len
-            runs[index + 1][1] = left_len
-
-    return decode_stage_runs(runs)
-
 def generate_gantt():
     """Generates a Gantt chart comparing stage schedules of Safe vs Standard RL.
 
@@ -71,44 +31,9 @@ def generate_gantt():
     safe_data = np.load(safe_path)
     std_data = np.load(std_path)
 
-    safe_stages = swap_stage_zero_one_timing(safe_data["stages"].copy())
-    std_stages = swap_stage_zero_one_timing(std_data["stages"].copy())
-
-    # Perturb Safe RL stage durations after the stage 0/1 swap.
-    np.random.seed(42)
-    rle = encode_stage_runs(safe_stages)
-
-    new_lengths = []
-    for s, l in rle:
-        if s == 0:
-            percent = np.random.uniform(0.10, 0.20)
-            direction = np.random.choice([-1.0, 1.0])
-            factor = 1.0 + (direction * percent)
-        elif s == 1:
-            percent = np.random.uniform(0.05, 0.15)
-            factor = 1.0 + percent
-        else:
-            factor = 1.0
-        new_l = max(1, int(round(l * factor)))
-        new_lengths.append(new_l)
-
-
-    # Scale back to match the original total length exactly
-    target_len = len(safe_stages)
-    total_new_len = sum(new_lengths)
-    scale_factor = target_len / total_new_len
-    scaled_lengths = [max(1, int(round(nl * scale_factor))) for nl in new_lengths]
-
-    # Adjust rounding differences
-    diff = target_len - sum(scaled_lengths)
-    if diff != 0:
-        scaled_lengths[-1] = max(1, scaled_lengths[-1] + diff)
-
-    safe_stages = decode_stage_runs([
-        [stage, scaled_length]
-        for (stage, _), scaled_length in zip(rle, scaled_lengths)
-    ])
-
+    # The median evaluation episodes' stages, as recorded (one per control step).
+    safe_stages = safe_data["stages"].copy()
+    std_stages = std_data["stages"].copy()
 
     CONTROL_INTERVAL = 10.0
 
